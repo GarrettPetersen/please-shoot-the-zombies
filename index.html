@@ -5,17 +5,29 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Please Shoot the Zombies</title>
   <style>
+    @font-face {
+      font-family: 'Zpix';
+      src: url('assets/font/zpix.ttf') format('truetype');
+      font-weight: normal;
+      font-style: normal;
+    }
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
+    html, body {
+      width: 100%;
+      height: 100%;
       background: #0d0d0d;
       overflow: hidden;
+    }
+    body {
       display: flex;
       align-items: center;
       justify-content: center;
-      min-height: 100vh;
     }
     canvas {
       display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
       image-rendering: pixelated;
       image-rendering: crisp-edges;
     }
