@@ -52,7 +52,7 @@ const ZOMBIE_DAMAGE_HEAD = 3;
 // Spawn: random XZ in annulus so they appear around the player
 const SPAWN_MIN_DIST = 2;
 const SPAWN_MAX_DIST = 14;
-const SPAWN_DELAY = 90;
+const SPAWN_DELAY = 480;  // frames between spawns (~8s at 60fps) — much slower
 const MAX_ZOMBIES = 50;
 
 let assets = {};
@@ -65,6 +65,7 @@ let zombies = [];  // { x, y, z } in world space
 let spawnTimer = 0;
 let pointerLocked = false;
 let hitFeedbackTime = 0;  // seconds to show hit reticule (CoD-style diagonal)
+let audioContext = null;  // Web Audio API context for positional sounds
 
 // Aiming: desired direction (reticule leads), camera chases with delay — turn any direction
 let desiredYaw = 0;
@@ -178,6 +179,8 @@ async function loadAssets() {
   assets.ejectCasing.preload = 'auto';
   assets.reloadSound = new Audio(SFX_RELOAD_PATH);
   assets.reloadSound.preload = 'auto';
+  const ZOMBIE_SOUND_NAMES = ['zombie_1', 'zombie_2', 'zombie_3', 'zombie_4', 'zombie_5'];
+  assets.zombieSoundPaths = ZOMBIE_SOUND_NAMES.map((n) => `${base}/sfx/clean/${n}.ogg`);
 }
 
 function playShotSound() {
@@ -185,19 +188,19 @@ function playShotSound() {
   const which = Math.floor(Math.random() * assets.shotSounds.length);
   const snd = assets.shotSounds[which];
   snd.currentTime = 0;
-  snd.play().catch(() => {});
+  snd.play().catch(() => { });
 }
 
 function playEjectCasingSound() {
   if (!assets.ejectCasing) return;
   assets.ejectCasing.currentTime = 0;
-  assets.ejectCasing.play().catch(() => {});
+  assets.ejectCasing.play().catch(() => { });
 }
 
 function playDryFireSound() {
   if (!assets.dryFire) return;
   assets.dryFire.currentTime = 0;
-  assets.dryFire.play().catch(() => {});
+  assets.dryFire.play().catch(() => { });
 }
 
 let reloadSoundPlayed = false;
@@ -205,7 +208,65 @@ let reloadSoundPlayed = false;
 function playReloadSound() {
   if (!assets.reloadSound) return;
   assets.reloadSound.currentTime = 0;
-  assets.reloadSound.play().catch(() => {});
+  assets.reloadSound.play().catch(() => { });
+}
+
+// ---- Positional audio (reusable for SFX, multiplayer, voice chat) ----
+// Listener is at (CAMERA_X, CAMERA_Z) facing cameraYaw. Sources at (worldX, worldZ) get gain + stereo pan.
+
+const POSITIONAL_REF_DIST = 5;
+const POSITIONAL_ROLLOFF = 0.25;
+
+/** Returns { gain, pan } for a source at (worldX, worldZ). Use for one-shots or to update continuous sources (e.g. voice) each frame. */
+function getPositionalGainPan(worldX, worldZ) {
+  const dx = worldX - CAMERA_X;
+  const dz = worldZ - CAMERA_Z;
+  const distance = Math.sqrt(dx * dx + dz * dz) || 0.001;
+  const gain = 1 / (1 + (distance / POSITIONAL_REF_DIST) * POSITIONAL_ROLLOFF);
+  const soundAngle = Math.atan2(dz, dx);
+  const lookAngle = Math.atan2(-Math.cos(cameraYaw), Math.sin(cameraYaw));
+  const relativeAngle = normalizeAngle(soundAngle - lookAngle);
+  const pan = Math.max(-1, Math.min(1, relativeAngle / (Math.PI / 2)));
+  return { gain, pan };
+}
+
+function getAudioContext() {
+  if (!window.AudioContext && !window.webkitAudioContext) return null;
+  if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioContext.state === 'suspended') audioContext.resume().catch(() => {});
+  return audioContext;
+}
+
+/** One-shot: play a sound from URL at world position (e.g. zombie spawn, impact). */
+function playPositionalSound(url, worldX, worldZ) {
+  if (!url) return;
+  const ctx = getAudioContext();
+  if (!ctx) return;
+  const { gain, pan } = getPositionalGainPan(worldX, worldZ);
+  const audio = new Audio(url);
+  const source = ctx.createMediaElementSource(audio);
+  const gainNode = ctx.createGain();
+  const panner = ctx.createStereoPanner();
+  gainNode.gain.value = gain;
+  panner.pan.value = pan;
+  source.connect(gainNode);
+  gainNode.connect(panner);
+  panner.connect(ctx.destination);
+  audio.play().catch(() => {});
+}
+
+/** For continuous sources (e.g. voice chat): create graph, connect your source to .gainNode, then each frame/tick set gainNode.gain.value and panner.pan.value from getPositionalGainPan(sourceX, sourceZ). */
+function createPositionalGraph(worldX, worldZ) {
+  const ctx = getAudioContext();
+  if (!ctx) return null;
+  const { gain, pan } = getPositionalGainPan(worldX, worldZ);
+  const gainNode = ctx.createGain();
+  const panner = ctx.createStereoPanner();
+  gainNode.gain.value = gain;
+  panner.pan.value = pan;
+  gainNode.connect(panner);
+  panner.connect(ctx.destination);
+  return { gainNode, panner };
 }
 
 // ---- Zombies ----
@@ -217,6 +278,10 @@ function spawnZombie() {
   const x = CAMERA_X + Math.cos(angle) * dist;
   const z = CAMERA_Z + Math.sin(angle) * dist;
   zombies.push({ x, y: 0, z, hp: ZOMBIE_HP_MAX });
+  if (assets.zombieSoundPaths && assets.zombieSoundPaths.length > 0) {
+    const which = Math.floor(Math.random() * assets.zombieSoundPaths.length);
+    playPositionalSound(assets.zombieSoundPaths[which], x, z);
+  }
 }
 
 const HIT_FEEDBACK_DURATION = 0.18;  // seconds to show diagonal hit reticule
@@ -422,20 +487,46 @@ function getZombieDrawInfo(z) {
   };
 }
 
+const PIXEL_HIT_ALPHA_THRESHOLD = 10;
+
 function hitTestZombies(px, py) {
-  let best = -1;
-  let bestDepth = Infinity;
+  if (!assets.zombie) return -1;
+  const candidates = [];
   for (let i = 0; i < zombies.length; i++) {
     const info = getZombieDrawInfo(zombies[i]);
     if (!info) continue;
     if (px >= info.sx && px <= info.sx + info.sw && py >= info.sy && py <= info.sy + info.sh) {
-      if (info.depth < bestDepth) {
-        bestDepth = info.depth;
-        best = i;
-      }
+      candidates.push({ i, info, z: zombies[i], depth: info.depth });
     }
   }
-  return best;
+  if (candidates.length === 0) return -1;
+  candidates.sort((a, b) => a.depth - b.depth);
+
+  ensureZombieSampleCanvas();
+  zombieSampleCtx.drawImage(assets.zombie, 0, 0);
+  const idata = zombieSampleCtx.getImageData(0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
+
+  for (const { i, info, z } of candidates) {
+    const tx = (px - info.sx) / info.sw * ZOMBIE_SPRITE_W;
+    const ty = (py - info.sy) / info.sh * ZOMBIE_SPRITE_H;
+    const txF = Math.floor(tx);
+    const tyF = Math.floor(ty);
+    if (txF < 0 || txF >= ZOMBIE_SPRITE_W || tyF < 0 || tyF >= ZOMBIE_SPRITE_H) continue;
+    const idx = (tyF * ZOMBIE_SPRITE_W + txF) * 4 + 3;
+    if (idata.data[idx] < PIXEL_HIT_ALPHA_THRESHOLD) continue;
+    if (z.holes && z.holes.length > 0) {
+      let inHole = false;
+      for (const hole of z.holes) {
+        if (insideJaggedShape(tx - hole.tx, ty - hole.ty, hole.jaggedRadii)) {
+          inHole = true;
+          break;
+        }
+      }
+      if (inHole) continue;
+    }
+    return i;
+  }
+  return -1;
 }
 
 // ---- Drawing ----
