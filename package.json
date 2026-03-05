@@ -1,0 +1,14 @@
+{
+  "name": "please-shoot-the-zombies",
+  "version": "0.1.0",
+  "description": "Retro pixel art multiplayer shooter — defend the bunker from zombies",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^28.0.0"
+  }
+}

@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build / Electron
+dist/
+out/
+*.asar
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+npm-debug.log*
+
+# Env (if we add server config later)
+.env
+.env.local
+.env.*.local
