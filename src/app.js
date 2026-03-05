@@ -1,44 +1,102 @@
 /**
- * Please Shoot the Zombies — minimal single-player shooting gallery.
- * One window, zombies appear, click to shoot. No networking.
+ * Please Shoot the Zombies — minimal single-player 3D shooting gallery.
+ * Player at fixed position, pivot with mouse (FPS-style). Zombies at 3D positions, scaled by distance.
  */
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 
-// Fixed resolution for pixel-art look; canvas can be scaled by CSS
+// Resolution
 const W = 512;
 const H = 384;
 canvas.width = W;
 canvas.height = H;
 
-// Shooting gallery: "window" where zombies appear (centered region)
-const WINDOW_X = Math.floor(W * 0.2);
-const WINDOW_Y = Math.floor(H * 0.15);
-const WINDOW_W = Math.floor(W * 0.6);
-const WINDOW_H = Math.floor(H * 0.55);
+// 3D: camera fixed position, yaw/pitch for look (radians)
+const CAMERA_X = 0;
+const CAMERA_Y = 1.6;
+const CAMERA_Z = 0;
+let cameraYaw = 0;   // left-right (rotation around Y)
+let cameraPitch = 0; // up-down
 
-// Rifle: fire-only sheet 8704×256 (34 frames), reload sheet 19200×256 (75 frames)
+const FOV = Math.PI / 3;  // 60° vertical FOV
+const ASPECT = W / H;
+const NEAR = 0.1;
+const FAR = 500;
+
+// World colors
+const GROUND_COLOR = '#3d3d35';
+const SKY_COLOR = '#2a3548';
+
+// Rifle (unchanged from before)
 const RIFLE_FRAME_W = 256;
 const RIFLE_FRAME_H = 256;
-const RIFLE_FIRE_FRAME_COUNT = 34;   // all frames of fire-only loop
-const RIFLE_RELOAD_FRAME_COUNT = 75; // all frames of fire+reload loop
+const RIFLE_FIRE_FRAME_COUNT = 34;
+const RIFLE_RELOAD_FRAME_COUNT = 75;
 const RIFLE_FPS = 24;
-const RIFLE_CLIP_SIZE = 5;           // fire 5 times, then reload
+const RIFLE_CLIP_SIZE = 5;
 
-// Zombie sprite: 512×1024 single frame, scale to fit window
-const ZOMBIE_W = 120;
-const ZOMBIE_H = 240;
+// Zombie: 3D position, sprite 512×1024; reference size at reference distance
+const ZOMBIE_REF_HEIGHT = 1.8;  // world units (height of zombie)
+const ZOMBIE_REF_DIST = 10;     // distance at which zombie appears at "normal" screen size
+
+// Spawn: random XZ in annulus so they appear around the player
+const SPAWN_MIN_DIST = 8;
+const SPAWN_MAX_DIST = 35;
+const SPAWN_DELAY = 90;
+const MAX_ZOMBIES = 50;
 
 let assets = {};
 let score = 0;
 let rifleFrame = 0;
-let rifleState = 'idle';  // 'idle' | 'firing' | 'reloading'
+let rifleState = 'idle';
 let rifleFrameTime = 0;
-let shotsInClip = RIFLE_CLIP_SIZE;   // after 5 shots, must reload
-let currentZombie = null;
+let shotsInClip = RIFLE_CLIP_SIZE;
+let zombies = [];  // { x, y, z } in world space
 let spawnTimer = 0;
-const SPAWN_DELAY = 120;  // frames between zombies
+let pointerLocked = false;
+
+// ---- 3D projection ----
+
+function getViewVectors() {
+  const cp = Math.cos(cameraPitch);
+  const sp = Math.sin(cameraPitch);
+  const cy = Math.cos(cameraYaw);
+  const sy = Math.sin(cameraYaw);
+  const forward = {
+    x: sy * cp,
+    y: -sp,
+    z: -cy * cp,
+  };
+  const right = {
+    x: cy,
+    y: 0,
+    z: sy,
+  };
+  const up = {
+    x: -sy * sp,
+    y: -cp,
+    z: cy * sp,
+  };
+  return { forward, right, up };
+}
+
+function project(wx, wy, wz) {
+  const dx = wx - CAMERA_X;
+  const dy = wy - CAMERA_Y;
+  const dz = wz - CAMERA_Z;
+  const { forward, right, up } = getViewVectors();
+  const depth = dx * forward.x + dy * forward.y + dz * forward.z;
+  if (depth <= NEAR) return null;
+  const viewX = dx * right.x + dy * right.y + dz * right.z;
+  const viewY = dx * up.x + dy * up.y + dz * up.z;
+  const scale = (H / 2) / (Math.tan(FOV / 2) * depth);
+  const sx = W / 2 + viewX * scale;
+  const sy = H / 2 - viewY * scale;
+  return { sx, sy, depth };
+}
+
+// ---- Assets ----
 
 function loadImage(path) {
   return new Promise((resolve, reject) => {
@@ -56,44 +114,87 @@ async function loadAssets() {
   assets.zombie = await loadImage(`${base}/german_zombie.png`);
 }
 
+// ---- Zombies ----
+
 function spawnZombie() {
-  if (currentZombie) return;
-  currentZombie = {
-    x: WINDOW_X + (WINDOW_W - ZOMBIE_W) / 2,
-    y: WINDOW_Y + WINDOW_H - ZOMBIE_H,
-    w: ZOMBIE_W,
-    h: ZOMBIE_H,
-  };
+  if (zombies.length >= MAX_ZOMBIES) return;
+  const angle = Math.random() * Math.PI * 2;
+  const dist = SPAWN_MIN_DIST + Math.random() * (SPAWN_MAX_DIST - SPAWN_MIN_DIST);
+  const x = CAMERA_X + Math.cos(angle) * dist;
+  const z = CAMERA_Z + Math.sin(angle) * dist;
+  zombies.push({ x, y: 0, z });
 }
 
-function hitTestZombie(px, py) {
-  if (!currentZombie) return false;
-  const z = currentZombie;
-  return px >= z.x && px <= z.x + z.w && py >= z.y && py <= z.y + z.h;
-}
-
-function killZombie() {
-  currentZombie = null;
+function killZombieAtIndex(i) {
+  zombies.splice(i, 1);
   score += 1;
   spawnTimer = 0;
 }
 
-function drawWindow() {
-  // Dark window frame
-  ctx.fillStyle = '#1a1a1a';
-  ctx.fillRect(WINDOW_X - 4, WINDOW_Y - 4, WINDOW_W + 8, WINDOW_H + 8);
-  ctx.strokeStyle = '#333';
-  ctx.lineWidth = 4;
-  ctx.strokeRect(WINDOW_X - 4, WINDOW_Y - 4, WINDOW_W + 8, WINDOW_H + 8);
-  // Sky/dark view
-  ctx.fillStyle = '#0d0d0d';
-  ctx.fillRect(WINDOW_X, WINDOW_Y, WINDOW_W, WINDOW_H);
+// Zombie sprite: 512×1024. Draw as billboard: scale by distance (perspective)
+function getZombieDrawInfo(z) {
+  const projScale = (H / 2) / Math.tan(FOV / 2);
+  const proj = project(z.x, z.y + ZOMBIE_REF_HEIGHT, z.z);
+  if (!proj || proj.depth <= NEAR) return null;
+  const screenH = (ZOMBIE_REF_HEIGHT * projScale) / proj.depth;
+  const screenW = screenH * (512 / 1024);
+  return {
+    sx: proj.sx - screenW / 2,
+    sy: proj.sy - screenH,
+    sw: screenW,
+    sh: screenH,
+    depth: proj.depth,
+  };
 }
 
-function drawZombie() {
-  if (!currentZombie || !assets.zombie) return;
-  const z = currentZombie;
-  ctx.drawImage(assets.zombie, 0, 0, 512, 1024, z.x, z.y, z.w, z.h);
+function hitTestZombies(px, py) {
+  let best = -1;
+  let bestDepth = Infinity;
+  for (let i = 0; i < zombies.length; i++) {
+    const info = getZombieDrawInfo(zombies[i]);
+    if (!info) continue;
+    if (px >= info.sx && px <= info.sx + info.sw && py >= info.sy && py <= info.sy + info.sh) {
+      if (info.depth < bestDepth) {
+        bestDepth = info.depth;
+        best = i;
+      }
+    }
+  }
+  return best;
+}
+
+// ---- Drawing ----
+
+function drawSky() {
+  ctx.fillStyle = SKY_COLOR;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function drawGround() {
+  // Horizon = where ground (y=0) meets sky. Project a point on the ground in our horizontal look direction.
+  const { forward } = getViewVectors();
+  const lenXZ = Math.sqrt(forward.x * forward.x + forward.z * forward.z);
+  if (lenXZ < 1e-6) {
+    ctx.fillStyle = GROUND_COLOR;
+    ctx.fillRect(0, 0, W, H);
+    return;
+  }
+  const far = 10000;
+  const hx = CAMERA_X + (forward.x / lenXZ) * far;
+  const hz = CAMERA_Z + (forward.z / lenXZ) * far;
+  const horizonProj = project(hx, 0, hz);
+  const horizonY = horizonProj ? horizonProj.sy : H / 2;
+  ctx.fillStyle = GROUND_COLOR;
+  ctx.fillRect(0, Math.floor(horizonY), W, Math.max(0, H - Math.floor(horizonY)));
+}
+
+function drawZombies() {
+  if (!assets.zombie) return;
+  const withInfo = zombies.map((z) => ({ z, info: getZombieDrawInfo(z) })).filter((o) => o.info);
+  withInfo.sort((a, b) => b.info.depth - a.info.depth);
+  for (const { z, info } of withInfo) {
+    ctx.drawImage(assets.zombie, 0, 0, 512, 1024, info.sx, info.sy, info.sw, info.sh);
+  }
 }
 
 function drawRifle(dt) {
@@ -111,7 +212,7 @@ function drawRifle(dt) {
       if (rifleFrame >= RIFLE_FIRE_FRAME_COUNT) {
         rifleFrame = 0;
         shotsInClip -= 1;
-        rifleState = 'idle';  // reload anim (with 5th shot) is started on next click when shotsInClip === 1
+        rifleState = 'idle';
       }
     }
   } else if (rifleState === 'reloading') {
@@ -130,30 +231,38 @@ function drawRifle(dt) {
   const frameCount = rifleState === 'reloading' ? RIFLE_RELOAD_FRAME_COUNT : RIFLE_FIRE_FRAME_COUNT;
   const frameIndex = Math.min(rifleFrame, frameCount - 1);
   const sx = frameIndex * RIFLE_FRAME_W;
-  const sy = 0;
-
   const scale = 0.7;
   const rw = RIFLE_FRAME_W * scale;
   const rh = RIFLE_FRAME_H * scale;
   const rx = W - rw - 20;
   const ry = H - rh - 20;
-  ctx.drawImage(sheet, sx, sy, RIFLE_FRAME_W, RIFLE_FRAME_H, rx, ry, rw, rh);
+  ctx.drawImage(sheet, sx, 0, RIFLE_FRAME_W, RIFLE_FRAME_H, rx, ry, rw, rh);
 }
 
 function drawScore() {
-  ctx.fillStyle = '#666';
+  ctx.fillStyle = '#aaa';
   ctx.font = '16px monospace';
   ctx.fillText(`Score: ${score}`, 12, 24);
 }
 
-function draw() {
-  ctx.fillStyle = '#0d0d0d';
+function drawHint() {
+  if (pointerLocked) return;
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
   ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#fff';
+  ctx.font = '18px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('Click to lock mouse and play', W / 2, H / 2);
+  ctx.textAlign = 'left';
+}
 
-  drawWindow();
-  drawZombie();
+function draw() {
+  drawSky();
+  drawGround();
+  drawZombies();
   drawRifle(1 / 60);
   drawScore();
+  if (!pointerLocked) drawHint();
 }
 
 function tick(dt) {
@@ -162,40 +271,60 @@ function tick(dt) {
   draw();
 }
 
+// ---- Input ----
+
+const MOUSE_SENS = 0.002;
+const PITCH_LIMIT = Math.PI / 2 - 0.1;
+
 canvas.addEventListener('click', (e) => {
+  if (!pointerLocked) {
+    canvas.requestPointerLock();
+    return;
+  }
   const rect = canvas.getBoundingClientRect();
   const scaleX = W / rect.width;
   const scaleY = H / rect.height;
   const px = (e.clientX - rect.left) * scaleX;
   const py = (e.clientY - rect.top) * scaleY;
 
-  // Only accept fire/reload when idle — no firing while an animation is playing
   if (rifleState !== 'idle') return;
 
-  // Shots 1–4: fire-only animation. Shot 5: reload animation (includes the shot, then reload).
   if (shotsInClip > 1) {
     rifleState = 'firing';
     rifleFrame = 0;
     rifleFrameTime = 0;
-    if (hitTestZombie(px, py)) killZombie();
-  } else if (shotsInClip === 1) {
+    const idx = hitTestZombies(px, py);
+    if (idx >= 0) killZombieAtIndex(idx);
+  } else   if (shotsInClip === 1) {
     rifleState = 'reloading';
     rifleFrame = 0;
     rifleFrameTime = 0;
-    if (hitTestZombie(px, py)) killZombie();
+    const idx = hitTestZombies(px, py);
+    if (idx >= 0) killZombieAtIndex(idx);
   }
-  // shotsInClip === 0 shouldn't occur (reload anim ends with full clip)
+});
+
+document.addEventListener('pointerlockchange', () => {
+  pointerLocked = document.pointerLockElement === canvas;
+});
+
+canvas.addEventListener('mousemove', (e) => {
+  if (!pointerLocked) return;
+  cameraYaw += e.movementX * MOUSE_SENS;     // mouse right = turn right
+  cameraPitch -= e.movementY * MOUSE_SENS;   // joystick style: mouse up = look down
+  cameraPitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, cameraPitch));
 });
 
 function loop(now = 0) {
-  const last = loop.last || now;
+  const last = loop.last ?? now;
   const dt = Math.min((now - last) / 1000, 0.1);
   loop.last = now;
   tick(dt);
   requestAnimationFrame(loop);
 }
 
-(async function main() {
-  await loadAssets();
+(function main() {
   requestAnimationFrame(loop);
+  loadAssets().catch((err) => console.error('Asset load failed:', err));
 })();
+
