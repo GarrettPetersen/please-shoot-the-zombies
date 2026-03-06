@@ -831,6 +831,39 @@ function hitTestZombies(px, py) {
   return candidates[0].i;
 }
 
+/** True if (px, py) hits opaque tree pixels (not transparent, not an existing hole). */
+function treeBlocksPoint(t, info, px, py) {
+  const hitTx = ((px - info.sx) / info.sw) * TREE_SPRITE_SIZE;
+  const hitTy = ((py - info.sy) / info.sh) * TREE_SPRITE_SIZE;
+  if (t.holes && t.holes.length > 0) {
+    for (const hole of t.holes) {
+      if (insideJaggedShape(hitTx - hole.tx, hitTy - hole.ty, hole.jaggedRadii)) return false;
+    }
+  }
+  if (!assets.retrotree) return false;
+  if (!treeHoleCanvas || treeHoleCanvas.width !== TREE_SPRITE_SIZE || treeHoleCanvas.height !== TREE_SPRITE_SIZE) {
+    treeHoleCanvas = document.createElement('canvas');
+    treeHoleCanvas.width = TREE_SPRITE_SIZE;
+    treeHoleCanvas.height = TREE_SPRITE_SIZE;
+    treeHoleCtx = treeHoleCanvas.getContext('2d');
+  }
+  const { col, row } = getTreeGridCell(t.spriteIndex);
+  treeHoleCtx.drawImage(
+    assets.retrotree,
+    col * TREE_SPRITE_SIZE,
+    row * TREE_SPRITE_SIZE,
+    TREE_SPRITE_SIZE,
+    TREE_SPRITE_SIZE,
+    0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE
+  );
+  const idata = treeHoleCtx.getImageData(0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE);
+  const tx = Math.floor(hitTx);
+  const ty = Math.floor(hitTy);
+  if (tx < 0 || tx >= TREE_SPRITE_SIZE || ty < 0 || ty >= TREE_SPRITE_SIZE) return false;
+  const alpha = idata.data[(ty * TREE_SPRITE_SIZE + tx) * 4 + 3];
+  return alpha >= PIXEL_HIT_ALPHA_THRESHOLD;
+}
+
 /** Returns { type: 'zombie'|'tree', index } for the closest hit, or null. */
 function getHitTarget(px, py) {
   const candidates = [];
@@ -843,7 +876,9 @@ function getHitTarget(px, py) {
     const info = getTreeDrawInfo(trees[i]);
     if (!info) continue;
     if (px >= info.sx && px <= info.sx + info.sw && py >= info.sy && py <= info.sy + info.sh) {
-      candidates.push({ type: 'tree', index: i, depth: info.depth });
+      if (treeBlocksPoint(trees[i], info, px, py)) {
+        candidates.push({ type: 'tree', index: i, depth: info.depth });
+      }
     }
   }
   if (candidates.length === 0) return null;
