@@ -30,6 +30,16 @@ const FAR = 500;
 // World colors
 const GROUND_COLOR = '#3d3d35';
 const SKY_COLOR = '#2a3548';
+const FOG_COLOR = '#3a4555';
+const FOG_RGB = { r: 0x3a, g: 0x45, b: 0x55 };
+const FOG_DENSITY = 0.028;
+const FOG_START = 4;  // no fog this close; fog ramps in beyond
+const FOG_WISP_COUNT = 5;       // number of wisp sprite variants
+const FOG_WISP_POSITIONS = 58;  // world positions (orbit at various distances)
+const FOG_WISP_SPRITE_SIZE = 96;
+const FOG_WISP_REF_DEPTH = 25;  // reference depth for screen size
+const FOG_WISP_BASE_ALPHA = 0.18;
+const FOG_WISP_ROT_SPEED = 0.026;  // rad/sec; each wisp gets ± this (clockwise vs counterclockwise)
 
 // Rifle — 455×256 per frame (fire + reload sheets), same as canvas
 const RIFLE_FRAME_W = 455;
@@ -44,9 +54,6 @@ const ZOMBIE_REF_HEIGHT = 1.8;  // world units (height of zombie)
 const ZOMBIE_REF_DIST = 10;     // distance at which zombie appears at "normal" screen size
 const ZOMBIE_SPRITE_W = 132;
 const ZOMBIE_SPRITE_H = 256;
-const ZOMBIE_NECK_PX = 46;     // pixels from top of sprite; above = head
-const HEADSHOT_X_MIN = 100;    // headshot only counts when sprite x in [HEADSHOT_X_MIN, HEADSHOT_X_MAX] (e.g. exclude raised hands on front-facing)
-const HEADSHOT_X_MAX = 150;
 const ZOMBIE_HP_MAX = 3;
 const ZOMBIE_DAMAGE_BODY = 1;
 const ZOMBIE_DAMAGE_HEAD = 3;
@@ -56,7 +63,7 @@ const SPAWN_MIN_DIST = 28;
 const SPAWN_MAX_DIST = 55;
 const SPAWN_DELAY = 520;
 const MAX_ZOMBIES = 20;
-const ZOMBIE_SPEED = 0.7;        // world units/sec toward player (slower)
+const ZOMBIE_SPEED = 0.35;       // world units/sec (average); each zombie has speedMult for variation
 const ZOMBIE_ZIGZAG = 0.5;      // lateral sway (world units)
 const ZOMBIE_ZIGZAG_SPEED = 2.5; // rad/sec for zigzag phase
 const ZOMBIE_BOB_AMPLITUDE = 0.06;
@@ -65,6 +72,7 @@ const ZOMBIE_TOUCH_DIST = 0.9;  // game over if zombie this close
 const ZOMBIE_DIR_CHANGE_DIST = 2.5;   // world units walked before maybe changing direction
 const ZOMBIE_DIR_CHANGE_CHANCE = 0.35; // probability to flip direction when threshold reached
 const GAME_OVER_FLASH_DURATION = 0.6;
+const ZOMBIE_SOUND_INTERVAL = 4;      // seconds between groans; deterministic from spawnIndex/spawnTime
 
 let assets = {};
 let score = 0;
@@ -79,6 +87,10 @@ let gameOver = false;
 let gameOverFlashStart = 0;
 let hitFeedbackTime = 0;  // seconds to show hit reticule (CoD-style diagonal)
 let audioContext = null;  // Web Audio API context for positional sounds
+let gameTime = 0;        // seconds since start (for deterministic zombie sounds)
+let spawnCounter = 0;    // increments per spawn so each zombie has a stable spawnIndex
+let fogWispSprites = [];
+let fogWispPositions = [];
 
 // Aiming: desired direction (reticule leads), camera chases with delay — turn any direction
 let desiredYaw = 0;
@@ -176,13 +188,84 @@ const RELOAD_SOUND_ALIGN_TIME = 0.65; // seconds into sound file at that frame
 const RELOAD_SOUND_EARLY_OFFSET = 0.25; // start sound this many seconds earlier
 const RELOAD_SOUND_TRIGGER_FRAME = Math.max(0, Math.floor((RELOAD_SOUND_ALIGN_FRAME - 1) - RELOAD_SOUND_ALIGN_TIME * RIFLE_FPS - RELOAD_SOUND_EARLY_OFFSET * RIFLE_FPS));
 
+/** Extract ImageData from an image (for headshot mask sampling). Returns null if image not loaded. */
+function imageDataFromImage(img) {
+  if (!img?.naturalWidth) return null;
+  const c = document.createElement('canvas');
+  c.width = img.naturalWidth;
+  c.height = img.naturalHeight;
+  const cx = c.getContext('2d');
+  cx.drawImage(img, 0, 0);
+  return cx.getImageData(0, 0, c.width, c.height);
+}
+
+function generateFogWisps() {
+  fogWispSprites = [];
+  const size = FOG_WISP_SPRITE_SIZE;
+  function seeded(initial) {
+    let s = initial;
+    return () => {
+      s = (s * 1103515245 + 12345) >>> 0;
+      return s / 0x100000000;
+    };
+  }
+  const rng = seeded(12345);
+  for (let n = 0; n < FOG_WISP_COUNT; n++) {
+    const c = document.createElement('canvas');
+    c.width = size;
+    c.height = size;
+    const cx = c.getContext('2d');
+    const particleCount = 35 + Math.floor(rng() * 25);
+    for (let i = 0; i < particleCount; i++) {
+      const u = rng();
+      const v = rng();
+      const x = size * (0.15 + u * 0.7);
+      const yNorm = v < 0.55 ? v * 0.9 : 0.45 + (v - 0.55) * 1.2;
+      const y = size * yNorm;
+      const radBase = 0.08 + rng() * 0.22;
+      const rad = size * radBase * (0.5 + 0.5 * (1 - yNorm));
+      const alpha = 0.06 + rng() * 0.1;
+      const grad = cx.createRadialGradient(x, y, 0, x, y, rad);
+      grad.addColorStop(0, `rgba(255,255,255,${alpha})`);
+      grad.addColorStop(0.6, `rgba(255,255,255,${alpha * 0.4})`);
+      grad.addColorStop(1, 'rgba(255,255,255,0)');
+      cx.fillStyle = grad;
+      cx.beginPath();
+      cx.arc(x, y, rad, 0, Math.PI * 2);
+      cx.fill();
+    }
+    fogWispSprites.push(c);
+  }
+  fogWispPositions = [];
+  const prng = seeded(67890);
+  for (let i = 0; i < FOG_WISP_POSITIONS; i++) {
+    const dist = 12 + prng() * 42;
+    const baseAngle = prng() * Math.PI * 2;
+    const rotSpeed = (prng() < 0.5 ? 1 : -1) * (0.5 + prng() * 0.6) * FOG_WISP_ROT_SPEED;
+    fogWispPositions.push({
+      dist,
+      baseAngle,
+      y: 0.1 + prng() * 0.35,
+      spriteIndex: Math.floor(prng() * fogWispSprites.length),
+      rotSpeed,
+    });
+  }
+}
+
 async function loadAssets() {
   const base = 'assets';
   assets.rifleFire = await loadImage(`${base}/lee_enfield-Sheet.png`);
   assets.rifleReload = await loadImage(`${base}/lee_enfield_reload-Sheet.png`);
   assets.zombie = await loadImage(`${base}/german_zombie.png`);
   assets.zombieFront = await loadImage(`${base}/front_facing_zombie.png`);
-  assets.zombieSprites = [assets.zombie, assets.zombieFront].filter(Boolean);
+  assets.zombiePickelhaube = await loadImage(`${base}/pickelhaube_zombie.png`);
+  assets.zombieSprites = [assets.zombie, assets.zombieFront, assets.zombiePickelhaube].filter(Boolean);
+  assets.zombieHeadshotMask = await loadImage(`${base}/german_zombie_headshot_area.png`);
+  assets.zombieFrontHeadshotMask = await loadImage(`${base}/front_facing_zombie_headshot_area.png`);
+  assets.zombiePickelhaubeHeadshotMask = await loadImage(`${base}/pickelhaube_zombie_headshot_area.png`);
+  assets.zombieHeadshotData = imageDataFromImage(assets.zombieHeadshotMask);
+  assets.zombieFrontHeadshotData = imageDataFromImage(assets.zombieFrontHeadshotMask);
+  assets.zombiePickelhaubeHeadshotData = imageDataFromImage(assets.zombiePickelhaubeHeadshotMask);
   assets.shotSounds = SFX_SHOT_PATHS.map((path) => {
     const a = new Audio(path);
     a.preload = 'auto';
@@ -196,6 +279,7 @@ async function loadAssets() {
   assets.reloadSound.preload = 'auto';
   const ZOMBIE_SOUND_NAMES = ['zombie_1', 'zombie_2', 'zombie_3', 'zombie_4', 'zombie_5'];
   assets.zombieSoundPaths = ZOMBIE_SOUND_NAMES.map((n) => `${base}/sfx/clean/${n}.ogg`);
+  generateFogWisps();
 }
 
 function playShotSound() {
@@ -228,16 +312,17 @@ function playReloadSound() {
 
 // ---- Positional audio (reusable for SFX, multiplayer, voice chat) ----
 // Listener is at (CAMERA_X, CAMERA_Z) facing cameraYaw. Sources at (worldX, worldZ) get gain + stereo pan.
+// Gain uses inverse-square law: loudness falls off as 1/distance² so distant sources are much quieter.
 
-const POSITIONAL_REF_DIST = 5;
-const POSITIONAL_ROLLOFF = 0.25;
+const POSITIONAL_REF_DIST = 6;   // distance at which gain is 0.5 (reference for inverse-square)
 
-/** Returns { gain, pan } for a source at (worldX, worldZ). Use for one-shots or to update continuous sources (e.g. voice) each frame. */
+/** Returns { gain, pan } for a source at (worldX, worldZ). Gain follows inverse-square law. */
 function getPositionalGainPan(worldX, worldZ) {
   const dx = worldX - CAMERA_X;
   const dz = worldZ - CAMERA_Z;
-  const distance = Math.sqrt(dx * dx + dz * dz) || 0.001;
-  const gain = 1 / (1 + (distance / POSITIONAL_REF_DIST) * POSITIONAL_ROLLOFF);
+  const distanceSq = dx * dx + dz * dz;
+  const refSq = POSITIONAL_REF_DIST * POSITIONAL_REF_DIST;
+  const gain = refSq / (refSq + Math.max(distanceSq, 0.01));
   const soundAngle = Math.atan2(dz, dx);
   const lookAngle = Math.atan2(-Math.cos(cameraYaw), Math.sin(cameraYaw));
   const relativeAngle = normalizeAngle(soundAngle - lookAngle);
@@ -295,26 +380,45 @@ function spawnZombie() {
   const sprite = assets.zombieSprites.length > 0
     ? assets.zombieSprites[Math.floor(Math.random() * assets.zombieSprites.length)]
     : assets.zombie;
+  const spawnIndex = spawnCounter++;
+  const spawnTime = gameTime;
+  const paths = assets.zombieSoundPaths;
+  const numPaths = paths?.length ?? 0;
+  const speedMult = 0.7 + Math.random() * 0.6;
   zombies.push({
     x, y: 0, z, hp: ZOMBIE_HP_MAX,
     walkPhase: Math.random() * Math.PI * 2,
     walkDir: Math.random() < 0.5 ? 1 : -1,
     distanceWalked: 0,
+    speedMult,
     sprite,
     spriteW: sprite?.naturalWidth ?? ZOMBIE_SPRITE_W,
     spriteH: sprite?.naturalHeight ?? ZOMBIE_SPRITE_H,
+    spawnIndex,
+    spawnTime,
+    lastSoundN: 0,   // 0 = played on spawn; next at n=1, 2, ...
   });
-  if (assets.zombieSoundPaths && assets.zombieSoundPaths.length > 0) {
-    const which = Math.floor(Math.random() * assets.zombieSoundPaths.length);
-    playPositionalSound(assets.zombieSoundPaths[which], x, z);
+  if (numPaths > 0) {
+    const which = spawnIndex % numPaths;
+    playPositionalSound(paths[which], x, z);
   }
 }
 
 function updateZombies(dt) {
   if (gameOver) return;
+  const paths = assets.zombieSoundPaths;
+  const numPaths = paths?.length ?? 0;
   for (const z of zombies) {
     z.walkPhase = (z.walkPhase ?? 0) + dt * ZOMBIE_BOB_SPEED;
     z.bob = Math.sin(z.walkPhase) * ZOMBIE_BOB_AMPLITUDE;
+    if (numPaths > 0) {
+      const n = Math.floor((gameTime - z.spawnTime) / ZOMBIE_SOUND_INTERVAL);
+      if (n > (z.lastSoundN ?? 0)) {
+        z.lastSoundN = n;
+        const which = (z.spawnIndex + n) % numPaths;
+        playPositionalSound(paths[which], z.x, z.z);
+      }
+    }
     const dx = CAMERA_X - z.x;
     const dz = CAMERA_Z - z.z;
     const d = Math.sqrt(dx * dx + dz * dz) || 0.001;
@@ -329,8 +433,9 @@ function updateZombies(dt) {
     const perpZ = ux;
     const walkDir = z.walkDir ?? 1;
     const zigzag = walkDir * Math.sin(z.walkPhase * ZOMBIE_ZIGZAG_SPEED) * ZOMBIE_ZIGZAG;
-    const vx = (ux * ZOMBIE_SPEED + perpX * zigzag) * dt;
-    const vz = (uz * ZOMBIE_SPEED + perpZ * zigzag) * dt;
+    const speed = ZOMBIE_SPEED * (z.speedMult ?? 1);
+    const vx = (ux * speed + perpX * zigzag) * dt;
+    const vz = (uz * speed + perpZ * zigzag) * dt;
     z.x += vx;
     z.z += vz;
     z.distanceWalked = (z.distanceWalked ?? 0) + Math.sqrt(vx * vx + vz * vz);
@@ -507,16 +612,42 @@ function drawParticles() {
     if (!proj || proj.depth <= NEAR) continue;
     if (proj.sx < -4 || proj.sx > W + 4 || proj.sy < -4 || proj.sy > H + 4) continue;
     const t = p.life / p.maxLife;
-    ctx.fillStyle = `rgba(${p.r},${p.g},${p.b},${(p.a / 255) * t})`;
+    const fogF = getFogFactor(proj.depth);
+    const r = Math.round(p.r * (1 - fogF) + FOG_RGB.r * fogF);
+    const g = Math.round(p.g * (1 - fogF) + FOG_RGB.g * fogF);
+    const b = Math.round(p.b * (1 - fogF) + FOG_RGB.b * fogF);
+    const a = (p.a / 255) * t * (1 - fogF);
+    ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
     ctx.fillRect(Math.floor(proj.sx), Math.floor(proj.sy), 2, 2);
   }
 }
 
-function isHeadShot(info, py, hitTx) {
+/** Black (and non-transparent) pixels in the headshot mask = head. hitTx/hitTy are already in sprite image space (flip is handled when computing them). Sample a small neighborhood so edge hits still count. */
+function isHeadShotFromMask(z, info, hitTx, hitTy) {
+  const spriteW = info.spriteW ?? ZOMBIE_SPRITE_W;
   const spriteH = info.spriteH ?? ZOMBIE_SPRITE_H;
-  const neckY = info.sy + info.sh * (ZOMBIE_NECK_PX / spriteH);
-  if (py >= neckY) return false;
-  return hitTx >= HEADSHOT_X_MIN && hitTx <= HEADSHOT_X_MAX;
+  const data = z.sprite === assets.zombieFront ? assets.zombieFrontHeadshotData
+    : z.sprite === assets.zombiePickelhaube ? assets.zombiePickelhaubeHeadshotData
+      : assets.zombieHeadshotData;
+  if (!data) return false;
+  const u = hitTx / spriteW;
+  const v = hitTy / spriteH;
+  const cx = Math.floor(u * data.width);
+  const cy = Math.floor(v * data.height);
+  const RAD = 1;
+  for (let dy = -RAD; dy <= RAD; dy++) {
+    for (let dx = -RAD; dx <= RAD; dx++) {
+      const tx = Math.max(0, Math.min(data.width - 1, cx + dx));
+      const ty = Math.max(0, Math.min(data.height - 1, cy + dy));
+      const i = (ty * data.width + tx) * 4;
+      const r = data.data[i];
+      const g = data.data[i + 1];
+      const b = data.data[i + 2];
+      const a = data.data[i + 3];
+      if (a > 64 && r < 140 && g < 140 && b < 140) return true;
+    }
+  }
+  return false;
 }
 
 function damageZombie(idx, hitPx, hitPy) {
@@ -529,7 +660,7 @@ function damageZombie(idx, hitPx, hitPy) {
     ? (info.sx + info.sw - hitPx) / info.sw * spriteW
     : (hitPx - info.sx) / info.sw * spriteW;
   const hitTy = ((hitPy - info.sy) / info.sh) * spriteH;
-  const headShot = isHeadShot(info, hitPy, hitTx);
+  const headShot = isHeadShotFromMask(z, info, hitTx, hitTy);
   const damage = headShot ? ZOMBIE_DAMAGE_HEAD : ZOMBIE_DAMAGE_BODY;
   z.hp -= damage;
   const baseRadii = makeJaggedRadii();
@@ -575,7 +706,7 @@ function getZombieDrawInfo(z) {
 const PIXEL_HIT_ALPHA_THRESHOLD = 1;
 
 function hitTestZombies(px, py) {
-  if (!assets.zombie && !assets.zombieFront) return -1;
+  if (!assets.zombieSprites?.length) return -1;
   const candidates = [];
   for (let i = 0; i < zombies.length; i++) {
     const info = getZombieDrawInfo(zombies[i]);
@@ -632,6 +763,11 @@ function hitTestZombies(px, py) {
 
 // ---- Drawing ----
 
+function getFogFactor(depth) {
+  const d = Math.max(0, depth - FOG_START);
+  return 1 - Math.exp(-d * FOG_DENSITY);
+}
+
 function drawSky() {
   ctx.fillStyle = SKY_COLOR;
   ctx.fillRect(0, 0, W, H);
@@ -651,16 +787,51 @@ function drawGround() {
   const hz = CAMERA_Z + (forward.z / lenXZ) * far;
   const horizonProj = project(hx, 0, hz);
   const horizonY = horizonProj ? horizonProj.sy : H / 2;
+  const floorHorizon = Math.floor(horizonY);
+  const groundH = Math.max(0, H - floorHorizon);
   ctx.fillStyle = GROUND_COLOR;
-  ctx.fillRect(0, Math.floor(horizonY), W, Math.max(0, H - Math.floor(horizonY)));
+  ctx.fillRect(0, floorHorizon, W, groundH);
+  const fog = ctx.createLinearGradient(0, floorHorizon, 0, H);
+  fog.addColorStop(0, FOG_COLOR + '80');
+  fog.addColorStop(1, FOG_COLOR + '00');
+  ctx.fillStyle = fog;
+  ctx.fillRect(0, floorHorizon, W, groundH);
+}
+
+function drawFogWisps() {
+  if (fogWispSprites.length === 0 || fogWispPositions.length === 0) return;
+  const visible = fogWispPositions
+    .map((w) => {
+      const angle = w.baseAngle + gameTime * w.rotSpeed;
+      const x = CAMERA_X + Math.cos(angle) * w.dist;
+      const z = CAMERA_Z + Math.sin(angle) * w.dist;
+      const p = project(x, w.y, z);
+      return p ? { ...w, proj: p } : null;
+    })
+    .filter(Boolean);
+  visible.sort((a, b) => b.proj.depth - a.proj.depth);
+  for (const w of visible) {
+    const size = (FOG_WISP_SPRITE_SIZE * FOG_WISP_REF_DEPTH) / w.proj.depth;
+    const fogF = getFogFactor(w.proj.depth);
+    const alpha = FOG_WISP_BASE_ALPHA * fogF;
+    if (alpha < 0.02) continue;
+    const img = fogWispSprites[w.spriteIndex];
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.drawImage(img, 0, 0, FOG_WISP_SPRITE_SIZE, FOG_WISP_SPRITE_SIZE, w.proj.sx - size / 2, w.proj.sy - size / 2, size, size);
+    ctx.restore();
+  }
 }
 
 function drawZombies() {
-  if (!assets.zombie && !assets.zombieFront) return;
+  if (!assets.zombieSprites?.length) return;
   const withInfo = zombies.map((z) => ({ z, info: getZombieDrawInfo(z) })).filter((o) => o.info);
   withInfo.sort((a, b) => b.info.depth - a.info.depth);
   for (const { z, info } of withInfo) {
-    const img = z.sprite || assets.zombie;
+    const fogF = getFogFactor(info.depth);
+    ctx.save();
+    ctx.globalAlpha = 1 - fogF;
+    const img = z.sprite || assets.zombieSprites[0];
     const spriteW = info.spriteW ?? ZOMBIE_SPRITE_W;
     const spriteH = info.spriteH ?? ZOMBIE_SPRITE_H;
     if (z.holes && z.holes.length > 0) {
@@ -759,6 +930,7 @@ function drawZombies() {
         ctx.drawImage(img, 0, 0, spriteW, spriteH, info.sx, info.sy, info.sw, info.sh);
       }
     }
+    ctx.restore();
   }
 }
 
@@ -905,6 +1077,7 @@ function drawGameOver() {
 function draw() {
   drawSky();
   drawGround();
+  drawFogWisps();
   drawZombies();
   drawParticles();
   if (!gameOver) drawRifle(1 / 60);
@@ -915,6 +1088,7 @@ function draw() {
 }
 
 function tick(dt) {
+  gameTime += dt;
   hitFeedbackTime = Math.max(0, hitFeedbackTime - dt);
   updateParticles(dt);
   if (!gameOver) {
