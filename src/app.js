@@ -41,6 +41,18 @@ const FOG_WISP_REF_DEPTH = 25;  // reference depth for screen size
 const FOG_WISP_BASE_ALPHA = 0.18;
 const FOG_WISP_ROT_SPEED = 0.026;  // rad/sec; each wisp gets ± this (clockwise vs counterclockwise)
 
+// Trees: 4x4 grid of 256x256 sprites in RetroTree.png; bottom-left two cells (0,3),(1,3) empty → 14 variants
+const TREE_SPRITE_SIZE = 256;
+const TREE_GRID_COLS = 4;
+const TREE_GRID_ROWS = 4;
+const TREE_HEIGHT = 25;           // world units (tall so at min dist they use full 256px and dwarf zombies)
+const TREE_MIN_DIST = 22;
+const TREE_MAX_DIST = 55;
+const TREE_COUNT = 32;
+const TREE_HP = 100;
+const TREE_DAMAGE = 1;   // body only; no headshot, so trees rarely "fully explode"
+let trees = [];
+
 // Rifle — 455×256 per frame (fire + reload sheets), same as canvas
 const RIFLE_FRAME_W = 455;
 const RIFLE_FRAME_H = 256;
@@ -252,6 +264,50 @@ function generateFogWisps() {
   }
 }
 
+function generateTrees() {
+  function seeded(initial) {
+    let s = initial;
+    return () => {
+      s = (s * 1103515245 + 12345) >>> 0;
+      return s / 0x100000000;
+    };
+  }
+  const rng = seeded(99999);
+  trees = [];
+  for (let i = 0; i < TREE_COUNT; i++) {
+    const dist = TREE_MIN_DIST + rng() * (TREE_MAX_DIST - TREE_MIN_DIST);
+    const angle = rng() * Math.PI * 2;
+    const x = CAMERA_X + Math.cos(angle) * dist;
+    const z = CAMERA_Z + Math.sin(angle) * dist;
+    const spriteIndex = Math.floor(rng() * 14);
+    trees.push({ x, z, spriteIndex, hp: TREE_HP });
+  }
+}
+
+function getTreeDrawInfo(t) {
+  if (!assets.retrotree) return null;
+  const top = project(t.x, TREE_HEIGHT, t.z);
+  const base = project(t.x, 0, t.z);
+  if (!top || !base || top.depth <= NEAR) return null;
+  const screenH = base.sy - top.sy;
+  const screenW = screenH;
+  const { col, row } = getTreeGridCell(t.spriteIndex);
+  return {
+    sx: top.sx - screenW / 2,
+    sy: top.sy,
+    sw: screenW,
+    sh: screenH,
+    depth: top.depth,
+    col,
+    row,
+  };
+}
+
+function getTreeGridCell(spriteIndex) {
+  if (spriteIndex < 12) return { col: spriteIndex % 4, row: Math.floor(spriteIndex / 4) };
+  return { col: spriteIndex === 12 ? 2 : 3, row: 3 };
+}
+
 async function loadAssets() {
   const base = 'assets';
   assets.rifleFire = await loadImage(`${base}/lee_enfield-Sheet.png`);
@@ -266,6 +322,7 @@ async function loadAssets() {
   assets.zombieHeadshotData = imageDataFromImage(assets.zombieHeadshotMask);
   assets.zombieFrontHeadshotData = imageDataFromImage(assets.zombieFrontHeadshotMask);
   assets.zombiePickelhaubeHeadshotData = imageDataFromImage(assets.zombiePickelhaubeHeadshotMask);
+  assets.retrotree = await loadImage(`${base}/RetroTree.png`);
   assets.shotSounds = SFX_SHOT_PATHS.map((path) => {
     const a = new Audio(path);
     a.preload = 'auto';
@@ -280,6 +337,7 @@ async function loadAssets() {
   const ZOMBIE_SOUND_NAMES = ['zombie_1', 'zombie_2', 'zombie_3', 'zombie_4', 'zombie_5'];
   assets.zombieSoundPaths = ZOMBIE_SOUND_NAMES.map((n) => `${base}/sfx/clean/${n}.ogg`);
   generateFogWisps();
+  generateTrees();
 }
 
 function playShotSound() {
@@ -465,7 +523,7 @@ const PARTICLE_REST_VXZ = 0.5;
 let particles = [];
 let zombieSampleCanvas, zombieSampleCtx;
 let holeCanvas, holeCtx;  // offscreen buffer for zombie-with-holes (true transparency)
-
+let treeHoleCanvas, treeHoleCtx;  // 256x256 buffer for tree-with-holes
 function ensureZombieSampleCanvas(w = ZOMBIE_SPRITE_W, h = ZOMBIE_SPRITE_H) {
   const needW = Math.max(w, 256);
   const needH = Math.max(h, 256);
@@ -622,6 +680,14 @@ function drawParticles() {
   }
 }
 
+function isHeadPixel(data, i) {
+  const a = data.data[i + 3];
+  const r = data.data[i];
+  const g = data.data[i + 1];
+  const b = data.data[i + 2];
+  return a > 64 && r < 140 && g < 140 && b < 140;
+}
+
 /** Black (and non-transparent) pixels in the headshot mask = head. hitTx/hitTy are already in sprite image space (flip is handled when computing them). Sample a small neighborhood so edge hits still count. */
 function isHeadShotFromMask(z, info, hitTx, hitTy) {
   const spriteW = info.spriteW ?? ZOMBIE_SPRITE_W;
@@ -640,11 +706,7 @@ function isHeadShotFromMask(z, info, hitTx, hitTy) {
       const tx = Math.max(0, Math.min(data.width - 1, cx + dx));
       const ty = Math.max(0, Math.min(data.height - 1, cy + dy));
       const i = (ty * data.width + tx) * 4;
-      const r = data.data[i];
-      const g = data.data[i + 1];
-      const b = data.data[i + 2];
-      const a = data.data[i + 3];
-      if (a > 64 && r < 140 && g < 140 && b < 140) return true;
+      if (isHeadPixel(data, i)) return true;
     }
   }
   return false;
@@ -761,6 +823,101 @@ function hitTestZombies(px, py) {
   return candidates[0].i;
 }
 
+/** Returns { type: 'zombie'|'tree', index } for the closest hit, or null. */
+function getHitTarget(px, py) {
+  const candidates = [];
+  const zombieIdx = hitTestZombies(px, py);
+  if (zombieIdx >= 0) {
+    const info = getZombieDrawInfo(zombies[zombieIdx]);
+    if (info) candidates.push({ type: 'zombie', index: zombieIdx, depth: info.depth });
+  }
+  for (let i = 0; i < trees.length; i++) {
+    const info = getTreeDrawInfo(trees[i]);
+    if (!info) continue;
+    if (px >= info.sx && px <= info.sx + info.sw && py >= info.sy && py <= info.sy + info.sh) {
+      candidates.push({ type: 'tree', index: i, depth: info.depth });
+    }
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => a.depth - b.depth);
+  return { type: candidates[0].type, index: candidates[0].index };
+}
+
+function spawnTreeHoleParticles(t, info, hitPx, hitPy, jaggedRadii) {
+  if (!assets.retrotree || particles.length >= MAX_PARTICLES) return;
+  const { col, row } = getTreeGridCell(t.spriteIndex);
+  if (!treeHoleCanvas || treeHoleCanvas.width !== TREE_SPRITE_SIZE || treeHoleCanvas.height !== TREE_SPRITE_SIZE) {
+    treeHoleCanvas = document.createElement('canvas');
+    treeHoleCanvas.width = TREE_SPRITE_SIZE;
+    treeHoleCanvas.height = TREE_SPRITE_SIZE;
+    treeHoleCtx = treeHoleCanvas.getContext('2d');
+  }
+  treeHoleCtx.drawImage(
+    assets.retrotree,
+    col * TREE_SPRITE_SIZE,
+    row * TREE_SPRITE_SIZE,
+    TREE_SPRITE_SIZE,
+    TREE_SPRITE_SIZE,
+    0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE
+  );
+  const idata = treeHoleCtx.getImageData(0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE);
+  const hitTx = ((hitPx - info.sx) / info.sw) * TREE_SPRITE_SIZE;
+  const hitTy = ((hitPy - info.sy) / info.sh) * TREE_SPRITE_SIZE;
+  const tNorm = Math.max(0, Math.min(1, (hitPy - info.sy) / info.sh));
+  const worldY = (1 - tNorm) * TREE_HEIGHT;
+  const maxR = Math.max(...jaggedRadii);
+  let added = 0;
+  for (let dy = -maxR; dy <= maxR && added < HOLE_PARTICLE_COUNT; dy += 2) {
+    for (let dx = -maxR; dx <= maxR && added < HOLE_PARTICLE_COUNT; dx += 2) {
+      if (!insideJaggedShape(dx, dy, jaggedRadii)) continue;
+      const tx = Math.floor(hitTx + dx);
+      const ty = Math.floor(hitTy + dy);
+      if (tx < 0 || tx >= TREE_SPRITE_SIZE || ty < 0 || ty >= TREE_SPRITE_SIZE) continue;
+      const i = (ty * TREE_SPRITE_SIZE + tx) * 4;
+      const r = idata.data[i];
+      const g = idata.data[i + 1];
+      const b = idata.data[i + 2];
+      const a = idata.data[i + 3];
+      if (a < 10) continue;
+      const angle = Math.atan2(dy, dx) + (Math.random() - 0.5);
+      const speed = 2.5 + Math.random() * 2.5;
+      if (particles.length >= MAX_PARTICLES) return;
+      particles.push({
+        wx: t.x + (Math.random() - 0.5) * 0.1,
+        wy: worldY + (Math.random() - 0.5) * 0.05,
+        wz: t.z + (Math.random() - 0.5) * 0.1,
+        vwx: Math.cos(angle) * speed * 0.8,
+        vwy: Math.sin(angle) * speed * 0.5 + 1.5,
+        vwz: Math.sin(angle) * speed * 0.8,
+        r, g, b, a,
+        life: PARTICLE_LIFE,
+        maxLife: PARTICLE_LIFE,
+      });
+      added++;
+    }
+  }
+}
+
+function damageTree(idx, hitPx, hitPy) {
+  const t = trees[idx];
+  const info = getTreeDrawInfo(t);
+  if (!info) return;
+  hitFeedbackTime = HIT_FEEDBACK_DURATION;
+  const hitTx = ((hitPx - info.sx) / info.sw) * TREE_SPRITE_SIZE;
+  const hitTy = ((hitPy - info.sy) / info.sh) * TREE_SPRITE_SIZE;
+  t.hp = (t.hp ?? TREE_HP) - TREE_DAMAGE;
+  const baseRadii = makeJaggedRadii();
+  const jaggedRadii = baseRadii.map((r) => (r * (TREE_SPRITE_SIZE / ZOMBIE_SPRITE_W)) / 10);
+  if (t.hp <= 0) {
+    spawnTreeHoleParticles(t, info, hitPx, hitPy, jaggedRadii);
+    trees.splice(idx, 1);
+  } else {
+    if (!t.holes) t.holes = [];
+    t.holes.push({ tx: hitTx, ty: hitTy, jaggedRadii });
+    spawnTreeHoleParticles(t, info, hitPx, hitPy, jaggedRadii);
+  }
+}
+
 // ---- Drawing ----
 
 function getFogFactor(depth) {
@@ -819,6 +976,116 @@ function drawFogWisps() {
     ctx.save();
     ctx.globalAlpha = alpha;
     ctx.drawImage(img, 0, 0, FOG_WISP_SPRITE_SIZE, FOG_WISP_SPRITE_SIZE, w.proj.sx - size / 2, w.proj.sy - size / 2, size, size);
+    ctx.restore();
+  }
+}
+
+function drawTrees() {
+  if (!assets.retrotree) return;
+  const visible = trees
+    .map((t) => {
+      const top = project(t.x, TREE_HEIGHT, t.z);
+      const base = project(t.x, 0, t.z);
+      if (!top || !base || top.depth <= NEAR) return null;
+      const screenH = base.sy - top.sy;
+      const screenW = screenH;
+      return {
+        ...t,
+        sx: top.sx - screenW / 2,
+        sy: top.sy,
+        sw: screenW,
+        sh: screenH,
+        depth: top.depth,
+      };
+    })
+    .filter(Boolean);
+  visible.sort((a, b) => b.depth - a.depth);
+  const HOLE_EDGE_ALPHA_THRESHOLD_TREE = 10;
+  for (const t of visible) {
+    const { col, row } = getTreeGridCell(t.spriteIndex);
+    const fogF = getFogFactor(t.depth);
+    ctx.save();
+    ctx.globalAlpha = 1 - fogF;
+    if (t.holes && t.holes.length > 0) {
+      if (!treeHoleCanvas || treeHoleCanvas.width !== TREE_SPRITE_SIZE || treeHoleCanvas.height !== TREE_SPRITE_SIZE) {
+        treeHoleCanvas = document.createElement('canvas');
+        treeHoleCanvas.width = TREE_SPRITE_SIZE;
+        treeHoleCanvas.height = TREE_SPRITE_SIZE;
+        treeHoleCtx = treeHoleCanvas.getContext('2d');
+      }
+      treeHoleCtx.clearRect(0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE);
+      treeHoleCtx.drawImage(
+        assets.retrotree,
+        col * TREE_SPRITE_SIZE,
+        row * TREE_SPRITE_SIZE,
+        TREE_SPRITE_SIZE,
+        TREE_SPRITE_SIZE,
+        0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE
+      );
+      const spriteData = treeHoleCtx.getImageData(0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE);
+      for (const hole of t.holes) {
+        const hx = hole.tx;
+        const hy = hole.ty;
+        treeHoleCtx.beginPath();
+        if (hole.jaggedRadii && hole.jaggedRadii.length > 0) {
+          for (let i = 0; i < hole.jaggedRadii.length; i++) {
+            const angle = (i / hole.jaggedRadii.length) * 2 * Math.PI;
+            const r = hole.jaggedRadii[i];
+            const px = hx + Math.cos(angle) * r;
+            const py = hy + Math.sin(angle) * r;
+            if (i === 0) treeHoleCtx.moveTo(px, py);
+            else treeHoleCtx.lineTo(px, py);
+          }
+          treeHoleCtx.closePath();
+        }
+        treeHoleCtx.globalCompositeOperation = 'destination-out';
+        treeHoleCtx.fillStyle = 'rgba(0,0,0,1)';
+        treeHoleCtx.fill();
+        treeHoleCtx.globalCompositeOperation = 'source-over';
+        treeHoleCtx.strokeStyle = '#000';
+        treeHoleCtx.lineWidth = 1;
+        if (hole.jaggedRadii && hole.jaggedRadii.length >= 2) {
+          const n = hole.jaggedRadii.length;
+          for (let i = 0; i < n; i++) {
+            const angle0 = (i / n) * 2 * Math.PI;
+            const angle1 = ((i + 1) / n) * 2 * Math.PI;
+            const v0x = hx + Math.cos(angle0) * hole.jaggedRadii[i];
+            const v0y = hy + Math.sin(angle0) * hole.jaggedRadii[i];
+            const v1x = hx + Math.cos(angle1) * hole.jaggedRadii[(i + 1) % n];
+            const v1y = hy + Math.sin(angle1) * hole.jaggedRadii[(i + 1) % n];
+            const mx = (v0x + v1x) / 2;
+            const my = (v0y + v1y) / 2;
+            const dx = mx - hx;
+            const dy = my - hy;
+            const len = Math.sqrt(dx * dx + dy * dy) || 1;
+            const outX = mx + (dx / len) * 2;
+            const outY = my + (dy / len) * 2;
+            const tx = Math.max(0, Math.min(TREE_SPRITE_SIZE - 1, Math.floor(outX)));
+            const ty = Math.max(0, Math.min(TREE_SPRITE_SIZE - 1, Math.floor(outY)));
+            const idx = (ty * TREE_SPRITE_SIZE + tx) * 4 + 3;
+            if (spriteData.data[idx] > HOLE_EDGE_ALPHA_THRESHOLD_TREE) {
+              treeHoleCtx.beginPath();
+              treeHoleCtx.moveTo(v0x, v0y);
+              treeHoleCtx.lineTo(v1x, v1y);
+              treeHoleCtx.stroke();
+            }
+          }
+        }
+      }
+      ctx.drawImage(treeHoleCanvas, 0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE, t.sx, t.sy, t.sw, t.sh);
+    } else {
+      ctx.drawImage(
+        assets.retrotree,
+        col * TREE_SPRITE_SIZE,
+        row * TREE_SPRITE_SIZE,
+        TREE_SPRITE_SIZE,
+        TREE_SPRITE_SIZE,
+        t.sx,
+        t.sy,
+        t.sw,
+        t.sh
+      );
+    }
     ctx.restore();
   }
 }
@@ -1078,6 +1345,7 @@ function draw() {
   drawSky();
   drawGround();
   drawFogWisps();
+  drawTrees();
   drawZombies();
   drawParticles();
   if (!gameOver) drawRifle(1 / 60);
@@ -1128,8 +1396,11 @@ canvas.addEventListener('click', (e) => {
     rifleFrameTime = 0;
     playShotSound();
     playEjectCasingSound();
-    const idx = hitTestZombies(px, py);
-    if (idx >= 0) damageZombie(idx, px, py);
+    const hit = getHitTarget(px, py);
+    if (hit) {
+      if (hit.type === 'zombie') damageZombie(hit.index, px, py);
+      else damageTree(hit.index, px, py);
+    }
   } else if (shotsInClip === 1) {
     rifleState = 'reloading';
     rifleFrame = 0;
@@ -1137,8 +1408,11 @@ canvas.addEventListener('click', (e) => {
     reloadSoundPlayed = false;
     playShotSound();
     playEjectCasingSound();
-    const idx = hitTestZombies(px, py);
-    if (idx >= 0) damageZombie(idx, px, py);
+    const hit = getHitTarget(px, py);
+    if (hit) {
+      if (hit.type === 'zombie') damageZombie(hit.index, px, py);
+      else damageTree(hit.index, px, py);
+    }
   }
 });
 
