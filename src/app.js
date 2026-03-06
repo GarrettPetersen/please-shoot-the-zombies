@@ -315,13 +315,16 @@ async function loadAssets() {
   assets.zombie = await loadImage(`${base}/german_zombie.png`);
   assets.zombieFront = await loadImage(`${base}/front_facing_zombie.png`);
   assets.zombiePickelhaube = await loadImage(`${base}/pickelhaube_zombie.png`);
-  assets.zombieSprites = [assets.zombie, assets.zombieFront, assets.zombiePickelhaube].filter(Boolean);
+  assets.zombieFemaleGhoul = await loadImage(`${base}/female_ghoul_in_nightgown.png`);
+  assets.zombieSprites = [assets.zombie, assets.zombieFront, assets.zombiePickelhaube, assets.zombieFemaleGhoul].filter(Boolean);
   assets.zombieHeadshotMask = await loadImage(`${base}/german_zombie_headshot_area.png`);
   assets.zombieFrontHeadshotMask = await loadImage(`${base}/front_facing_zombie_headshot_area.png`);
   assets.zombiePickelhaubeHeadshotMask = await loadImage(`${base}/pickelhaube_zombie_headshot_area.png`);
+  assets.zombieFemaleGhoulHeadshotMask = await loadImage(`${base}/female_ghoul_in_nightgown_headshot_area.png`);
   assets.zombieHeadshotData = imageDataFromImage(assets.zombieHeadshotMask);
   assets.zombieFrontHeadshotData = imageDataFromImage(assets.zombieFrontHeadshotMask);
   assets.zombiePickelhaubeHeadshotData = imageDataFromImage(assets.zombiePickelhaubeHeadshotMask);
+  assets.zombieFemaleGhoulHeadshotData = imageDataFromImage(assets.zombieFemaleGhoulHeadshotMask);
   assets.retrotree = await loadImage(`${base}/RetroTree.png`);
   assets.shotSounds = SFX_SHOT_PATHS.map((path) => {
     const a = new Audio(path);
@@ -335,7 +338,9 @@ async function loadAssets() {
   assets.reloadSound = new Audio(SFX_RELOAD_PATH);
   assets.reloadSound.preload = 'auto';
   const ZOMBIE_SOUND_NAMES = ['zombie_1', 'zombie_2', 'zombie_3', 'zombie_4', 'zombie_5'];
+  const ZOMBIE_FEMALE_SOUND_NAMES = ['female_zombie_1', 'female_zombie_2', 'female_zombie_3', 'female_zombie_4'];
   assets.zombieSoundPaths = ZOMBIE_SOUND_NAMES.map((n) => `${base}/sfx/clean/${n}.ogg`);
+  assets.zombieFemaleSoundPaths = ZOMBIE_FEMALE_SOUND_NAMES.map((n) => `${base}/sfx/clean/${n}.ogg`);
   generateFogWisps();
   generateTrees();
 }
@@ -440,7 +445,8 @@ function spawnZombie() {
     : assets.zombie;
   const spawnIndex = spawnCounter++;
   const spawnTime = gameTime;
-  const paths = assets.zombieSoundPaths;
+  const useFemaleSounds = sprite === assets.zombieFemaleGhoul;
+  const paths = useFemaleSounds ? assets.zombieFemaleSoundPaths : assets.zombieSoundPaths;
   const numPaths = paths?.length ?? 0;
   const speedMult = 0.7 + Math.random() * 0.6;
   zombies.push({
@@ -455,6 +461,7 @@ function spawnZombie() {
     spawnIndex,
     spawnTime,
     lastSoundN: 0,   // 0 = played on spawn; next at n=1, 2, ...
+    useFemaleSounds,
   });
   if (numPaths > 0) {
     const which = spawnIndex % numPaths;
@@ -464,9 +471,9 @@ function spawnZombie() {
 
 function updateZombies(dt) {
   if (gameOver) return;
-  const paths = assets.zombieSoundPaths;
-  const numPaths = paths?.length ?? 0;
   for (const z of zombies) {
+    const paths = z.useFemaleSounds ? assets.zombieFemaleSoundPaths : assets.zombieSoundPaths;
+    const numPaths = paths?.length ?? 0;
     z.walkPhase = (z.walkPhase ?? 0) + dt * ZOMBIE_BOB_SPEED;
     z.bob = Math.sin(z.walkPhase) * ZOMBIE_BOB_AMPLITUDE;
     if (numPaths > 0) {
@@ -694,7 +701,8 @@ function isHeadShotFromMask(z, info, hitTx, hitTy) {
   const spriteH = info.spriteH ?? ZOMBIE_SPRITE_H;
   const data = z.sprite === assets.zombieFront ? assets.zombieFrontHeadshotData
     : z.sprite === assets.zombiePickelhaube ? assets.zombiePickelhaubeHeadshotData
-      : assets.zombieHeadshotData;
+      : z.sprite === assets.zombieFemaleGhoul ? assets.zombieFemaleGhoulHeadshotData
+        : assets.zombieHeadshotData;
   if (!data) return false;
   const u = hitTx / spriteW;
   const v = hitTy / spriteH;
@@ -725,6 +733,7 @@ function damageZombie(idx, hitPx, hitPy) {
   const headShot = isHeadShotFromMask(z, info, hitTx, hitTy);
   const damage = headShot ? ZOMBIE_DAMAGE_HEAD : ZOMBIE_DAMAGE_BODY;
   z.hp -= damage;
+  hitFeedbackTime = HIT_FEEDBACK_DURATION;  // white reticule only when we actually damage an enemy
   const baseRadii = makeJaggedRadii();
   const jaggedRadii = baseRadii.map((r) => r * (spriteW / ZOMBIE_SPRITE_W));
   if (z.hp <= 0) {
@@ -733,7 +742,6 @@ function damageZombie(idx, hitPx, hitPy) {
     zombies.splice(idx, 1);
     score += 1;
     spawnTimer = 0;
-    hitFeedbackTime = HIT_FEEDBACK_DURATION;
   } else {
     if (!z.holes) z.holes = [];
     z.holes.push({ tx: hitTx, ty: hitTy, jaggedRadii });
@@ -902,7 +910,7 @@ function damageTree(idx, hitPx, hitPy) {
   const t = trees[idx];
   const info = getTreeDrawInfo(t);
   if (!info) return;
-  hitFeedbackTime = HIT_FEEDBACK_DURATION;
+  // no hit feedback for trees — white reticule only when damaging an enemy (zombie)
   const hitTx = ((hitPx - info.sx) / info.sw) * TREE_SPRITE_SIZE;
   const hitTy = ((hitPy - info.sy) / info.sh) * TREE_SPRITE_SIZE;
   t.hp = (t.hp ?? TREE_HP) - TREE_DAMAGE;
