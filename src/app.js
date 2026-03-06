@@ -44,7 +44,9 @@ const ZOMBIE_REF_HEIGHT = 1.8;  // world units (height of zombie)
 const ZOMBIE_REF_DIST = 10;     // distance at which zombie appears at "normal" screen size
 const ZOMBIE_SPRITE_W = 132;
 const ZOMBIE_SPRITE_H = 256;
-const ZOMBIE_NECK_PX = 46;     // pixels from top of sprite; above = head (was 185 at 1024px height)
+const ZOMBIE_NECK_PX = 46;     // pixels from top of sprite; above = head
+const HEADSHOT_X_MIN = 100;    // headshot only counts when sprite x in [HEADSHOT_X_MIN, HEADSHOT_X_MAX] (e.g. exclude raised hands on front-facing)
+const HEADSHOT_X_MAX = 150;
 const ZOMBIE_HP_MAX = 3;
 const ZOMBIE_DAMAGE_BODY = 1;
 const ZOMBIE_DAMAGE_HEAD = 3;
@@ -179,6 +181,8 @@ async function loadAssets() {
   assets.rifleFire = await loadImage(`${base}/lee_enfield-Sheet.png`);
   assets.rifleReload = await loadImage(`${base}/lee_enfield_reload-Sheet.png`);
   assets.zombie = await loadImage(`${base}/german_zombie.png`);
+  assets.zombieFront = await loadImage(`${base}/front_facing_zombie.png`);
+  assets.zombieSprites = [assets.zombie, assets.zombieFront].filter(Boolean);
   assets.shotSounds = SFX_SHOT_PATHS.map((path) => {
     const a = new Audio(path);
     a.preload = 'auto';
@@ -288,11 +292,17 @@ function spawnZombie() {
   const dist = SPAWN_MIN_DIST + Math.random() * (SPAWN_MAX_DIST - SPAWN_MIN_DIST);
   const x = CAMERA_X + Math.cos(angle) * dist;
   const z = CAMERA_Z + Math.sin(angle) * dist;
+  const sprite = assets.zombieSprites.length > 0
+    ? assets.zombieSprites[Math.floor(Math.random() * assets.zombieSprites.length)]
+    : assets.zombie;
   zombies.push({
     x, y: 0, z, hp: ZOMBIE_HP_MAX,
     walkPhase: Math.random() * Math.PI * 2,
-    walkDir: Math.random() < 0.5 ? 1 : -1,  // 1 = facing right (not flipped), -1 = facing left (flipped)
+    walkDir: Math.random() < 0.5 ? 1 : -1,
     distanceWalked: 0,
+    sprite,
+    spriteW: sprite?.naturalWidth ?? ZOMBIE_SPRITE_W,
+    spriteH: sprite?.naturalHeight ?? ZOMBIE_SPRITE_H,
   });
   if (assets.zombieSoundPaths && assets.zombieSoundPaths.length > 0) {
     const which = Math.floor(Math.random() * assets.zombieSoundPaths.length);
@@ -351,12 +361,16 @@ let particles = [];
 let zombieSampleCanvas, zombieSampleCtx;
 let holeCanvas, holeCtx;  // offscreen buffer for zombie-with-holes (true transparency)
 
-function ensureZombieSampleCanvas() {
-  if (zombieSampleCtx) return;
-  zombieSampleCanvas = document.createElement('canvas');
-  zombieSampleCanvas.width = ZOMBIE_SPRITE_W;
-  zombieSampleCanvas.height = ZOMBIE_SPRITE_H;
-  zombieSampleCtx = zombieSampleCanvas.getContext('2d');
+function ensureZombieSampleCanvas(w = ZOMBIE_SPRITE_W, h = ZOMBIE_SPRITE_H) {
+  const needW = Math.max(w, 256);
+  const needH = Math.max(h, 256);
+  if (zombieSampleCtx && zombieSampleCanvas.width >= needW && zombieSampleCanvas.height >= needH) return;
+  if (!zombieSampleCanvas || zombieSampleCanvas.width < needW || zombieSampleCanvas.height < needH) {
+    zombieSampleCanvas = document.createElement('canvas');
+    zombieSampleCanvas.width = needW;
+    zombieSampleCanvas.height = needH;
+    zombieSampleCtx = zombieSampleCanvas.getContext('2d');
+  }
 }
 
 function makeJaggedRadii() {
@@ -382,14 +396,17 @@ function insideJaggedShape(dx, dy, radii) {
 }
 
 function spawnHoleParticles(z, info, hitPx, hitPy, jaggedRadii) {
-  if (!assets.zombie || particles.length >= MAX_PARTICLES) return;
-  ensureZombieSampleCanvas();
-  zombieSampleCtx.drawImage(assets.zombie, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
-  const idata = zombieSampleCtx.getImageData(0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
+  const img = z.sprite || assets.zombie;
+  if (!img || particles.length >= MAX_PARTICLES) return;
+  const w = info.spriteW ?? ZOMBIE_SPRITE_W;
+  const h = info.spriteH ?? ZOMBIE_SPRITE_H;
+  ensureZombieSampleCanvas(w, h);
+  zombieSampleCtx.drawImage(img, 0, 0, w, h, 0, 0, w, h);
+  const idata = zombieSampleCtx.getImageData(0, 0, w, h);
   const hitTx = info.flip
-    ? (info.sx + info.sw - hitPx) / info.sw * ZOMBIE_SPRITE_W
-    : (hitPx - info.sx) / info.sw * ZOMBIE_SPRITE_W;
-  const hitTy = ((hitPy - info.sy) / info.sh) * ZOMBIE_SPRITE_H;
+    ? (info.sx + info.sw - hitPx) / info.sw * w
+    : (hitPx - info.sx) / info.sw * w;
+  const hitTy = ((hitPy - info.sy) / info.sh) * h;
   const t = Math.max(0, Math.min(1, (hitPy - info.sy) / info.sh));
   const worldY = z.y + (1 - t) * ZOMBIE_REF_HEIGHT;
   const maxR = Math.max(...jaggedRadii);
@@ -399,8 +416,8 @@ function spawnHoleParticles(z, info, hitPx, hitPy, jaggedRadii) {
       if (!insideJaggedShape(dx, dy, jaggedRadii)) continue;
       const tx = Math.floor(hitTx + dx);
       const ty = Math.floor(hitTy + dy);
-      if (tx < 0 || tx >= ZOMBIE_SPRITE_W || ty < 0 || ty >= ZOMBIE_SPRITE_H) continue;
-      const i = (ty * ZOMBIE_SPRITE_W + tx) * 4;
+      if (tx < 0 || tx >= w || ty < 0 || ty >= h) continue;
+      const i = (ty * w + tx) * 4;
       const r = idata.data[i];
       const g = idata.data[i + 1];
       const b = idata.data[i + 2];
@@ -426,19 +443,23 @@ function spawnHoleParticles(z, info, hitPx, hitPy, jaggedRadii) {
 }
 
 function spawnDeathParticles(z, info) {
-  if (!assets.zombie || particles.length >= MAX_PARTICLES) return;
-  ensureZombieSampleCanvas();
-  zombieSampleCtx.drawImage(assets.zombie, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
-  const idata = zombieSampleCtx.getImageData(0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
-  for (let ty = 0; ty < ZOMBIE_SPRITE_H; ty += DEATH_GRID_STEP) {
-    for (let tx = 0; tx < ZOMBIE_SPRITE_W; tx += DEATH_GRID_STEP) {
-      const i = (ty * ZOMBIE_SPRITE_W + tx) * 4;
+  const img = z.sprite || assets.zombie;
+  if (!img || particles.length >= MAX_PARTICLES) return;
+  const w = info.spriteW ?? ZOMBIE_SPRITE_W;
+  const h = info.spriteH ?? ZOMBIE_SPRITE_H;
+  ensureZombieSampleCanvas(w, h);
+  zombieSampleCtx.drawImage(img, 0, 0, w, h, 0, 0, w, h);
+  const idata = zombieSampleCtx.getImageData(0, 0, w, h);
+  const step = Math.max(DEATH_GRID_STEP, Math.floor(DEATH_GRID_STEP * w / ZOMBIE_SPRITE_W));
+  for (let ty = 0; ty < h; ty += step) {
+    for (let tx = 0; tx < w; tx += step) {
+      const i = (ty * w + tx) * 4;
       const a = idata.data[i + 3];
       if (a < 10) continue;
       if (particles.length >= MAX_PARTICLES) return;
-      const worldY = z.y + (1 - ty / ZOMBIE_SPRITE_H) * ZOMBIE_REF_HEIGHT;
+      const worldY = z.y + (1 - ty / h) * ZOMBIE_REF_HEIGHT;
       particles.push({
-        wx: z.x + (tx / ZOMBIE_SPRITE_W - 0.5) * 0.4,
+        wx: z.x + (tx / w - 0.5) * 0.4,
         wy: worldY,
         wz: z.z + (Math.random() - 0.5) * 0.2,
         vwx: (Math.random() - 0.5) * 0.8,
@@ -491,23 +512,28 @@ function drawParticles() {
   }
 }
 
-function isHeadShot(info, py) {
-  const neckY = info.sy + info.sh * (ZOMBIE_NECK_PX / ZOMBIE_SPRITE_H);
-  return py < neckY;
+function isHeadShot(info, py, hitTx) {
+  const spriteH = info.spriteH ?? ZOMBIE_SPRITE_H;
+  const neckY = info.sy + info.sh * (ZOMBIE_NECK_PX / spriteH);
+  if (py >= neckY) return false;
+  return hitTx >= HEADSHOT_X_MIN && hitTx <= HEADSHOT_X_MAX;
 }
 
 function damageZombie(idx, hitPx, hitPy) {
   const z = zombies[idx];
   const info = getZombieDrawInfo(z);
   if (!info) return;
-  const headShot = isHeadShot(info, hitPy);
+  const spriteW = info.spriteW ?? ZOMBIE_SPRITE_W;
+  const spriteH = info.spriteH ?? ZOMBIE_SPRITE_H;
+  const hitTx = info.flip
+    ? (info.sx + info.sw - hitPx) / info.sw * spriteW
+    : (hitPx - info.sx) / info.sw * spriteW;
+  const hitTy = ((hitPy - info.sy) / info.sh) * spriteH;
+  const headShot = isHeadShot(info, hitPy, hitTx);
   const damage = headShot ? ZOMBIE_DAMAGE_HEAD : ZOMBIE_DAMAGE_BODY;
   z.hp -= damage;
-  const hitTx = info.flip
-    ? (info.sx + info.sw - hitPx) / info.sw * ZOMBIE_SPRITE_W
-    : (hitPx - info.sx) / info.sw * ZOMBIE_SPRITE_W;
-  const hitTy = ((hitPy - info.sy) / info.sh) * ZOMBIE_SPRITE_H;
-  const jaggedRadii = makeJaggedRadii();
+  const baseRadii = makeJaggedRadii();
+  const jaggedRadii = baseRadii.map((r) => r * (spriteW / ZOMBIE_SPRITE_W));
   if (z.hp <= 0) {
     spawnHoleParticles(z, info, hitPx, hitPy, jaggedRadii);
     spawnDeathParticles(z, info);
@@ -522,7 +548,7 @@ function damageZombie(idx, hitPx, hitPy) {
   }
 }
 
-// Zombie sprite: flip from walk direction (walking right = not flipped, walking left = flipped).
+// Zombie sprite: flip from walk direction. Uses per-zombie sprite dimensions for aspect.
 function getZombieDrawInfo(z) {
   const bob = z.bob ?? 0;
   const feetY = z.y + bob;
@@ -531,7 +557,9 @@ function getZombieDrawInfo(z) {
   const feetProj = project(z.x, feetY, z.z);
   if (!headProj || headProj.depth <= NEAR || !feetProj) return null;
   const screenH = feetProj.sy - headProj.sy;
-  const screenW = screenH * (ZOMBIE_SPRITE_W / ZOMBIE_SPRITE_H);
+  const spriteW = z.spriteW ?? ZOMBIE_SPRITE_W;
+  const spriteH = z.spriteH ?? ZOMBIE_SPRITE_H;
+  const screenW = screenH * (spriteW / spriteH);
   return {
     sx: headProj.sx - screenW / 2,
     sy: headProj.sy,
@@ -539,13 +567,15 @@ function getZombieDrawInfo(z) {
     sh: screenH,
     depth: headProj.depth,
     flip: (z.walkDir ?? 1) === -1,
+    spriteW,
+    spriteH,
   };
 }
 
 const PIXEL_HIT_ALPHA_THRESHOLD = 1;
 
 function hitTestZombies(px, py) {
-  if (!assets.zombie) return -1;
+  if (!assets.zombie && !assets.zombieFront) return -1;
   const candidates = [];
   for (let i = 0; i < zombies.length; i++) {
     const info = getZombieDrawInfo(zombies[i]);
@@ -557,20 +587,32 @@ function hitTestZombies(px, py) {
   if (candidates.length === 0) return -1;
   candidates.sort((a, b) => a.depth - b.depth);
 
-  ensureZombieSampleCanvas();
-  // Use same source rect as game draw so sample matches on-screen sprite (handles any image size)
-  zombieSampleCtx.drawImage(assets.zombie, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
-  const idata = zombieSampleCtx.getImageData(0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
+  const spriteToData = new Map();
+  function getIdata(z, info) {
+    const img = z.sprite || assets.zombie;
+    const w = info.spriteW ?? ZOMBIE_SPRITE_W;
+    const h = info.spriteH ?? ZOMBIE_SPRITE_H;
+    const key = `${img?.src ?? ''}-${w}-${h}`;
+    if (!spriteToData.has(key)) {
+      ensureZombieSampleCanvas(w, h);
+      zombieSampleCtx.drawImage(img, 0, 0, w, h, 0, 0, w, h);
+      spriteToData.set(key, zombieSampleCtx.getImageData(0, 0, w, h));
+    }
+    return spriteToData.get(key);
+  }
 
   for (const { i, info, z } of candidates) {
+    const spriteW = info.spriteW ?? ZOMBIE_SPRITE_W;
+    const spriteH = info.spriteH ?? ZOMBIE_SPRITE_H;
+    const idata = getIdata(z, info);
     const tx = info.flip
-      ? (info.sx + info.sw - px) / info.sw * ZOMBIE_SPRITE_W
-      : (px - info.sx) / info.sw * ZOMBIE_SPRITE_W;
-    const ty = (py - info.sy) / info.sh * ZOMBIE_SPRITE_H;
+      ? (info.sx + info.sw - px) / info.sw * spriteW
+      : (px - info.sx) / info.sw * spriteW;
+    const ty = (py - info.sy) / info.sh * spriteH;
     const txF = Math.floor(tx);
     const tyF = Math.floor(ty);
-    if (txF < 0 || txF >= ZOMBIE_SPRITE_W || tyF < 0 || tyF >= ZOMBIE_SPRITE_H) continue;
-    const idx = (tyF * ZOMBIE_SPRITE_W + txF) * 4 + 3;
+    if (txF < 0 || txF >= spriteW || tyF < 0 || tyF >= spriteH) continue;
+    const idx = (tyF * spriteW + txF) * 4 + 3;
     if (idata.data[idx] < PIXEL_HIT_ALPHA_THRESHOLD) continue;
     if (z.holes && z.holes.length > 0) {
       let inHole = false;
@@ -614,10 +656,13 @@ function drawGround() {
 }
 
 function drawZombies() {
-  if (!assets.zombie) return;
+  if (!assets.zombie && !assets.zombieFront) return;
   const withInfo = zombies.map((z) => ({ z, info: getZombieDrawInfo(z) })).filter((o) => o.info);
   withInfo.sort((a, b) => b.info.depth - a.info.depth);
   for (const { z, info } of withInfo) {
+    const img = z.sprite || assets.zombie;
+    const spriteW = info.spriteW ?? ZOMBIE_SPRITE_W;
+    const spriteH = info.spriteH ?? ZOMBIE_SPRITE_H;
     if (z.holes && z.holes.length > 0) {
       const rw = Math.ceil(info.sw);
       const rh = Math.ceil(info.sh);
@@ -628,17 +673,17 @@ function drawZombies() {
         holeCtx = holeCanvas.getContext('2d');
       }
       holeCtx.clearRect(0, 0, holeCanvas.width, holeCanvas.height);
-      holeCtx.drawImage(assets.zombie, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H, 0, 0, info.sw, info.sh);
+      holeCtx.drawImage(img, 0, 0, spriteW, spriteH, 0, 0, info.sw, info.sh);
       const holeRadiusScreen = (HOLE_RADIUS_SPRITE / ZOMBIE_SPRITE_W) * info.sw;
-      ensureZombieSampleCanvas();
-      zombieSampleCtx.drawImage(assets.zombie, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
-      const spriteData = zombieSampleCtx.getImageData(0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
+      ensureZombieSampleCanvas(spriteW, spriteH);
+      zombieSampleCtx.drawImage(img, 0, 0, spriteW, spriteH, 0, 0, spriteW, spriteH);
+      const spriteData = zombieSampleCtx.getImageData(0, 0, spriteW, spriteH);
       const HOLE_EDGE_ALPHA_THRESHOLD = 10;
       for (const hole of z.holes) {
-        const hx = (hole.tx / ZOMBIE_SPRITE_W) * info.sw;
-        const hy = (hole.ty / ZOMBIE_SPRITE_H) * info.sh;
-        const scaleX = info.sw / ZOMBIE_SPRITE_W;
-        const scaleY = info.sh / ZOMBIE_SPRITE_H;
+        const hx = (hole.tx / spriteW) * info.sw;
+        const hy = (hole.ty / spriteH) * info.sh;
+        const scaleX = info.sw / spriteW;
+        const scaleY = info.sh / spriteH;
         let vertices = [];
         holeCtx.beginPath();
         if (hole.jaggedRadii && hole.jaggedRadii.length > 0) {
@@ -680,11 +725,11 @@ function drawZombies() {
             const len = Math.sqrt(dx * dx + dy * dy) || 1;
             const outX = mx + (dx / len) * 2;
             const outY = my + (dy / len) * 2;
-            const sx = Math.floor((outX / info.sw) * ZOMBIE_SPRITE_W);
-            const sy = Math.floor((outY / info.sh) * ZOMBIE_SPRITE_H);
-            const tx = Math.max(0, Math.min(ZOMBIE_SPRITE_W - 1, sx));
-            const ty = Math.max(0, Math.min(ZOMBIE_SPRITE_H - 1, sy));
-            const idx = (ty * ZOMBIE_SPRITE_W + tx) * 4 + 3;
+            const sx = Math.floor((outX / info.sw) * spriteW);
+            const sy = Math.floor((outY / info.sh) * spriteH);
+            const tx = Math.max(0, Math.min(spriteW - 1, sx));
+            const ty = Math.max(0, Math.min(spriteH - 1, sy));
+            const idx = (ty * spriteW + tx) * 4 + 3;
             if (spriteData.data[idx] > HOLE_EDGE_ALPHA_THRESHOLD) {
               holeCtx.beginPath();
               holeCtx.moveTo(v0.x, v0.y);
@@ -708,10 +753,10 @@ function drawZombies() {
         ctx.save();
         ctx.translate(info.sx + info.sw, info.sy);
         ctx.scale(-1, 1);
-        ctx.drawImage(assets.zombie, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H, 0, 0, info.sw, info.sh);
+        ctx.drawImage(img, 0, 0, spriteW, spriteH, 0, 0, info.sw, info.sh);
         ctx.restore();
       } else {
-        ctx.drawImage(assets.zombie, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H, info.sx, info.sy, info.sw, info.sh);
+        ctx.drawImage(img, 0, 0, spriteW, spriteH, info.sx, info.sy, info.sw, info.sh);
       }
     }
   }
