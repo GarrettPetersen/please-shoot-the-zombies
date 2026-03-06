@@ -39,21 +39,30 @@ const RIFLE_RELOAD_FRAME_COUNT = 75;
 const RIFLE_FPS = 24;
 const RIFLE_CLIP_SIZE = 5;
 
-// Zombie: 3D position, sprite 512×1024; reference size at reference distance
+// Zombie: 3D position, sprite size and reference at distance
 const ZOMBIE_REF_HEIGHT = 1.8;  // world units (height of zombie)
 const ZOMBIE_REF_DIST = 10;     // distance at which zombie appears at "normal" screen size
-const ZOMBIE_SPRITE_W = 512;
-const ZOMBIE_SPRITE_H = 1024;
-const ZOMBIE_NECK_PX = 185;    // pixels from top of sprite; above = head
+const ZOMBIE_SPRITE_W = 132;
+const ZOMBIE_SPRITE_H = 256;
+const ZOMBIE_NECK_PX = 46;     // pixels from top of sprite; above = head (was 185 at 1024px height)
 const ZOMBIE_HP_MAX = 3;
 const ZOMBIE_DAMAGE_BODY = 1;
 const ZOMBIE_DAMAGE_HEAD = 3;
 
-// Spawn: random XZ in annulus so they appear around the player
-const SPAWN_MIN_DIST = 2;
-const SPAWN_MAX_DIST = 14;
-const SPAWN_DELAY = 480;  // frames between spawns (~8s at 60fps) — much slower
-const MAX_ZOMBIES = 50;
+// Spawn: start far away; they walk toward player
+const SPAWN_MIN_DIST = 28;
+const SPAWN_MAX_DIST = 55;
+const SPAWN_DELAY = 520;
+const MAX_ZOMBIES = 20;
+const ZOMBIE_SPEED = 0.7;        // world units/sec toward player (slower)
+const ZOMBIE_ZIGZAG = 0.5;      // lateral sway (world units)
+const ZOMBIE_ZIGZAG_SPEED = 2.5; // rad/sec for zigzag phase
+const ZOMBIE_BOB_AMPLITUDE = 0.06;
+const ZOMBIE_BOB_SPEED = 9;     // rad/sec for walk bob
+const ZOMBIE_TOUCH_DIST = 0.9;  // game over if zombie this close
+const ZOMBIE_DIR_CHANGE_DIST = 2.5;   // world units walked before maybe changing direction
+const ZOMBIE_DIR_CHANGE_CHANCE = 0.35; // probability to flip direction when threshold reached
+const GAME_OVER_FLASH_DURATION = 0.6;
 
 let assets = {};
 let score = 0;
@@ -64,6 +73,8 @@ let shotsInClip = RIFLE_CLIP_SIZE;
 let zombies = [];  // { x, y, z } in world space
 let spawnTimer = 0;
 let pointerLocked = false;
+let gameOver = false;
+let gameOverFlashStart = 0;
 let hitFeedbackTime = 0;  // seconds to show hit reticule (CoD-style diagonal)
 let audioContext = null;  // Web Audio API context for positional sounds
 
@@ -277,10 +288,46 @@ function spawnZombie() {
   const dist = SPAWN_MIN_DIST + Math.random() * (SPAWN_MAX_DIST - SPAWN_MIN_DIST);
   const x = CAMERA_X + Math.cos(angle) * dist;
   const z = CAMERA_Z + Math.sin(angle) * dist;
-  zombies.push({ x, y: 0, z, hp: ZOMBIE_HP_MAX });
+  zombies.push({
+    x, y: 0, z, hp: ZOMBIE_HP_MAX,
+    walkPhase: Math.random() * Math.PI * 2,
+    walkDir: Math.random() < 0.5 ? 1 : -1,  // 1 = facing right (not flipped), -1 = facing left (flipped)
+    distanceWalked: 0,
+  });
   if (assets.zombieSoundPaths && assets.zombieSoundPaths.length > 0) {
     const which = Math.floor(Math.random() * assets.zombieSoundPaths.length);
     playPositionalSound(assets.zombieSoundPaths[which], x, z);
+  }
+}
+
+function updateZombies(dt) {
+  if (gameOver) return;
+  for (const z of zombies) {
+    z.walkPhase = (z.walkPhase ?? 0) + dt * ZOMBIE_BOB_SPEED;
+    z.bob = Math.sin(z.walkPhase) * ZOMBIE_BOB_AMPLITUDE;
+    const dx = CAMERA_X - z.x;
+    const dz = CAMERA_Z - z.z;
+    const d = Math.sqrt(dx * dx + dz * dz) || 0.001;
+    if (d < ZOMBIE_TOUCH_DIST) {
+      gameOver = true;
+      gameOverFlashStart = performance.now() / 1000;
+      return;
+    }
+    const ux = dx / d;
+    const uz = dz / d;
+    const perpX = -uz;
+    const perpZ = ux;
+    const walkDir = z.walkDir ?? 1;
+    const zigzag = walkDir * Math.sin(z.walkPhase * ZOMBIE_ZIGZAG_SPEED) * ZOMBIE_ZIGZAG;
+    const vx = (ux * ZOMBIE_SPEED + perpX * zigzag) * dt;
+    const vz = (uz * ZOMBIE_SPEED + perpZ * zigzag) * dt;
+    z.x += vx;
+    z.z += vz;
+    z.distanceWalked = (z.distanceWalked ?? 0) + Math.sqrt(vx * vx + vz * vz);
+    if (z.distanceWalked >= ZOMBIE_DIR_CHANGE_DIST && Math.random() < ZOMBIE_DIR_CHANGE_CHANCE) {
+      z.walkDir = -walkDir;
+      z.distanceWalked = 0;
+    }
   }
 }
 
@@ -288,11 +335,11 @@ const HIT_FEEDBACK_DURATION = 0.18;  // seconds to show diagonal hit reticule
 
 // Particle system (performance: caps, simple physics, small draw)
 const MAX_PARTICLES = 1200;
-const HOLE_RADIUS_SPRITE = 70;  // 2.5x original (28*2.5) for big visible hole
-const HOLE_JAGGED_POINTS = 24;  // number of points around the hole for jagged shape
-const HOLE_JAGGED_AMOUNT = 0.45; // 0 = circle, larger = more irregular (radius *= 1 ± this)
+const HOLE_RADIUS_SPRITE = 18;  // scaled for 132px-wide sprite (was 70 at 512)
+const HOLE_JAGGED_POINTS = 24;
+const HOLE_JAGGED_AMOUNT = 0.45;
 const HOLE_PARTICLE_COUNT = 90;
-const DEATH_GRID_STEP = 20;   // sample zombie texture every N px for death pile
+const DEATH_GRID_STEP = 5;    // sample every N px for death pile (scaled from 20 at 512 width)
 const PARTICLE_LIFE = 2.5;
 const WORLD_GRAVITY = 18;      // world units/s² (y down)
 const PARTICLE_BOUNCE = 0.35;
@@ -337,9 +384,11 @@ function insideJaggedShape(dx, dy, radii) {
 function spawnHoleParticles(z, info, hitPx, hitPy, jaggedRadii) {
   if (!assets.zombie || particles.length >= MAX_PARTICLES) return;
   ensureZombieSampleCanvas();
-  zombieSampleCtx.drawImage(assets.zombie, 0, 0);
+  zombieSampleCtx.drawImage(assets.zombie, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
   const idata = zombieSampleCtx.getImageData(0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
-  const hitTx = ((hitPx - info.sx) / info.sw) * ZOMBIE_SPRITE_W;
+  const hitTx = info.flip
+    ? (info.sx + info.sw - hitPx) / info.sw * ZOMBIE_SPRITE_W
+    : (hitPx - info.sx) / info.sw * ZOMBIE_SPRITE_W;
   const hitTy = ((hitPy - info.sy) / info.sh) * ZOMBIE_SPRITE_H;
   const t = Math.max(0, Math.min(1, (hitPy - info.sy) / info.sh));
   const worldY = z.y + (1 - t) * ZOMBIE_REF_HEIGHT;
@@ -379,7 +428,7 @@ function spawnHoleParticles(z, info, hitPx, hitPy, jaggedRadii) {
 function spawnDeathParticles(z, info) {
   if (!assets.zombie || particles.length >= MAX_PARTICLES) return;
   ensureZombieSampleCanvas();
-  zombieSampleCtx.drawImage(assets.zombie, 0, 0);
+  zombieSampleCtx.drawImage(assets.zombie, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
   const idata = zombieSampleCtx.getImageData(0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
   for (let ty = 0; ty < ZOMBIE_SPRITE_H; ty += DEATH_GRID_STEP) {
     for (let tx = 0; tx < ZOMBIE_SPRITE_W; tx += DEATH_GRID_STEP) {
@@ -454,7 +503,9 @@ function damageZombie(idx, hitPx, hitPy) {
   const headShot = isHeadShot(info, hitPy);
   const damage = headShot ? ZOMBIE_DAMAGE_HEAD : ZOMBIE_DAMAGE_BODY;
   z.hp -= damage;
-  const hitTx = ((hitPx - info.sx) / info.sw) * ZOMBIE_SPRITE_W;
+  const hitTx = info.flip
+    ? (info.sx + info.sw - hitPx) / info.sw * ZOMBIE_SPRITE_W
+    : (hitPx - info.sx) / info.sw * ZOMBIE_SPRITE_W;
   const hitTy = ((hitPy - info.sy) / info.sh) * ZOMBIE_SPRITE_H;
   const jaggedRadii = makeJaggedRadii();
   if (z.hp <= 0) {
@@ -471,23 +522,27 @@ function damageZombie(idx, hitPx, hitPy) {
   }
 }
 
-// Zombie sprite: 512×1024. Anchor by head and feet so they sit on the ground (no floating)
+// Zombie sprite: flip from walk direction (walking right = not flipped, walking left = flipped).
 function getZombieDrawInfo(z) {
-  const headProj = project(z.x, z.y + ZOMBIE_REF_HEIGHT, z.z);
-  const feetProj = project(z.x, z.y, z.z);
+  const bob = z.bob ?? 0;
+  const feetY = z.y + bob;
+  const headY = z.y + ZOMBIE_REF_HEIGHT + bob;
+  const headProj = project(z.x, headY, z.z);
+  const feetProj = project(z.x, feetY, z.z);
   if (!headProj || headProj.depth <= NEAR || !feetProj) return null;
-  const screenH = feetProj.sy - headProj.sy;  // head above feet on screen; height = projected span
-  const screenW = screenH * (512 / 1024);
+  const screenH = feetProj.sy - headProj.sy;
+  const screenW = screenH * (ZOMBIE_SPRITE_W / ZOMBIE_SPRITE_H);
   return {
     sx: headProj.sx - screenW / 2,
     sy: headProj.sy,
     sw: screenW,
     sh: screenH,
     depth: headProj.depth,
+    flip: (z.walkDir ?? 1) === -1,
   };
 }
 
-const PIXEL_HIT_ALPHA_THRESHOLD = 10;
+const PIXEL_HIT_ALPHA_THRESHOLD = 1;
 
 function hitTestZombies(px, py) {
   if (!assets.zombie) return -1;
@@ -503,11 +558,14 @@ function hitTestZombies(px, py) {
   candidates.sort((a, b) => a.depth - b.depth);
 
   ensureZombieSampleCanvas();
-  zombieSampleCtx.drawImage(assets.zombie, 0, 0);
+  // Use same source rect as game draw so sample matches on-screen sprite (handles any image size)
+  zombieSampleCtx.drawImage(assets.zombie, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
   const idata = zombieSampleCtx.getImageData(0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
 
   for (const { i, info, z } of candidates) {
-    const tx = (px - info.sx) / info.sw * ZOMBIE_SPRITE_W;
+    const tx = info.flip
+      ? (info.sx + info.sw - px) / info.sw * ZOMBIE_SPRITE_W
+      : (px - info.sx) / info.sw * ZOMBIE_SPRITE_W;
     const ty = (py - info.sy) / info.sh * ZOMBIE_SPRITE_H;
     const txF = Math.floor(tx);
     const tyF = Math.floor(ty);
@@ -526,7 +584,8 @@ function hitTestZombies(px, py) {
     }
     return i;
   }
-  return -1;
+  // Pixel-perfect missed (e.g. transparent pixel); still count AABB hit so bullets register
+  return candidates[0].i;
 }
 
 // ---- Drawing ----
@@ -572,7 +631,7 @@ function drawZombies() {
       holeCtx.drawImage(assets.zombie, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H, 0, 0, info.sw, info.sh);
       const holeRadiusScreen = (HOLE_RADIUS_SPRITE / ZOMBIE_SPRITE_W) * info.sw;
       ensureZombieSampleCanvas();
-      zombieSampleCtx.drawImage(assets.zombie, 0, 0);
+      zombieSampleCtx.drawImage(assets.zombie, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
       const spriteData = zombieSampleCtx.getImageData(0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H);
       const HOLE_EDGE_ALPHA_THRESHOLD = 10;
       for (const hole of z.holes) {
@@ -635,9 +694,25 @@ function drawZombies() {
           }
         }
       }
-      ctx.drawImage(holeCanvas, 0, 0, info.sw, info.sh, info.sx, info.sy, info.sw, info.sh);
+      if (info.flip) {
+        ctx.save();
+        ctx.translate(info.sx + info.sw, info.sy);
+        ctx.scale(-1, 1);
+        ctx.drawImage(holeCanvas, 0, 0, info.sw, info.sh, 0, 0, info.sw, info.sh);
+        ctx.restore();
+      } else {
+        ctx.drawImage(holeCanvas, 0, 0, info.sw, info.sh, info.sx, info.sy, info.sw, info.sh);
+      }
     } else {
-      ctx.drawImage(assets.zombie, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H, info.sx, info.sy, info.sw, info.sh);
+      if (info.flip) {
+        ctx.save();
+        ctx.translate(info.sx + info.sw, info.sy);
+        ctx.scale(-1, 1);
+        ctx.drawImage(assets.zombie, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H, 0, 0, info.sw, info.sh);
+        ctx.restore();
+      } else {
+        ctx.drawImage(assets.zombie, 0, 0, ZOMBIE_SPRITE_W, ZOMBIE_SPRITE_H, info.sx, info.sy, info.sw, info.sh);
+      }
     }
   }
 }
@@ -769,23 +844,39 @@ function drawHint() {
   ctx.textAlign = 'left';
 }
 
+function drawGameOver() {
+  const elapsed = performance.now() / 1000 - gameOverFlashStart;
+  const flash = Math.max(0, 1 - elapsed / GAME_OVER_FLASH_DURATION);
+  const alpha = 0.4 + 0.5 * flash;
+  ctx.fillStyle = `rgba(180, 0, 0, ${alpha})`;
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#fff';
+  ctx.font = `${FONT_SIZE * 2}px ${FONT_FAMILY}`;
+  ctx.textAlign = 'center';
+  ctx.fillText('GAME OVER', W / 2, H / 2);
+  ctx.textAlign = 'left';
+}
+
 function draw() {
   drawSky();
   drawGround();
   drawZombies();
   drawParticles();
-  drawRifle(1 / 60);
+  if (!gameOver) drawRifle(1 / 60);
   drawScore();
   drawReticule();
-  if (!pointerLocked) drawHint();
+  if (gameOver) drawGameOver();
+  else if (!pointerLocked) drawHint();
 }
 
 function tick(dt) {
-  spawnTimer += 1;
-  if (spawnTimer >= SPAWN_DELAY) spawnZombie();
   hitFeedbackTime = Math.max(0, hitFeedbackTime - dt);
   updateParticles(dt);
-  // View chases desired aim (shortest path for yaw); reticule drifts to center as body follows
+  if (!gameOver) {
+    spawnTimer += 1;
+    if (spawnTimer >= SPAWN_DELAY) spawnZombie();
+    updateZombies(dt);
+  }
   const chaseT = 1 - Math.exp(-CHASE_LERP * dt);
   cameraYaw += normalizeAngle(desiredYaw - cameraYaw) * chaseT;
   cameraPitch += (desiredPitch - cameraPitch) * chaseT;
@@ -798,6 +889,7 @@ function tick(dt) {
 const PITCH_LIMIT = Math.PI / 2 - 0.1;
 
 canvas.addEventListener('click', (e) => {
+  if (gameOver) return;
   if (!pointerLocked) {
     canvas.requestPointerLock();
     return;
