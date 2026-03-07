@@ -4,11 +4,15 @@
   "description": "Retro pixel art multiplayer shooter — defend the bunker from zombies",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "capsules": "node capsule/generate-capsules.js"
   },
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^28.0.0"
+    "canvas": "^3.0.0",
+    "electron": "^28.0.0",
+    "opentype.js": "^1.3.4",
+    "sharp": "^0.33.0"
   }
 }
