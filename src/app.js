@@ -15,14 +15,20 @@ canvas.height = H;
 // Pixel art: nearest-neighbor scaling, no anti-aliasing on sprites
 ctx.imageSmoothingEnabled = false;
 
-// 3D: camera fixed position, yaw/pitch for look (radians)
-const CAMERA_X = 0;
+// 3D: bunker at world center; camera moves between discrete slots around it.
+const WORLD_CENTER_X = 0;
+const WORLD_CENTER_Z = 0;
 const CAMERA_Y = 1.6;
-const CAMERA_Z = 0;
+let cameraX = WORLD_CENTER_X;
+let cameraZ = WORLD_CENTER_Z;
+let desiredCameraX = WORLD_CENTER_X;
+let desiredCameraZ = WORLD_CENTER_Z;
 let cameraYaw = 0;   // left-right (rotation around Y)
 let cameraPitch = 0; // up-down
 
 const FOV = Math.PI / 3;  // 60° vertical FOV
+const IRON_SIGHTS_FOV = Math.PI / 5;  // narrower when aiming down sights (~36°)
+const IRON_SIGHTS_SENS = 0.35;  // cursor sensitivity multiplier when holding iron sights
 const ASPECT = W / H;
 const NEAR = 0.1;
 const FAR = 500;
@@ -40,6 +46,23 @@ const FOG_WISP_SPRITE_SIZE = 96;
 const FOG_WISP_REF_DEPTH = 25;  // reference depth for screen size
 const FOG_WISP_BASE_ALPHA = 0.18;
 const FOG_WISP_ROT_SPEED = 0.026;  // rad/sec; each wisp gets ± this (clockwise vs counterclockwise)
+
+// Bunker: generate a rectangular ring of discrete standing positions.
+const BUNKER_LAYOUT = { north: 3, east: 2, south: 3, west: 2 };
+const BUNKER_SLOT_SPACING = 4.5;
+const BUNKER_WALL_INSET = 1.35;
+const BUNKER_MOVE_LERP = 10;
+const BUNKER_CRATE_SIDE = 'south';
+const BUNKER_WALL_HEIGHT = 2.85;
+const BUNKER_WINDOW_WIDTH = 1.9;
+const BUNKER_WINDOW_BOTTOM = 0.9;
+const BUNKER_WINDOW_TOP = 2.15;
+const BUNKER_CRATE_WIDTH = 1.9;
+const BUNKER_CRATE_HEIGHT = 1.15;
+const BUNKER_CRATE_DEPTH = 0.95;
+let bunker = null;
+let bunkerSlots = [];
+let activeSlotIndex = 0;
 
 // Trees: 4x4 grid of 256x256 sprites in RetroTree.png; bottom-left two cells (0,3),(1,3) empty → 14 variants
 const TREE_SPRITE_SIZE = 256;
@@ -60,6 +83,17 @@ const RIFLE_FIRE_FRAME_COUNT = 34;
 const RIFLE_RELOAD_FRAME_COUNT = 75;
 const RIFLE_FPS = 24;
 const RIFLE_CLIP_SIZE = 5;
+const MAX_CLIPS = 10;
+const IRON_SIGHTS_AIM_X = 166;
+const IRON_SIGHTS_AIM_Y = 198;
+const IRON_SIGHTS_RIGID_RESPONSE = 0.55;
+const IRON_SIGHTS_DEPTH = { front: 0.5, rear: 0.15, barrel: -0.35, stock: -1.25 };
+const IRON_SIGHTS_RECOIL_KICK = 42;
+const IRON_SIGHTS_RECOIL_DECAY = 0.72;
+let ironSightsHeld = false;
+let ironSightsRecoilKick = 0;
+const RELOAD_FREEZE_FRAME = 22;   // freeze here when out of clips until restocked
+const OUT_OF_AMMO_MESSAGE_DURATION = 1.5;
 
 // Zombie: 3D position, sprite size and reference at distance
 const ZOMBIE_REF_HEIGHT = 1.8;  // world units (height of zombie)
@@ -80,7 +114,7 @@ const ZOMBIE_ZIGZAG = 0.5;      // lateral sway (world units)
 const ZOMBIE_ZIGZAG_SPEED = 2.5; // rad/sec for zigzag phase
 const ZOMBIE_BOB_AMPLITUDE = 0.06;
 const ZOMBIE_BOB_SPEED = 9;     // rad/sec for walk bob
-const ZOMBIE_TOUCH_DIST = 0.9;  // game over if zombie this close
+const ZOMBIE_BREACH_DIST = 0.45;  // bunker lost if zombie reaches its assigned window
 const ZOMBIE_DIR_CHANGE_DIST = 2.5;   // world units walked before maybe changing direction
 const ZOMBIE_DIR_CHANGE_CHANCE = 0.35; // probability to flip direction when threshold reached
 const GAME_OVER_FLASH_DURATION = 0.6;
@@ -92,6 +126,8 @@ let rifleFrame = 0;
 let rifleState = 'idle';
 let rifleFrameTime = 0;
 let shotsInClip = RIFLE_CLIP_SIZE;
+let clipsCarried = MAX_CLIPS;
+let outOfAmmoMessageTime = 0;
 let zombies = [];  // { x, y, z } in world space
 let spawnTimer = 0;
 let pointerLocked = false;
@@ -161,16 +197,24 @@ function getViewVectors() {
   return { forward, right, up };
 }
 
+function getFOV() {
+  return isIronSightsActive() ? IRON_SIGHTS_FOV : FOV;
+}
+
+function isIronSightsActive() {
+  return ironSightsHeld && rifleState !== 'reloading';
+}
+
 function project(wx, wy, wz) {
-  const dx = wx - CAMERA_X;
+  const dx = wx - cameraX;
   const dy = wy - CAMERA_Y;
-  const dz = wz - CAMERA_Z;
+  const dz = wz - cameraZ;
   const { forward, right, up } = getViewVectors();
   const depth = dx * forward.x + dy * forward.y + dz * forward.z;
   if (depth <= NEAR) return null;
   const viewX = dx * right.x + dy * right.y + dz * right.z;
   const viewY = dx * up.x + dy * up.y + dz * up.z;
-  const scale = (H / 2) / (Math.tan(FOV / 2) * depth);
+  const scale = (H / 2) / (Math.tan(getFOV() / 2) * depth);
   const sx = W / 2 + viewX * scale;
   const sy = H / 2 - viewY * scale;
   return { sx, sy, depth };
@@ -194,6 +238,13 @@ const SFX_SHOT_PATHS = [
 const SFX_DRY_FIRE_PATH = 'assets/sfx/clean/lee-enfield_dry_fire.ogg';
 const SFX_EJECT_CASING_PATH = 'assets/sfx/clean/lee-enfield_eject_casing.ogg';
 const SFX_RELOAD_PATH = 'assets/sfx/clean/lee-enfield_reload.ogg';
+const SFX_PICK_UP_PATH = 'assets/sfx/clean/pick_up.ogg';
+const SFX_BOLT_OPEN_PATH = 'assets/sfx/clean/bolt_open.ogg';
+const SFX_BOLT_CLOSE_PATH = 'assets/sfx/clean/bolt_close.ogg';
+const FIRE_BOLT_OPEN_FRAME = 10;
+const FIRE_BOLT_CLOSE_FRAME = 20;
+const RELOAD_BOLT_OPEN_FRAME = 10;
+const RELOAD_BOLT_CLOSE_FRAME = 60;
 // Align reload sound so 0.65s in file matches frame 51 (1-indexed). Trigger at this 0-indexed frame.
 const RELOAD_SOUND_ALIGN_FRAME = 51;   // 1-indexed (51st frame)
 const RELOAD_SOUND_ALIGN_TIME = 0.65; // seconds into sound file at that frame
@@ -277,11 +328,291 @@ function generateTrees() {
   for (let i = 0; i < TREE_COUNT; i++) {
     const dist = TREE_MIN_DIST + rng() * (TREE_MAX_DIST - TREE_MIN_DIST);
     const angle = rng() * Math.PI * 2;
-    const x = CAMERA_X + Math.cos(angle) * dist;
-    const z = CAMERA_Z + Math.sin(angle) * dist;
+    const x = WORLD_CENTER_X + Math.cos(angle) * dist;
+    const z = WORLD_CENTER_Z + Math.sin(angle) * dist;
     const spriteIndex = Math.floor(rng() * 14);
     trees.push({ x, z, spriteIndex, hp: TREE_HP });
   }
+}
+
+function generateBunkerLayout(layout = BUNKER_LAYOUT) {
+  const slots = [];
+  const halfW = (Math.max(layout.north, layout.south, 1) - 1) * BUNKER_SLOT_SPACING / 2 + 2.4;
+  const halfD = (Math.max(layout.east, layout.west, 1) - 1) * BUNKER_SLOT_SPACING / 2 + 2.4;
+  function addSide(side, count, baseYaw, fixedCoord, horizontal, reverse = false) {
+    for (let i = 0; i < count; i++) {
+      const logicalIndex = reverse ? (count - 1 - i) : i;
+      const offset = (logicalIndex - (count - 1) / 2) * BUNKER_SLOT_SPACING;
+      slots.push(horizontal
+        ? { side, sideIndex: logicalIndex, type: 'window', x: WORLD_CENTER_X + offset, z: fixedCoord, baseYaw }
+        : { side, sideIndex: logicalIndex, type: 'window', x: fixedCoord, z: WORLD_CENTER_Z + offset, baseYaw });
+    }
+  }
+  addSide('north', layout.north, 0, WORLD_CENTER_Z - halfD + BUNKER_WALL_INSET, true);
+  addSide('east', layout.east, Math.PI / 2, WORLD_CENTER_X + halfW - BUNKER_WALL_INSET, false);
+  addSide('south', layout.south, Math.PI, WORLD_CENTER_Z + halfD - BUNKER_WALL_INSET, true, true);
+  addSide('west', layout.west, -Math.PI / 2, WORLD_CENTER_X - halfW + BUNKER_WALL_INSET, false, true);
+
+  const preferred = slots.filter((slot) => slot.side === BUNKER_CRATE_SIDE);
+  const crateSlot = preferred[Math.floor(preferred.length / 2)] ?? slots[Math.floor(slots.length / 2)];
+  if (crateSlot) crateSlot.type = 'crate';
+
+  bunker = { halfW, halfD };
+  bunkerSlots = slots;
+  activeSlotIndex = Math.max(0, bunkerSlots.findIndex((slot) => slot.type === 'window'));
+  setActiveBunkerSlot(activeSlotIndex, true);
+}
+
+function getCurrentBunkerSlot() {
+  return bunkerSlots[activeSlotIndex] ?? null;
+}
+
+function getSideWallCoord(side) {
+  if (!bunker) return 0;
+  if (side === 'north') return WORLD_CENTER_Z - bunker.halfD;
+  if (side === 'south') return WORLD_CENTER_Z + bunker.halfD;
+  if (side === 'east') return WORLD_CENTER_X + bunker.halfW;
+  return WORLD_CENTER_X - bunker.halfW;
+}
+
+function setActiveBunkerSlot(index, snap = false) {
+  if (bunkerSlots.length === 0) return;
+  activeSlotIndex = (index + bunkerSlots.length) % bunkerSlots.length;
+  const slot = getCurrentBunkerSlot();
+  desiredCameraX = slot.x;
+  desiredCameraZ = slot.z;
+  desiredYaw = slot.baseYaw;
+  desiredPitch = 0;
+  if (snap) {
+    cameraX = desiredCameraX;
+    cameraZ = desiredCameraZ;
+    cameraYaw = desiredYaw;
+    cameraPitch = 0;
+  } else {
+    cameraYaw = desiredYaw;
+    cameraPitch = 0;
+  }
+}
+
+function moveBunkerSlot(step) {
+  if (bunkerSlots.length === 0) return;
+  setActiveBunkerSlot(activeSlotIndex + step);
+}
+
+function getSlotWallCenter(slot) {
+  return slot.side === 'north' || slot.side === 'south' ? slot.x : slot.z;
+}
+
+function getWindowOpeningsForSide(side) {
+  return bunkerSlots
+    .filter((slot) => slot.side === side && slot.type === 'window')
+    .map((slot) => ({
+      min: getSlotWallCenter(slot) - BUNKER_WINDOW_WIDTH / 2,
+      max: getSlotWallCenter(slot) + BUNKER_WINDOW_WIDTH / 2,
+      bottom: BUNKER_WINDOW_BOTTOM,
+      top: BUNKER_WINDOW_TOP,
+    }))
+    .sort((a, b) => a.min - b.min);
+}
+
+function getWindowSlots() {
+  return bunkerSlots.filter((slot) => slot.type === 'window');
+}
+
+function getZombieWindowTarget(slot) {
+  if (!slot) return { x: WORLD_CENTER_X, z: WORLD_CENTER_Z };
+  const wall = getSideWallCoord(slot.side);
+  if (slot.side === 'north') return { x: slot.x, z: wall };
+  if (slot.side === 'south') return { x: slot.x, z: wall };
+  if (slot.side === 'east') return { x: wall, z: slot.z };
+  return { x: wall, z: slot.z };
+}
+
+function chooseZombieTargetSlot(x, z) {
+  const windows = getWindowSlots();
+  if (windows.length === 0) return null;
+  let best = windows[0];
+  let bestDistSq = Infinity;
+  for (const slot of windows) {
+    const target = getZombieWindowTarget(slot);
+    const dx = target.x - x;
+    const dz = target.z - z;
+    const distSq = dx * dx + dz * dz;
+    if (distSq < bestDistSq) {
+      bestDistSq = distSq;
+      best = slot;
+    }
+  }
+  return best;
+}
+
+function worldToView(wx, wy, wz) {
+  const dx = wx - cameraX;
+  const dy = wy - CAMERA_Y;
+  const dz = wz - cameraZ;
+  const { forward, right, up } = getViewVectors();
+  return {
+    x: dx * right.x + dy * right.y + dz * right.z,
+    y: dx * up.x + dy * up.y + dz * up.z,
+    depth: dx * forward.x + dy * forward.y + dz * forward.z,
+  };
+}
+
+function projectViewPoint(v) {
+  const scale = (H / 2) / (Math.tan(getFOV() / 2) * v.depth);
+  return {
+    sx: W / 2 + v.x * scale,
+    sy: H / 2 - v.y * scale,
+    depth: v.depth,
+  };
+}
+
+function clipPolygonToNear(viewPoints) {
+  const clipped = [];
+  for (let i = 0; i < viewPoints.length; i++) {
+    const a = viewPoints[i];
+    const b = viewPoints[(i + 1) % viewPoints.length];
+    const aInside = a.depth >= NEAR;
+    const bInside = b.depth >= NEAR;
+    if (aInside) clipped.push(a);
+    if (aInside !== bInside) {
+      const t = (NEAR - a.depth) / (b.depth - a.depth);
+      clipped.push({
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
+        depth: NEAR,
+      });
+    }
+  }
+  return clipped;
+}
+
+function pushPolygon(polys, points, fill, stroke = null) {
+  const viewPoints = clipPolygonToNear(points.map((p) => worldToView(p.x, p.y, p.z)));
+  if (viewPoints.length < 3) return;
+  const projected = viewPoints.map(projectViewPoint);
+  const avgDepth = viewPoints.reduce((sum, p) => sum + p.depth, 0) / viewPoints.length;
+  polys.push({ projected, avgDepth, fill, stroke });
+}
+
+function drawProjectedPolygon(poly) {
+  const { projected, fill, stroke } = poly;
+  ctx.beginPath();
+  ctx.moveTo(projected[0].sx, projected[0].sy);
+  for (let i = 1; i < projected.length; i++) ctx.lineTo(projected[i].sx, projected[i].sy);
+  ctx.closePath();
+  ctx.fillStyle = fill;
+  ctx.fill();
+  if (stroke) {
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+}
+
+function getShotDirection(px, py) {
+  const { forward, right, up } = getViewVectors();
+  const xScale = ((px - W / 2) * Math.tan(getFOV() / 2)) / (H / 2);
+  const yScale = (-(py - H / 2) * Math.tan(getFOV() / 2)) / (H / 2);
+  const dir = {
+    x: forward.x + right.x * xScale + up.x * yScale,
+    y: forward.y + right.y * xScale + up.y * yScale,
+    z: forward.z + right.z * xScale + up.z * yScale,
+  };
+  const len = Math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z) || 1;
+  return { x: dir.x / len, y: dir.y / len, z: dir.z / len };
+}
+
+function shotLeavesThroughWindow(px, py) {
+  if (!bunker) return true;
+  const dir = getShotDirection(px, py);
+  const origin = { x: cameraX, y: CAMERA_Y, z: cameraZ };
+  const EPS = 1e-5;
+  const hits = [];
+
+  if (dir.z < -EPS) hits.push({ side: 'north', t: (getSideWallCoord('north') - origin.z) / dir.z });
+  if (dir.z > EPS) hits.push({ side: 'south', t: (getSideWallCoord('south') - origin.z) / dir.z });
+  if (dir.x > EPS) hits.push({ side: 'east', t: (getSideWallCoord('east') - origin.x) / dir.x });
+  if (dir.x < -EPS) hits.push({ side: 'west', t: (getSideWallCoord('west') - origin.x) / dir.x });
+
+  const first = hits
+    .filter((hit) => hit.t > EPS)
+    .map((hit) => {
+      const x = origin.x + dir.x * hit.t;
+      const y = origin.y + dir.y * hit.t;
+      const z = origin.z + dir.z * hit.t;
+      return { ...hit, x, y, z };
+    })
+    .filter((hit) => {
+      if (hit.side === 'north' || hit.side === 'south') {
+        return hit.x >= WORLD_CENTER_X - bunker.halfW - EPS && hit.x <= WORLD_CENTER_X + bunker.halfW + EPS;
+      }
+      return hit.z >= WORLD_CENTER_Z - bunker.halfD - EPS && hit.z <= WORLD_CENTER_Z + bunker.halfD + EPS;
+    })
+    .sort((a, b) => a.t - b.t)[0];
+
+  if (!first) return true;
+  if (first.y <= BUNKER_WINDOW_BOTTOM || first.y >= BUNKER_WINDOW_TOP) return false;
+  const coord = first.side === 'north' || first.side === 'south' ? first.x : first.z;
+  return getWindowOpeningsForSide(first.side).some((opening) => coord >= opening.min && coord <= opening.max);
+}
+
+function getCrateAABB() {
+  if (!bunker) return null;
+  const crateSlot = bunkerSlots.find((slot) => slot.type === 'crate');
+  if (!crateSlot) return null;
+  const minX = WORLD_CENTER_X - bunker.halfW;
+  const maxX = WORLD_CENTER_X + bunker.halfW;
+  const minZ = WORLD_CENTER_Z - bunker.halfD;
+  const maxZ = WORLD_CENTER_Z + bunker.halfD;
+  let crateMinX, crateMaxX, crateMinZ, crateMaxZ;
+  if (crateSlot.side === 'north' || crateSlot.side === 'south') {
+    crateMinX = crateSlot.x - BUNKER_CRATE_WIDTH / 2;
+    crateMaxX = crateSlot.x + BUNKER_CRATE_WIDTH / 2;
+    if (crateSlot.side === 'north') {
+      crateMinZ = minZ + 0.08;
+      crateMaxZ = crateMinZ + BUNKER_CRATE_DEPTH;
+    } else {
+      crateMaxZ = maxZ - 0.08;
+      crateMinZ = crateMaxZ - BUNKER_CRATE_DEPTH;
+    }
+  } else {
+    crateMinZ = crateSlot.z - BUNKER_CRATE_WIDTH / 2;
+    crateMaxZ = crateSlot.z + BUNKER_CRATE_WIDTH / 2;
+    if (crateSlot.side === 'west') {
+      crateMinX = minX + 0.08;
+      crateMaxX = crateMinX + BUNKER_CRATE_DEPTH;
+    } else {
+      crateMaxX = maxX - 0.08;
+      crateMinX = crateMaxX - BUNKER_CRATE_DEPTH;
+    }
+  }
+  return {
+    minX: crateMinX, maxX: crateMaxX,
+    minY: 0, maxY: BUNKER_CRATE_HEIGHT,
+    minZ: crateMinZ, maxZ: crateMaxZ,
+  };
+}
+
+function isReticuleOnCrate(px, py) {
+  const box = getCrateAABB();
+  if (!box) return false;
+  const dir = getShotDirection(px, py);
+  const ox = cameraX;
+  const oy = CAMERA_Y;
+  const oz = cameraZ;
+  const tx = 1 / dir.x;
+  const tminX = dir.x >= 0 ? (box.minX - ox) * tx : (box.maxX - ox) * tx;
+  const tmaxX = dir.x >= 0 ? (box.maxX - ox) * tx : (box.minX - ox) * tx;
+  const ty = 1 / dir.y;
+  const tminY = dir.y >= 0 ? (box.minY - oy) * ty : (box.maxY - oy) * ty;
+  const tmaxY = dir.y >= 0 ? (box.maxY - oy) * ty : (box.minY - oy) * ty;
+  const tz = 1 / dir.z;
+  const tminZ = dir.z >= 0 ? (box.minZ - oz) * tz : (box.maxZ - oz) * tz;
+  const tmaxZ = dir.z >= 0 ? (box.maxZ - oz) * tz : (box.minZ - oz) * tz;
+  const t0 = Math.max(tminX, tminY, tminZ);
+  const t1 = Math.min(tmaxX, tmaxY, tmaxZ);
+  return t0 <= t1 && t1 > 1e-5;
 }
 
 function getTreeDrawInfo(t) {
@@ -326,6 +657,13 @@ async function loadAssets() {
   assets.zombiePickelhaubeHeadshotData = imageDataFromImage(assets.zombiePickelhaubeHeadshotMask);
   assets.zombieFemaleGhoulHeadshotData = imageDataFromImage(assets.zombieFemaleGhoulHeadshotMask);
   assets.retrotree = await loadImage(`${base}/RetroTree.png`);
+  const ironBase = `${base}/lee-enfield_iron_sights`;
+  assets.ironSightsFront = await loadImage(`${ironBase}/0_front.png`);
+  assets.ironSightsRear = await loadImage(`${ironBase}/1_rear.png`);
+  assets.ironSightsBarrel = await loadImage(`${ironBase}/2_barrel.png`);
+  assets.ironSightsStock = await loadImage(`${ironBase}/3_stock.png`);
+  assets.ironSightsStockEject = await loadImage(`${ironBase}/3_stock_eject.png`);
+  assets.ironSights = [assets.ironSightsStock, assets.ironSightsBarrel, assets.ironSightsRear, assets.ironSightsFront].filter(Boolean);
   assets.shotSounds = SFX_SHOT_PATHS.map((path) => {
     const a = new Audio(path);
     a.preload = 'auto';
@@ -337,6 +675,12 @@ async function loadAssets() {
   assets.ejectCasing.preload = 'auto';
   assets.reloadSound = new Audio(SFX_RELOAD_PATH);
   assets.reloadSound.preload = 'auto';
+  assets.pickUp = new Audio(SFX_PICK_UP_PATH);
+  assets.pickUp.preload = 'auto';
+  assets.boltOpen = new Audio(SFX_BOLT_OPEN_PATH);
+  assets.boltOpen.preload = 'auto';
+  assets.boltClose = new Audio(SFX_BOLT_CLOSE_PATH);
+  assets.boltClose.preload = 'auto';
   const ZOMBIE_SOUND_NAMES = ['zombie_1', 'zombie_2', 'zombie_3', 'zombie_4', 'zombie_5'];
   const ZOMBIE_FEMALE_SOUND_NAMES = ['female_zombie_1', 'female_zombie_2', 'female_zombie_3', 'female_zombie_4'];
   assets.zombieSoundPaths = ZOMBIE_SOUND_NAMES.map((n) => `${base}/sfx/clean/${n}.ogg`);
@@ -350,6 +694,7 @@ function playShotSound() {
   const which = Math.floor(Math.random() * assets.shotSounds.length);
   const snd = assets.shotSounds[which];
   snd.currentTime = 0;
+  snd.volume = 1.0;
   snd.play().catch(() => { });
 }
 
@@ -366,6 +711,8 @@ function playDryFireSound() {
 }
 
 let reloadSoundPlayed = false;
+let boltOpenSoundPlayed = false;
+let boltCloseSoundPlayed = false;
 
 function playReloadSound() {
   if (!assets.reloadSound) return;
@@ -373,16 +720,36 @@ function playReloadSound() {
   assets.reloadSound.play().catch(() => { });
 }
 
+function playPickUpSound() {
+  if (!assets.pickUp) return;
+  assets.pickUp.currentTime = 0;
+  assets.pickUp.play().catch(() => { });
+}
+
+function playBoltOpenSound() {
+  if (!assets.boltOpen) return;
+  assets.boltOpen.currentTime = 0;
+  assets.boltOpen.volume = 0.35;
+  assets.boltOpen.play().catch(() => { });
+}
+
+function playBoltCloseSound() {
+  if (!assets.boltClose) return;
+  assets.boltClose.currentTime = 0;
+  assets.boltClose.volume = 0.35;
+  assets.boltClose.play().catch(() => { });
+}
+
 // ---- Positional audio (reusable for SFX, multiplayer, voice chat) ----
-// Listener is at (CAMERA_X, CAMERA_Z) facing cameraYaw. Sources at (worldX, worldZ) get gain + stereo pan.
+// Listener is at the current bunker slot facing cameraYaw. Sources at (worldX, worldZ) get gain + stereo pan.
 // Gain uses inverse-square law: loudness falls off as 1/distance² so distant sources are much quieter.
 
 const POSITIONAL_REF_DIST = 6;   // distance at which gain is 0.5 (reference for inverse-square)
 
 /** Returns { gain, pan } for a source at (worldX, worldZ). Gain follows inverse-square law. */
 function getPositionalGainPan(worldX, worldZ) {
-  const dx = worldX - CAMERA_X;
-  const dz = worldZ - CAMERA_Z;
+  const dx = worldX - cameraX;
+  const dz = worldZ - cameraZ;
   const distanceSq = dx * dx + dz * dz;
   const refSq = POSITIONAL_REF_DIST * POSITIONAL_REF_DIST;
   const gain = refSq / (refSq + Math.max(distanceSq, 0.01));
@@ -438,8 +805,10 @@ function spawnZombie() {
   if (zombies.length >= MAX_ZOMBIES) return;
   const angle = Math.random() * Math.PI * 2;
   const dist = SPAWN_MIN_DIST + Math.random() * (SPAWN_MAX_DIST - SPAWN_MIN_DIST);
-  const x = CAMERA_X + Math.cos(angle) * dist;
-  const z = CAMERA_Z + Math.sin(angle) * dist;
+  const x = WORLD_CENTER_X + Math.cos(angle) * dist;
+  const z = WORLD_CENTER_Z + Math.sin(angle) * dist;
+  const targetSlot = chooseZombieTargetSlot(x, z);
+  const target = getZombieWindowTarget(targetSlot);
   const sprite = assets.zombieSprites.length > 0
     ? assets.zombieSprites[Math.floor(Math.random() * assets.zombieSprites.length)]
     : assets.zombie;
@@ -454,6 +823,9 @@ function spawnZombie() {
     walkPhase: Math.random() * Math.PI * 2,
     walkDir: Math.random() < 0.5 ? 1 : -1,
     distanceWalked: 0,
+    targetSide: targetSlot?.side ?? null,
+    targetWindowX: target.x,
+    targetWindowZ: target.z,
     speedMult,
     sprite,
     spriteW: sprite?.naturalWidth ?? ZOMBIE_SPRITE_W,
@@ -484,10 +856,12 @@ function updateZombies(dt) {
         playPositionalSound(paths[which], z.x, z.z);
       }
     }
-    const dx = CAMERA_X - z.x;
-    const dz = CAMERA_Z - z.z;
+    const targetX = z.targetWindowX ?? WORLD_CENTER_X;
+    const targetZ = z.targetWindowZ ?? WORLD_CENTER_Z;
+    const dx = targetX - z.x;
+    const dz = targetZ - z.z;
     const d = Math.sqrt(dx * dx + dz * dz) || 0.001;
-    if (d < ZOMBIE_TOUCH_DIST) {
+    if (d < ZOMBIE_BREACH_DIST) {
       gameOver = true;
       gameOverFlashStart = performance.now() / 1000;
       return;
@@ -571,6 +945,7 @@ function spawnHoleParticles(z, info, hitPx, hitPy, jaggedRadii) {
   const w = info.spriteW ?? ZOMBIE_SPRITE_W;
   const h = info.spriteH ?? ZOMBIE_SPRITE_H;
   ensureZombieSampleCanvas(w, h);
+  zombieSampleCtx.clearRect(0, 0, w, h);
   zombieSampleCtx.drawImage(img, 0, 0, w, h, 0, 0, w, h);
   const idata = zombieSampleCtx.getImageData(0, 0, w, h);
   const hitTx = info.flip
@@ -618,6 +993,7 @@ function spawnDeathParticles(z, info) {
   const w = info.spriteW ?? ZOMBIE_SPRITE_W;
   const h = info.spriteH ?? ZOMBIE_SPRITE_H;
   ensureZombieSampleCanvas(w, h);
+  zombieSampleCtx.clearRect(0, 0, w, h);
   zombieSampleCtx.drawImage(img, 0, 0, w, h, 0, 0, w, h);
   const idata = zombieSampleCtx.getImageData(0, 0, w, h);
   const step = Math.max(DEATH_GRID_STEP, Math.floor(DEATH_GRID_STEP * w / ZOMBIE_SPRITE_W));
@@ -796,6 +1172,7 @@ function hitTestZombies(px, py) {
     const key = `${img?.src ?? ''}-${w}-${h}`;
     if (!spriteToData.has(key)) {
       ensureZombieSampleCanvas(w, h);
+      zombieSampleCtx.clearRect(0, 0, w, h);
       zombieSampleCtx.drawImage(img, 0, 0, w, h, 0, 0, w, h);
       spriteToData.set(key, zombieSampleCtx.getImageData(0, 0, w, h));
     }
@@ -983,8 +1360,8 @@ function drawGround() {
     return;
   }
   const far = 10000;
-  const hx = CAMERA_X + (forward.x / lenXZ) * far;
-  const hz = CAMERA_Z + (forward.z / lenXZ) * far;
+  const hx = cameraX + (forward.x / lenXZ) * far;
+  const hz = cameraZ + (forward.z / lenXZ) * far;
   const horizonProj = project(hx, 0, hz);
   const horizonY = horizonProj ? horizonProj.sy : H / 2;
   const floorHorizon = Math.floor(horizonY);
@@ -1003,8 +1380,8 @@ function drawFogWisps() {
   const visible = fogWispPositions
     .map((w) => {
       const angle = w.baseAngle + gameTime * w.rotSpeed;
-      const x = CAMERA_X + Math.cos(angle) * w.dist;
-      const z = CAMERA_Z + Math.sin(angle) * w.dist;
+      const x = WORLD_CENTER_X + Math.cos(angle) * w.dist;
+      const z = WORLD_CENTER_Z + Math.sin(angle) * w.dist;
       const p = project(x, w.y, z);
       return p ? { ...w, proj: p } : null;
     })
@@ -1157,6 +1534,7 @@ function drawZombies() {
       holeCtx.drawImage(img, 0, 0, spriteW, spriteH, 0, 0, info.sw, info.sh);
       const holeRadiusScreen = (HOLE_RADIUS_SPRITE / ZOMBIE_SPRITE_W) * info.sw;
       ensureZombieSampleCanvas(spriteW, spriteH);
+      zombieSampleCtx.clearRect(0, 0, spriteW, spriteH);
       zombieSampleCtx.drawImage(img, 0, 0, spriteW, spriteH, 0, 0, spriteW, spriteH);
       const spriteData = zombieSampleCtx.getImageData(0, 0, spriteW, spriteH);
       const HOLE_EDGE_ALPHA_THRESHOLD = 10;
@@ -1244,6 +1622,153 @@ function drawZombies() {
   }
 }
 
+function drawBunkerInterior() {
+  if (!bunker) return;
+
+  const polys = [];
+  const wallColor = '#1e1712';
+  const wallShade = '#2a2119';
+  const trimColor = '#564536';
+  const floorColor = '#1a1511';
+  const ceilingColor = '#100c09';
+  const crateFront = '#765235';
+  const crateSide = '#5b3f29';
+  const crateTop = '#8e6944';
+
+  const minX = WORLD_CENTER_X - bunker.halfW;
+  const maxX = WORLD_CENTER_X + bunker.halfW;
+  const minZ = WORLD_CENTER_Z - bunker.halfD;
+  const maxZ = WORLD_CENTER_Z + bunker.halfD;
+
+  pushPolygon(polys, [
+    { x: minX, y: 0.02, z: minZ },
+    { x: maxX, y: 0.02, z: minZ },
+    { x: maxX, y: 0.02, z: maxZ },
+    { x: minX, y: 0.02, z: maxZ },
+  ], floorColor);
+  pushPolygon(polys, [
+    { x: minX, y: BUNKER_WALL_HEIGHT, z: maxZ },
+    { x: maxX, y: BUNKER_WALL_HEIGHT, z: maxZ },
+    { x: maxX, y: BUNKER_WALL_HEIGHT, z: minZ },
+    { x: minX, y: BUNKER_WALL_HEIGHT, z: minZ },
+  ], ceilingColor);
+
+  function pushWallRect(side, from, to, y0, y1, fill) {
+    if (to - from < 0.02 || y1 - y0 < 0.02) return;
+    if (side === 'north') {
+      pushPolygon(polys, [
+        { x: from, y: y0, z: minZ },
+        { x: to, y: y0, z: minZ },
+        { x: to, y: y1, z: minZ },
+        { x: from, y: y1, z: minZ },
+      ], fill, trimColor);
+    } else if (side === 'south') {
+      pushPolygon(polys, [
+        { x: to, y: y0, z: maxZ },
+        { x: from, y: y0, z: maxZ },
+        { x: from, y: y1, z: maxZ },
+        { x: to, y: y1, z: maxZ },
+      ], fill, trimColor);
+    } else if (side === 'east') {
+      pushPolygon(polys, [
+        { x: maxX, y: y0, z: from },
+        { x: maxX, y: y0, z: to },
+        { x: maxX, y: y1, z: to },
+        { x: maxX, y: y1, z: from },
+      ], fill, trimColor);
+    } else {
+      pushPolygon(polys, [
+        { x: minX, y: y0, z: to },
+        { x: minX, y: y0, z: from },
+        { x: minX, y: y1, z: from },
+        { x: minX, y: y1, z: to },
+      ], fill, trimColor);
+    }
+  }
+
+  function addWallSide(side) {
+    const openings = getWindowOpeningsForSide(side);
+    const rangeMin = side === 'north' || side === 'south' ? minX : minZ;
+    const rangeMax = side === 'north' || side === 'south' ? maxX : maxZ;
+    let cursor = rangeMin;
+    for (const opening of openings) {
+      pushWallRect(side, cursor, opening.min, 0, BUNKER_WALL_HEIGHT, wallColor);
+      pushWallRect(side, opening.min, opening.max, 0, opening.bottom, wallShade);
+      pushWallRect(side, opening.min, opening.max, opening.top, BUNKER_WALL_HEIGHT, wallShade);
+      cursor = opening.max;
+    }
+    pushWallRect(side, cursor, rangeMax, 0, BUNKER_WALL_HEIGHT, wallColor);
+  }
+
+  addWallSide('north');
+  addWallSide('east');
+  addWallSide('south');
+  addWallSide('west');
+
+  const crateSlot = bunkerSlots.find((slot) => slot.type === 'crate');
+  if (crateSlot) {
+    let crateMinX;
+    let crateMaxX;
+    let crateMinZ;
+    let crateMaxZ;
+    if (crateSlot.side === 'north' || crateSlot.side === 'south') {
+      crateMinX = crateSlot.x - BUNKER_CRATE_WIDTH / 2;
+      crateMaxX = crateSlot.x + BUNKER_CRATE_WIDTH / 2;
+      if (crateSlot.side === 'north') {
+        crateMinZ = minZ + 0.08;
+        crateMaxZ = crateMinZ + BUNKER_CRATE_DEPTH;
+      } else {
+        crateMaxZ = maxZ - 0.08;
+        crateMinZ = crateMaxZ - BUNKER_CRATE_DEPTH;
+      }
+    } else {
+      crateMinZ = crateSlot.z - BUNKER_CRATE_WIDTH / 2;
+      crateMaxZ = crateSlot.z + BUNKER_CRATE_WIDTH / 2;
+      if (crateSlot.side === 'west') {
+        crateMinX = minX + 0.08;
+        crateMaxX = crateMinX + BUNKER_CRATE_DEPTH;
+      } else {
+        crateMaxX = maxX - 0.08;
+        crateMinX = crateMaxX - BUNKER_CRATE_DEPTH;
+      }
+    }
+    const crateY1 = BUNKER_CRATE_HEIGHT;
+    pushPolygon(polys, [
+      { x: crateMinX, y: 0, z: crateMinZ },
+      { x: crateMaxX, y: 0, z: crateMinZ },
+      { x: crateMaxX, y: crateY1, z: crateMinZ },
+      { x: crateMinX, y: crateY1, z: crateMinZ },
+    ], crateSide, '#3f2b1b');
+    pushPolygon(polys, [
+      { x: crateMaxX, y: 0, z: crateMinZ },
+      { x: crateMaxX, y: 0, z: crateMaxZ },
+      { x: crateMaxX, y: crateY1, z: crateMaxZ },
+      { x: crateMaxX, y: crateY1, z: crateMinZ },
+    ], crateSide, '#3f2b1b');
+    pushPolygon(polys, [
+      { x: crateMinX, y: 0, z: crateMaxZ },
+      { x: crateMinX, y: 0, z: crateMinZ },
+      { x: crateMinX, y: crateY1, z: crateMinZ },
+      { x: crateMinX, y: crateY1, z: crateMaxZ },
+    ], crateSide, '#3f2b1b');
+    pushPolygon(polys, [
+      { x: crateMinX, y: crateY1, z: crateMinZ },
+      { x: crateMaxX, y: crateY1, z: crateMinZ },
+      { x: crateMaxX, y: crateY1, z: crateMaxZ },
+      { x: crateMinX, y: crateY1, z: crateMaxZ },
+    ], crateTop, '#3f2b1b');
+    pushPolygon(polys, [
+      { x: crateMinX, y: 0, z: crateMaxZ },
+      { x: crateMaxX, y: 0, z: crateMaxZ },
+      { x: crateMaxX, y: crateY1, z: crateMaxZ },
+      { x: crateMinX, y: crateY1, z: crateMaxZ },
+    ], crateFront, '#3f2b1b');
+  }
+
+  polys.sort((a, b) => b.avgDepth - a.avgDepth);
+  for (const poly of polys) drawProjectedPolygon(poly);
+}
+
 function drawRifle(dt) {
   const fireSheet = assets.rifleFire;
   const reloadSheet = assets.rifleReload;
@@ -1256,6 +1781,14 @@ function drawRifle(dt) {
     if (rifleFrameTime >= frameDuration) {
       rifleFrameTime -= frameDuration;
       rifleFrame += 1;
+      if (!boltOpenSoundPlayed && rifleFrame >= FIRE_BOLT_OPEN_FRAME) {
+        playBoltOpenSound();
+        boltOpenSoundPlayed = true;
+      }
+      if (!boltCloseSoundPlayed && rifleFrame >= FIRE_BOLT_CLOSE_FRAME) {
+        playBoltCloseSound();
+        boltCloseSoundPlayed = true;
+      }
       if (rifleFrame >= RIFLE_FIRE_FRAME_COUNT) {
         rifleFrame = 0;
         shotsInClip -= 1;
@@ -1264,16 +1797,29 @@ function drawRifle(dt) {
     }
   } else if (rifleState === 'reloading') {
     if (rifleFrameTime >= frameDuration) {
-      rifleFrameTime -= frameDuration;
-      rifleFrame += 1;
-      if (!reloadSoundPlayed && rifleFrame >= RELOAD_SOUND_TRIGGER_FRAME) {
-        playReloadSound();
-        reloadSoundPlayed = true;
-      }
-      if (rifleFrame >= RIFLE_RELOAD_FRAME_COUNT) {
-        rifleFrame = 0;
-        shotsInClip = RIFLE_CLIP_SIZE;
-        rifleState = 'idle';
+      const nextFrame = rifleFrame + 1;
+      const frozen = nextFrame > RELOAD_FREEZE_FRAME && clipsCarried === 0;
+      if (!frozen) {
+        rifleFrameTime -= frameDuration;
+        rifleFrame = nextFrame;
+        if (!boltOpenSoundPlayed && rifleFrame >= RELOAD_BOLT_OPEN_FRAME) {
+          playBoltOpenSound();
+          boltOpenSoundPlayed = true;
+        }
+        if (!boltCloseSoundPlayed && rifleFrame >= RELOAD_BOLT_CLOSE_FRAME) {
+          playBoltCloseSound();
+          boltCloseSoundPlayed = true;
+        }
+        if (!reloadSoundPlayed && rifleFrame >= RELOAD_SOUND_TRIGGER_FRAME) {
+          playReloadSound();
+          reloadSoundPlayed = true;
+        }
+        if (rifleFrame >= RIFLE_RELOAD_FRAME_COUNT) {
+          rifleFrame = 0;
+          shotsInClip = RIFLE_CLIP_SIZE;
+          if (clipsCarried > 0) clipsCarried -= 1;
+          rifleState = 'idle';
+        }
       }
     }
   }
@@ -1287,8 +1833,13 @@ function drawRifle(dt) {
   const rh = RIFLE_FRAME_H * scale;
   // Gun lines up with screen only when reticule is top-left; else 1 gun px per 2 reticule px
   const ro = getReticuleOffset();
+  const reticulePx = W / 2 + ro.x;
+  const reticulePy = H / 2 + ro.y;
+  const pointingAtCrate = getCurrentBunkerSlot()?.type === 'crate' && isReticuleOnCrate(reticulePx, reticulePy);
+  const GUN_LOWERED_OFFSET_Y = 140;
   let rifleShiftX = (ro.x + RETICULE_CLAMP_X) * GUN_PX_PER_RETICULE_PX;
   let rifleShiftY = (ro.y + RETICULE_CLAMP_Y) * GUN_PX_PER_RETICULE_PX_Y;
+  if (pointingAtCrate) rifleShiftY += GUN_LOWERED_OFFSET_Y;
   // During reload: move gun toward (0,0) (slower out), peak at frame 52 when bullets go in, faster back
   if (rifleState === 'reloading') {
     const RELOAD_PEAK_FRAME = 51; // 0-indexed; frame 52 = push bullets in
@@ -1305,7 +1856,39 @@ function drawRifle(dt) {
     rifleShiftX *= 1 - reloadBlend;
     rifleShiftY *= 1 - reloadBlend;
   }
-  ctx.drawImage(sheet, sx, 0, RIFLE_FRAME_W, RIFLE_FRAME_H, rifleShiftX, rifleShiftY, rw, rh);
+
+  if (isIronSightsActive() && assets.ironSights?.length === 4) {
+    const baseX = W / 2 - IRON_SIGHTS_AIM_X;
+    let baseY = H / 2 - IRON_SIGHTS_AIM_Y;
+    if (pointingAtCrate) baseY += GUN_LOWERED_OFFSET_Y;
+    const layerDepth = [
+      IRON_SIGHTS_DEPTH.stock,
+      IRON_SIGHTS_DEPTH.barrel,
+      IRON_SIGHTS_DEPTH.rear,
+      IRON_SIGHTS_DEPTH.front,
+    ];
+    const rigidX = ro.x * IRON_SIGHTS_RIGID_RESPONSE;
+    const rigidY = ro.y * IRON_SIGHTS_RIGID_RESPONSE - ironSightsRecoilKick;
+    for (let i = 3; i >= 0; i--) {
+      let img = assets.ironSights[i];
+      if (!img?.naturalWidth) continue;
+      let srcX = 0;
+      let srcW = img.naturalWidth;
+      let drawW = img.naturalWidth;
+      if (i === 0 && rifleState === 'firing' && assets.ironSightsStockEject?.naturalWidth) {
+        img = assets.ironSightsStockEject;
+        srcW = assets.ironSightsStock?.naturalWidth ?? Math.floor(img.naturalWidth / RIFLE_FIRE_FRAME_COUNT);
+        drawW = srcW;
+        const ejectFrameCount = Math.max(1, Math.floor(img.naturalWidth / srcW));
+        srcX = Math.min(frameIndex, ejectFrameCount - 1) * srcW;
+      }
+      const px = baseX + layerDepth[i] * rigidX;
+      const py = baseY + layerDepth[i] * rigidY;
+      ctx.drawImage(img, srcX, 0, srcW, img.naturalHeight, Math.floor(px), Math.floor(py), drawW, img.naturalHeight);
+    }
+  } else {
+    ctx.drawImage(sheet, sx, 0, RIFLE_FRAME_W, RIFLE_FRAME_H, rifleShiftX, rifleShiftY, rw, rh);
+  }
 }
 
 const FONT_FAMILY = 'Zpix';
@@ -1315,48 +1898,45 @@ function drawScore() {
   ctx.fillStyle = '#aaa';
   ctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
   ctx.fillText(`Score: ${score}`, 12, FONT_SIZE + 4);
+  ctx.fillText(`Clips: ${clipsCarried}/${MAX_CLIPS}`, 12, FONT_SIZE * 2 + 4);
+}
+
+function drawOutOfAmmoMessage() {
+  if (outOfAmmoMessageTime <= 0) return;
+  const alpha = Math.min(1, outOfAmmoMessageTime * 2);
+  ctx.fillStyle = `rgba(255, 200, 100, ${alpha})`;
+  ctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
+  ctx.textAlign = 'center';
+  ctx.fillText('Out of ammo', W / 2, H - 32);
+  ctx.textAlign = 'left';
+}
+
+function drawPositionLabel() {
+  const slot = getCurrentBunkerSlot();
+  if (!slot) return;
+  ctx.fillStyle = '#aaa';
+  ctx.font = `${Math.floor(FONT_SIZE * 0.7)}px ${FONT_FAMILY}`;
+  const label = slot.type === 'crate' ? 'Ammo Crate' : `${slot.side[0].toUpperCase()}${slot.side.slice(1)} Window`;
+  ctx.fillText(label, 12, FONT_SIZE * 2 + 22);
 }
 
 function drawReticule() {
   if (!pointerLocked) return;
-  if (rifleState === 'reloading') return;
   const ro = getReticuleOffset();
   const cx = Math.round(W / 2 + ro.x);
   const cy = Math.round(H / 2 + ro.y);
-  const size = 4;
-  const stroke = 1;
-  const canFire = rifleState === 'idle';
+  const slot = getCurrentBunkerSlot();
+  const pointingAtCrate = slot?.type === 'crate' && isReticuleOnCrate(cx, cy);
 
-  if (hitFeedbackTime > 0) {
-    // CoD-style: diagonal X for a split second after a hit
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
-    ctx.lineWidth = stroke;
-    ctx.beginPath();
-    ctx.moveTo(cx - size, cy - size);
-    ctx.lineTo(cx + size, cy + size);
-    ctx.moveTo(cx + size, cy - size);
-    ctx.lineTo(cx - size, cy + size);
-    ctx.stroke();
-  } else if (!canFire) {
-    // Can't fire (firing or reloading): X reticule, dimmed
-    ctx.strokeStyle = 'rgba(180, 180, 180, 0.25)';
-    ctx.lineWidth = stroke;
-    ctx.beginPath();
-    ctx.moveTo(cx - size, cy - size);
-    ctx.lineTo(cx + size, cy + size);
-    ctx.moveTo(cx + size, cy - size);
-    ctx.lineTo(cx - size, cy + size);
-    ctx.stroke();
-  } else {
-    // Normal crosshair when ready to fire
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
-    ctx.lineWidth = stroke;
-    ctx.beginPath();
-    ctx.moveTo(cx - size, cy);
-    ctx.lineTo(cx + size, cy);
-    ctx.moveTo(cx, cy - size);
-    ctx.lineTo(cx, cy + size);
-    ctx.stroke();
+  if (pointingAtCrate) {
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+    ctx.font = `28px ${FONT_FAMILY}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('\u2340', cx, cy);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    return;
   }
 }
 
@@ -1368,6 +1948,8 @@ function drawHint() {
   ctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
   ctx.textAlign = 'center';
   ctx.fillText('Click to lock mouse and play', W / 2, H / 2);
+  ctx.font = `${Math.floor(FONT_SIZE * 0.65)}px ${FONT_FAMILY}`;
+  ctx.fillText('Move between windows with A/D or Left/Right', W / 2, H / 2 + 26);
   ctx.textAlign = 'left';
 }
 
@@ -1380,7 +1962,9 @@ function drawGameOver() {
   ctx.fillStyle = '#fff';
   ctx.font = `${FONT_SIZE * 2}px ${FONT_FAMILY}`;
   ctx.textAlign = 'center';
-  ctx.fillText('GAME OVER', W / 2, H / 2);
+  ctx.fillText('BUNKER OVERRUN', W / 2, H / 2 - 6);
+  ctx.font = `${Math.floor(FONT_SIZE * 0.65)}px ${FONT_FAMILY}`;
+  ctx.fillText('A zombie got through a window', W / 2, H / 2 + 18);
   ctx.textAlign = 'left';
 }
 
@@ -1391,9 +1975,12 @@ function draw() {
   drawTrees();
   drawZombies();
   drawParticles();
+  drawBunkerInterior();
   if (!gameOver) drawRifle(1 / 60);
   drawScore();
+  drawPositionLabel();
   drawReticule();
+  drawOutOfAmmoMessage();
   if (gameOver) drawGameOver();
   else if (!pointerLocked) drawHint();
 }
@@ -1401,12 +1988,17 @@ function draw() {
 function tick(dt) {
   gameTime += dt;
   hitFeedbackTime = Math.max(0, hitFeedbackTime - dt);
+  outOfAmmoMessageTime = Math.max(0, outOfAmmoMessageTime - dt);
+  ironSightsRecoilKick *= IRON_SIGHTS_RECOIL_DECAY;
   updateParticles(dt);
   if (!gameOver) {
     spawnTimer += 1;
     if (spawnTimer >= SPAWN_DELAY) spawnZombie();
     updateZombies(dt);
   }
+  const moveT = 1 - Math.exp(-BUNKER_MOVE_LERP * dt);
+  cameraX += (desiredCameraX - cameraX) * moveT;
+  cameraZ += (desiredCameraZ - cameraZ) * moveT;
   const chaseT = 1 - Math.exp(-CHASE_LERP * dt);
   cameraYaw += normalizeAngle(desiredYaw - cameraYaw) * chaseT;
   cameraPitch += (desiredPitch - cameraPitch) * chaseT;
@@ -1427,19 +2019,53 @@ canvas.addEventListener('click', (e) => {
   const ro = getReticuleOffset();
   const px = W / 2 + ro.x;
   const py = H / 2 + ro.y;
+  const slot = getCurrentBunkerSlot();
+  const pointingAtCrate = slot?.type === 'crate' && isReticuleOnCrate(px, py);
+
+  if (pointingAtCrate) {
+    playPickUpSound();
+    clipsCarried = MAX_CLIPS;
+    return;
+  }
 
   if (rifleState !== 'idle') {
     playDryFireSound();
     return;
   }
 
+  if (shotsInClip === 0 && clipsCarried === 0) {
+    outOfAmmoMessageTime = OUT_OF_AMMO_MESSAGE_DURATION;
+    rifleState = 'reloading';
+    rifleFrame = 0;
+    rifleFrameTime = 0;
+    reloadSoundPlayed = false;
+    boltOpenSoundPlayed = false;
+    boltCloseSoundPlayed = false;
+    return;
+  }
+
+  if (shotsInClip === 0 && clipsCarried > 0) {
+    rifleState = 'reloading';
+    rifleFrame = 0;
+    rifleFrameTime = 0;
+    reloadSoundPlayed = false;
+    boltOpenSoundPlayed = false;
+    boltCloseSoundPlayed = false;
+    return;
+  }
+
+  const canSeeOutside = shotLeavesThroughWindow(px, py);
+
   if (shotsInClip > 1) {
     rifleState = 'firing';
     rifleFrame = 0;
     rifleFrameTime = 0;
+    boltOpenSoundPlayed = false;
+    boltCloseSoundPlayed = false;
+    if (ironSightsHeld) ironSightsRecoilKick = IRON_SIGHTS_RECOIL_KICK;
     playShotSound();
     playEjectCasingSound();
-    const hit = getHitTarget(px, py);
+    const hit = canSeeOutside ? getHitTarget(px, py) : null;
     if (hit) {
       if (hit.type === 'zombie') damageZombie(hit.index, px, py);
       else damageTree(hit.index, px, py);
@@ -1449,9 +2075,12 @@ canvas.addEventListener('click', (e) => {
     rifleFrame = 0;
     rifleFrameTime = 0;
     reloadSoundPlayed = false;
+    boltOpenSoundPlayed = false;
+    boltCloseSoundPlayed = false;
+    if (ironSightsHeld) ironSightsRecoilKick = IRON_SIGHTS_RECOIL_KICK;
     playShotSound();
     playEjectCasingSound();
-    const hit = getHitTarget(px, py);
+    const hit = canSeeOutside ? getHitTarget(px, py) : null;
     if (hit) {
       if (hit.type === 'zombie') damageZombie(hit.index, px, py);
       else damageTree(hit.index, px, py);
@@ -1462,16 +2091,42 @@ canvas.addEventListener('click', (e) => {
 document.addEventListener('pointerlockchange', () => {
   pointerLocked = document.pointerLockElement === canvas;
   if (!pointerLocked) {
-    desiredYaw = desiredPitch = 0;
-    cameraYaw = cameraPitch = 0;
+    const slot = getCurrentBunkerSlot();
+    desiredPitch = 0;
+    cameraPitch = 0;
+    if (slot) {
+      desiredYaw = slot.baseYaw;
+      cameraYaw = slot.baseYaw;
+    } else {
+      desiredYaw = 0;
+      cameraYaw = 0;
+    }
   }
 });
 
 canvas.addEventListener('mousemove', (e) => {
   if (!pointerLocked) return;
-  desiredYaw += e.movementX * MOUSE_SENS;
-  desiredPitch += e.movementY * PITCH_SENS;   // mouse down -> look down (positive pitch), reticule leads then camera follows
+  const sens = isIronSightsActive() ? IRON_SIGHTS_SENS : 1;
+  desiredYaw += e.movementX * MOUSE_SENS * sens;
+  desiredPitch += e.movementY * PITCH_SENS * sens;   // mouse down -> look down (positive pitch), reticule leads then camera follows
   desiredPitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, desiredPitch));
+});
+
+document.addEventListener('keydown', (e) => {
+  if (gameOver) return;
+  if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
+    ironSightsHeld = true;
+  } else if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
+    e.preventDefault();
+    moveBunkerSlot(-1);
+  } else if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+    e.preventDefault();
+    moveBunkerSlot(1);
+  }
+});
+
+document.addEventListener('keyup', (e) => {
+  if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') ironSightsHeld = false;
 });
 
 function loop(now = 0) {
@@ -1483,6 +2138,7 @@ function loop(now = 0) {
 }
 
 (function main() {
+  generateBunkerLayout();
   requestAnimationFrame(loop);
   loadAssets().catch((err) => console.error('Asset load failed:', err));
 })();
