@@ -26,8 +26,8 @@ let desiredCameraZ = WORLD_CENTER_Z;
 let cameraYaw = 0;   // left-right (rotation around Y)
 let cameraPitch = 0; // up-down
 
-const FOV = Math.PI / 3;  // 60° vertical FOV
-const IRON_SIGHTS_FOV = Math.PI / 5;  // narrower when aiming down sights (~36°)
+const FOV = Math.PI / 4.5;  // ~40° vertical FOV for tighter "window shooter" framing
+const IRON_SIGHTS_FOV = Math.PI / 7.5;  // ~24° ADS
 const IRON_SIGHTS_SENS = 0.35;  // cursor sensitivity multiplier when holding iron sights
 const ASPECT = W / H;
 const NEAR = 0.1;
@@ -53,10 +53,19 @@ const FOG_WISP_ROT_SPEED = 0.026;  // rad/sec; each wisp gets ± this (clockwise
 // Bunker: generate a rectangular ring of discrete standing positions.
 const BUNKER_LAYOUT = { north: 3, east: 2, south: 3, west: 2 };
 const BUNKER_SLOT_SPACING = 4.5;
-const BUNKER_WALL_INSET = 1.35;
+const BUNKER_WALL_INSET = 2.8;
 const BUNKER_MOVE_LERP = 10;
 const BUNKER_CRATE_SIDE = 'south';
+const BUNKER_EMPTY_WALL_SIDE = 'west';
 const BUNKER_WALL_HEIGHT = 2.85;
+const BUNKER_WALL_TILE_SCALE = 1.6; // scales wall sprite aspect into world-space tile width
+const BUNKER_WALL_TEXTURE_SLICES = 24;
+const BUNKER_WALL_ALPHA_PASS_THRESHOLD = 8;
+const BUNKER_PEEK_MAX_YAW = 1.42;             // very wide peek (~81°)
+const BUNKER_PEEK_WINDOW_MARGIN = 0.12;       // keep center ray away from window edges/frame
+const BUNKER_PEEK_FORWARD_PUSH_MAX = 0.35;    // slight forward push while peeking hard
+const BUNKER_PEEK_FADE_START_YAW = 1.05;      // start fading pivot when turning away from own window
+const BUNKER_PEEK_FADE_END_YAW = 1.75;        // fully centered again by this yaw (~100°)
 const BUNKER_WINDOW_WIDTH = 1.9;
 const BUNKER_WINDOW_BOTTOM = 0.9;
 const BUNKER_WINDOW_TOP = 2.15;
@@ -65,6 +74,8 @@ const BUNKER_CRATE_HEIGHT = 1.15;
 const BUNKER_CRATE_DEPTH = 0.95;
 let bunker = null;
 let bunkerSlots = [];
+let bunkerWallTiles = { north: [], east: [], south: [], west: [] };
+let bunkerTileWorldWidth = BUNKER_SLOT_SPACING;
 let activeSlotIndex = 0;
 
 // Trees: 4x4 grid of 256x256 sprites in RetroTree.png; bottom-left two cells (0,3),(1,3) empty → 14 variants
@@ -78,6 +89,7 @@ const TREE_MAX_DIST = 55;
 const TREE_COUNT = 32;
 const TREE_HP = 100;
 const TREE_DAMAGE = 1;   // body only; no headshot, so trees rarely "fully explode"
+const TREE_HOLE_RADIUS_SCALE = 0.2;
 let trees = [];
 
 // Rifle — 455×256 per frame (fire + reload sheets), same as canvas
@@ -343,25 +355,85 @@ function generateTrees() {
 
 function generateBunkerLayout(layout = BUNKER_LAYOUT) {
   const slots = [];
-  const halfW = (Math.max(layout.north, layout.south, 1) - 1) * BUNKER_SLOT_SPACING / 2 + 2.4;
-  const halfD = (Math.max(layout.east, layout.west, 1) - 1) * BUNKER_SLOT_SPACING / 2 + 2.4;
-  function addSide(side, count, baseYaw, fixedCoord, horizontal, reverse = false) {
+  const wallAspect = assets.bunkerWall?.naturalWidth && assets.bunkerWall?.naturalHeight
+    ? assets.bunkerWall.naturalWidth / assets.bunkerWall.naturalHeight
+    : 1;
+  bunkerTileWorldWidth = BUNKER_WALL_HEIGHT * wallAspect * BUNKER_WALL_TILE_SCALE;
+  const tilesX = Math.max(layout.north, layout.south, 1);
+  const tilesZ = Math.max(layout.east, layout.west, 1);
+  const halfW = (tilesX * bunkerTileWorldWidth) / 2;
+  const halfD = (tilesZ * bunkerTileWorldWidth) / 2;
+  const sideCounts = { north: tilesX, east: tilesZ, south: tilesX, west: tilesZ };
+  bunkerWallTiles = { north: [], east: [], south: [], west: [] };
+
+  function spriteKeyForTile(side, i, count) {
+    const center = Math.floor((count - 1) / 2);
+    if (side === BUNKER_EMPTY_WALL_SIDE) return 'wall';
+    if (side === BUNKER_CRATE_SIDE && i === center) return 'door';
+    if (side === 'east' && i === center) return 'hole';
+    if (count <= 1) return 'window';
+    if (count === 2) return i === 0 ? 'window' : 'wall';
+    return i % 2 === 0 ? 'window' : 'wall';
+  }
+
+  for (const side of ['north', 'east', 'south', 'west']) {
+    const count = sideCounts[side];
+    const rangeMin = side === 'north' || side === 'south' ? WORLD_CENTER_X - halfW : WORLD_CENTER_Z - halfD;
     for (let i = 0; i < count; i++) {
-      const logicalIndex = reverse ? (count - 1 - i) : i;
-      const offset = (logicalIndex - (count - 1) / 2) * BUNKER_SLOT_SPACING;
-      slots.push(horizontal
-        ? { side, sideIndex: logicalIndex, type: 'window', x: WORLD_CENTER_X + offset, z: fixedCoord, baseYaw }
-        : { side, sideIndex: logicalIndex, type: 'window', x: fixedCoord, z: WORLD_CENTER_Z + offset, baseYaw });
+      const min = rangeMin + i * bunkerTileWorldWidth;
+      const max = min + bunkerTileWorldWidth;
+      bunkerWallTiles[side].push({ side, sideIndex: i, min, max, spriteKey: spriteKeyForTile(side, i, count) });
     }
   }
-  addSide('north', layout.north, 0, WORLD_CENTER_Z - halfD + BUNKER_WALL_INSET, true);
-  addSide('east', layout.east, Math.PI / 2, WORLD_CENTER_X + halfW - BUNKER_WALL_INSET, false);
-  addSide('south', layout.south, Math.PI, WORLD_CENTER_Z + halfD - BUNKER_WALL_INSET, true, true);
-  addSide('west', layout.west, -Math.PI / 2, WORLD_CENTER_X - halfW + BUNKER_WALL_INSET, false, true);
 
-  const preferred = slots.filter((slot) => slot.side === BUNKER_CRATE_SIDE);
-  const crateSlot = preferred[Math.floor(preferred.length / 2)] ?? slots[Math.floor(slots.length / 2)];
-  if (crateSlot) crateSlot.type = 'crate';
+  function addSideSlots(side, count, baseYaw, fixedCoord, horizontal, reverse = false) {
+    for (let i = 0; i < count; i++) {
+      const logicalIndex = reverse ? (count - 1 - i) : i;
+      const tile = bunkerWallTiles[side][logicalIndex];
+      if (!tile) continue;
+      if (tile.spriteKey === 'wall') continue;
+      const centerCoord = (tile.min + tile.max) / 2;
+      const type = 'window';
+      slots.push(horizontal
+        ? { side, sideIndex: logicalIndex, tileIndex: logicalIndex, tileSpriteKey: tile.spriteKey, type, x: centerCoord, z: fixedCoord, baseYaw }
+        : { side, sideIndex: logicalIndex, tileIndex: logicalIndex, tileSpriteKey: tile.spriteKey, type, x: fixedCoord, z: centerCoord, baseYaw });
+    }
+  }
+
+  addSideSlots('north', sideCounts.north, 0, WORLD_CENTER_Z - halfD + BUNKER_WALL_INSET, true);
+  addSideSlots('east', sideCounts.east, Math.PI / 2, WORLD_CENTER_X + halfW - BUNKER_WALL_INSET, false);
+  addSideSlots('south', sideCounts.south, Math.PI, WORLD_CENTER_Z + halfD - BUNKER_WALL_INSET, true, true);
+  addSideSlots('west', sideCounts.west, -Math.PI / 2, WORLD_CENTER_X - halfW + BUNKER_WALL_INSET, false, true);
+
+  const crateCount = sideCounts[BUNKER_EMPTY_WALL_SIDE] || 1;
+  const crateCenterIndex = Math.floor((crateCount - 1) / 2);
+  const crateTile = bunkerWallTiles[BUNKER_EMPTY_WALL_SIDE]?.[crateCenterIndex];
+  if (crateTile) {
+    const centerCoord = (crateTile.min + crateTile.max) / 2;
+    if (BUNKER_EMPTY_WALL_SIDE === 'north' || BUNKER_EMPTY_WALL_SIDE === 'south') {
+      slots.push({
+        side: BUNKER_EMPTY_WALL_SIDE,
+        sideIndex: crateCenterIndex,
+        tileIndex: crateCenterIndex,
+        tileSpriteKey: 'wall',
+        type: 'crate',
+        x: centerCoord,
+        z: BUNKER_EMPTY_WALL_SIDE === 'north' ? WORLD_CENTER_Z - halfD + BUNKER_WALL_INSET : WORLD_CENTER_Z + halfD - BUNKER_WALL_INSET,
+        baseYaw: BUNKER_EMPTY_WALL_SIDE === 'north' ? 0 : Math.PI,
+      });
+    } else {
+      slots.push({
+        side: BUNKER_EMPTY_WALL_SIDE,
+        sideIndex: crateCenterIndex,
+        tileIndex: crateCenterIndex,
+        tileSpriteKey: 'wall',
+        type: 'crate',
+        x: BUNKER_EMPTY_WALL_SIDE === 'west' ? WORLD_CENTER_X - halfW + BUNKER_WALL_INSET : WORLD_CENTER_X + halfW - BUNKER_WALL_INSET,
+        z: centerCoord,
+        baseYaw: BUNKER_EMPTY_WALL_SIDE === 'east' ? Math.PI / 2 : -Math.PI / 2,
+      });
+    }
+  }
 
   bunker = { halfW, halfD };
   bunkerSlots = slots;
@@ -409,14 +481,46 @@ function getSlotWallCenter(slot) {
   return slot.side === 'north' || slot.side === 'south' ? slot.x : slot.z;
 }
 
+function getPeekOffsetForSlot(slot) {
+  if (!slot || slot.type !== 'window') return { x: 0, z: 0 };
+  const rawYawFromSlot = normalizeAngle(cameraYaw - slot.baseYaw);
+  const absRawYaw = Math.abs(rawYawFromSlot);
+  if (absRawYaw >= BUNKER_PEEK_FADE_END_YAW) return { x: 0, z: 0 };
+  let peekFade = 1;
+  if (absRawYaw > BUNKER_PEEK_FADE_START_YAW) {
+    const t = (absRawYaw - BUNKER_PEEK_FADE_START_YAW) / Math.max(1e-6, (BUNKER_PEEK_FADE_END_YAW - BUNKER_PEEK_FADE_START_YAW));
+    const smooth = t * t * (3 - 2 * t);
+    peekFade = 1 - smooth;
+  }
+  const yawFromSlot = Math.max(-BUNKER_PEEK_MAX_YAW, Math.min(BUNKER_PEEK_MAX_YAW, rawYawFromSlot));
+  const tile = bunkerWallTiles[slot.side]?.[slot.tileIndex];
+  const tileWidth = tile ? (tile.max - tile.min) : BUNKER_WINDOW_WIDTH;
+  const halfOpen = Math.max(0.05, tileWidth / 2 - BUNKER_PEEK_WINDOW_MARGIN);
+  // Solve lateral shift so center shot ray intersects near opening center:
+  // lateral + inset * tan(yaw) ~= 0  => lateral = -inset * tan(yaw).
+  let lateral = -BUNKER_WALL_INSET * Math.tan(yawFromSlot);
+  lateral = Math.max(-halfOpen, Math.min(halfOpen, lateral));
+  lateral *= peekFade;
+  const lateralRatio = Math.abs(lateral) / Math.max(halfOpen, 1e-6);
+  const forward = lateralRatio * lateralRatio * BUNKER_PEEK_FORWARD_PUSH_MAX * peekFade;
+  const rightX = Math.cos(slot.baseYaw);
+  const rightZ = Math.sin(slot.baseYaw);
+  const forwardX = Math.sin(slot.baseYaw);
+  const forwardZ = -Math.cos(slot.baseYaw);
+  return {
+    x: rightX * lateral + forwardX * forward,
+    z: rightZ * lateral + forwardZ * forward,
+  };
+}
+
 function getWindowOpeningsForSide(side) {
-  return bunkerSlots
-    .filter((slot) => slot.side === side && slot.type === 'window')
-    .map((slot) => ({
-      min: getSlotWallCenter(slot) - BUNKER_WINDOW_WIDTH / 2,
-      max: getSlotWallCenter(slot) + BUNKER_WINDOW_WIDTH / 2,
-      bottom: BUNKER_WINDOW_BOTTOM,
-      top: BUNKER_WINDOW_TOP,
+  return (bunkerWallTiles[side] ?? [])
+    .filter((tile) => tile.spriteKey !== 'wall')
+    .map((tile) => ({
+      min: tile.min,
+      max: tile.max,
+      bottom: 0,
+      top: BUNKER_WALL_HEIGHT,
     }))
     .sort((a, b) => a.min - b.min);
 }
@@ -493,22 +597,71 @@ function clipPolygonToNear(viewPoints) {
   return clipped;
 }
 
-function pushPolygon(polys, points, fill, stroke = null) {
+function pushPolygon(polys, points, fill, stroke = null, texture = null) {
   const viewPoints = clipPolygonToNear(points.map((p) => worldToView(p.x, p.y, p.z)));
   if (viewPoints.length < 3) return;
   const projected = viewPoints.map(projectViewPoint);
   const avgDepth = viewPoints.reduce((sum, p) => sum + p.depth, 0) / viewPoints.length;
-  polys.push({ projected, avgDepth, fill, stroke });
+  polys.push({ projected, avgDepth, fill, stroke, texture });
+}
+
+function drawTexturedTriangle(img, s0, s1, s2, d0, d1, d2) {
+  const det = s0.x * (s1.y - s2.y) + s1.x * (s2.y - s0.y) + s2.x * (s0.y - s1.y);
+  if (Math.abs(det) < 1e-6) return;
+  const a = (d0.x * (s1.y - s2.y) + d1.x * (s2.y - s0.y) + d2.x * (s0.y - s1.y)) / det;
+  const b = (d0.y * (s1.y - s2.y) + d1.y * (s2.y - s0.y) + d2.y * (s0.y - s1.y)) / det;
+  const c = (d0.x * (s2.x - s1.x) + d1.x * (s0.x - s2.x) + d2.x * (s1.x - s0.x)) / det;
+  const d = (d0.y * (s2.x - s1.x) + d1.y * (s0.x - s2.x) + d2.y * (s1.x - s0.x)) / det;
+  const e = (d0.x * (s1.x * s2.y - s2.x * s1.y) + d1.x * (s2.x * s0.y - s0.x * s2.y) + d2.x * (s0.x * s1.y - s1.x * s0.y)) / det;
+  const f = (d0.y * (s1.x * s2.y - s2.x * s1.y) + d1.y * (s2.x * s0.y - s0.x * s2.y) + d2.y * (s0.x * s1.y - s1.x * s0.y)) / det;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(d0.x, d0.y);
+  ctx.lineTo(d1.x, d1.y);
+  ctx.lineTo(d2.x, d2.y);
+  ctx.closePath();
+  ctx.clip();
+  ctx.transform(a, b, c, d, e, f);
+  ctx.drawImage(img, 0, 0);
+  ctx.restore();
+}
+
+function drawTexturedQuad(img, projected, texRect = null) {
+  const iw = img.naturalWidth || img.width;
+  const ih = img.naturalHeight || img.height;
+  if (!iw || !ih || projected.length !== 4) return false;
+  const tex = texRect || { sx: 0, sy: 0, sw: iw, sh: ih };
+  const left = tex.sx;
+  const right = tex.sx + tex.sw;
+  const top = tex.sy;
+  const bottom = tex.sy + tex.sh;
+  const s0 = { x: left, y: bottom };
+  const s1 = { x: right, y: bottom };
+  const s2 = { x: right, y: top };
+  const s3 = { x: left, y: top };
+  const d0 = { x: projected[0].sx, y: projected[0].sy };
+  const d1 = { x: projected[1].sx, y: projected[1].sy };
+  const d2 = { x: projected[2].sx, y: projected[2].sy };
+  const d3 = { x: projected[3].sx, y: projected[3].sy };
+  drawTexturedTriangle(img, s0, s1, s2, d0, d1, d2);
+  drawTexturedTriangle(img, s0, s2, s3, d0, d2, d3);
+  return true;
 }
 
 function drawProjectedPolygon(poly) {
-  const { projected, fill, stroke } = poly;
+  const { projected, fill, stroke, texture } = poly;
   ctx.beginPath();
   ctx.moveTo(projected[0].sx, projected[0].sy);
   for (let i = 1; i < projected.length; i++) ctx.lineTo(projected[i].sx, projected[i].sy);
   ctx.closePath();
-  ctx.fillStyle = fill;
-  ctx.fill();
+  const texRect = (texture && texture.sx !== undefined)
+    ? { sx: texture.sx, sy: texture.sy, sw: texture.sw, sh: texture.sh }
+    : null;
+  const drewTexture = texture?.img ? drawTexturedQuad(texture.img, projected, texRect) : false;
+  if (!drewTexture) {
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
   if (stroke) {
     ctx.strokeStyle = stroke;
     ctx.lineWidth = 1;
@@ -527,6 +680,28 @@ function getShotDirection(px, py) {
   };
   const len = Math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z) || 1;
   return { x: dir.x / len, y: dir.y / len, z: dir.z / len };
+}
+
+function getBunkerWallImageAndData(spriteKey) {
+  if (spriteKey === 'window') return { img: assets.bunkerWallWindow, data: assets.bunkerWallWindowData };
+  if (spriteKey === 'hole') return { img: assets.bunkerWallHole, data: assets.bunkerWallHoleData };
+  if (spriteKey === 'door') return { img: assets.bunkerWallDoor, data: assets.bunkerWallDoorData };
+  return { img: assets.bunkerWall, data: assets.bunkerWallData };
+}
+
+function sampleBunkerWallAlpha(side, coord, y) {
+  const tiles = bunkerWallTiles[side] ?? [];
+  const tile = tiles.find((t) => coord >= t.min && coord <= t.max);
+  if (!tile) return 255;
+  const { data } = getBunkerWallImageAndData(tile.spriteKey);
+  if (!data?.width || !data?.height) {
+    return tile.spriteKey === 'wall' ? 255 : 0;
+  }
+  const u = Math.max(0, Math.min(0.999999, (coord - tile.min) / Math.max(tile.max - tile.min, 1e-6)));
+  const v = Math.max(0, Math.min(0.999999, 1 - y / BUNKER_WALL_HEIGHT));
+  const tx = Math.floor(u * data.width);
+  const ty = Math.floor(v * data.height);
+  return data.data[(ty * data.width + tx) * 4 + 3];
 }
 
 function shotLeavesThroughWindow(px, py) {
@@ -558,9 +733,11 @@ function shotLeavesThroughWindow(px, py) {
     .sort((a, b) => a.t - b.t)[0];
 
   if (!first) return true;
-  if (first.y <= BUNKER_WINDOW_BOTTOM || first.y >= BUNKER_WINDOW_TOP) return false;
+  if (first.y <= 0) return false;
+  if (first.y >= BUNKER_WALL_HEIGHT) return true;
   const coord = first.side === 'north' || first.side === 'south' ? first.x : first.z;
-  return getWindowOpeningsForSide(first.side).some((opening) => coord >= opening.min && coord <= opening.max);
+  const alpha = sampleBunkerWallAlpha(first.side, coord, first.y);
+  return alpha <= BUNKER_WALL_ALPHA_PASS_THRESHOLD;
 }
 
 function getCrateAABB() {
@@ -666,6 +843,15 @@ async function loadAssets() {
   assets.zombieFemaleGhoulHeadshotData = imageDataFromImage(assets.zombieFemaleGhoulHeadshotMask);
   assets.zombieGasMaskHeadshotData = imageDataFromImage(assets.zombieGasMaskHeadshotMask);
   assets.retrotree = await loadImage(`${base}/RetroTree.png`);
+  assets.bunkerWall = await loadImage(`${base}/bunker/wall.png`);
+  assets.bunkerWallWindow = await loadImage(`${base}/bunker/wall_with_window.png`);
+  assets.bunkerWallHole = await loadImage(`${base}/bunker/wall_with_hole.png`);
+  assets.bunkerWallDoor = await loadImage(`${base}/bunker/wall_with_door.png`);
+  assets.bunkerWallData = imageDataFromImage(assets.bunkerWall);
+  assets.bunkerWallWindowData = imageDataFromImage(assets.bunkerWallWindow);
+  assets.bunkerWallHoleData = imageDataFromImage(assets.bunkerWallHole);
+  assets.bunkerWallDoorData = imageDataFromImage(assets.bunkerWallDoor);
+  generateBunkerLayout();
   const horizonPath = `${base}/${HORIZON_BACKGROUND_PATH}`;
   assets.horizonBackground = await loadImage(horizonPath);
   if (assets.horizonBackground) {
@@ -1352,7 +1538,7 @@ function damageTree(idx, hitPx, hitPy) {
   const hitTy = ((hitPy - info.sy) / info.sh) * TREE_SPRITE_SIZE;
   t.hp = (t.hp ?? TREE_HP) - TREE_DAMAGE;
   const baseRadii = makeJaggedRadii();
-  const jaggedRadii = baseRadii.map((r) => (r * (TREE_SPRITE_SIZE / ZOMBIE_SPRITE_W)) / 10);
+  const jaggedRadii = baseRadii.map((r) => r * (TREE_SPRITE_SIZE / ZOMBIE_SPRITE_W) * TREE_HOLE_RADIUS_SCALE);
   if (t.hp <= 0) {
     spawnTreeHoleParticles(t, info, hitPx, hitPy, jaggedRadii);
     trees.splice(idx, 1);
@@ -1603,9 +1789,9 @@ function drawFogWisps() {
   }
 }
 
-function drawTrees() {
-  if (!assets.retrotree) return;
-  const visible = trees
+function getVisibleTrees() {
+  if (!assets.retrotree) return [];
+  return trees
     .map((t) => {
       const base = project(t.x, 0, t.z);
       const center = project(t.x, TREE_HEIGHT * 0.5, t.z);
@@ -1625,205 +1811,227 @@ function drawTrees() {
       };
     })
     .filter(Boolean);
-  visible.sort((a, b) => b.depth - a.depth);
+}
+
+function drawTreeInfo(t) {
   const HOLE_EDGE_ALPHA_THRESHOLD_TREE = 10;
-  for (const t of visible) {
-    const { col, row } = getTreeGridCell(t.spriteIndex);
-    ctx.save();
-    ctx.globalAlpha = 1;
-    if (t.holes && t.holes.length > 0) {
-      if (!treeHoleCanvas || treeHoleCanvas.width !== TREE_SPRITE_SIZE || treeHoleCanvas.height !== TREE_SPRITE_SIZE) {
-        treeHoleCanvas = document.createElement('canvas');
-        treeHoleCanvas.width = TREE_SPRITE_SIZE;
-        treeHoleCanvas.height = TREE_SPRITE_SIZE;
-        treeHoleCtx = treeHoleCanvas.getContext('2d');
-      }
-      treeHoleCtx.clearRect(0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE);
-      treeHoleCtx.drawImage(
-        assets.retrotree,
-        col * TREE_SPRITE_SIZE,
-        row * TREE_SPRITE_SIZE,
-        TREE_SPRITE_SIZE,
-        TREE_SPRITE_SIZE,
-        0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE
-      );
-      const spriteData = treeHoleCtx.getImageData(0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE);
-      for (const hole of t.holes) {
-        const hx = hole.tx;
-        const hy = hole.ty;
-        treeHoleCtx.beginPath();
-        if (hole.jaggedRadii && hole.jaggedRadii.length > 0) {
-          for (let i = 0; i < hole.jaggedRadii.length; i++) {
-            const angle = (i / hole.jaggedRadii.length) * 2 * Math.PI;
-            const r = hole.jaggedRadii[i];
-            const px = hx + Math.cos(angle) * r;
-            const py = hy + Math.sin(angle) * r;
-            if (i === 0) treeHoleCtx.moveTo(px, py);
-            else treeHoleCtx.lineTo(px, py);
-          }
-          treeHoleCtx.closePath();
-        }
-        treeHoleCtx.globalCompositeOperation = 'destination-out';
-        treeHoleCtx.fillStyle = 'rgba(0,0,0,1)';
-        treeHoleCtx.fill();
-        treeHoleCtx.globalCompositeOperation = 'source-over';
-        treeHoleCtx.strokeStyle = '#000';
-        treeHoleCtx.lineWidth = 1;
-        if (hole.jaggedRadii && hole.jaggedRadii.length >= 2) {
-          const n = hole.jaggedRadii.length;
-          for (let i = 0; i < n; i++) {
-            const angle0 = (i / n) * 2 * Math.PI;
-            const angle1 = ((i + 1) / n) * 2 * Math.PI;
-            const v0x = hx + Math.cos(angle0) * hole.jaggedRadii[i];
-            const v0y = hy + Math.sin(angle0) * hole.jaggedRadii[i];
-            const v1x = hx + Math.cos(angle1) * hole.jaggedRadii[(i + 1) % n];
-            const v1y = hy + Math.sin(angle1) * hole.jaggedRadii[(i + 1) % n];
-            const mx = (v0x + v1x) / 2;
-            const my = (v0y + v1y) / 2;
-            const dx = mx - hx;
-            const dy = my - hy;
-            const len = Math.sqrt(dx * dx + dy * dy) || 1;
-            const outX = mx + (dx / len) * 2;
-            const outY = my + (dy / len) * 2;
-            const tx = Math.max(0, Math.min(TREE_SPRITE_SIZE - 1, Math.floor(outX)));
-            const ty = Math.max(0, Math.min(TREE_SPRITE_SIZE - 1, Math.floor(outY)));
-            const idx = (ty * TREE_SPRITE_SIZE + tx) * 4 + 3;
-            if (spriteData.data[idx] > HOLE_EDGE_ALPHA_THRESHOLD_TREE) {
-              treeHoleCtx.beginPath();
-              treeHoleCtx.moveTo(v0x, v0y);
-              treeHoleCtx.lineTo(v1x, v1y);
-              treeHoleCtx.stroke();
-            }
-          }
-        }
-      }
-      ctx.drawImage(treeHoleCanvas, 0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE, t.sx, t.sy, t.sw, t.sh);
-    } else {
-      ctx.drawImage(
-        assets.retrotree,
-        col * TREE_SPRITE_SIZE,
-        row * TREE_SPRITE_SIZE,
-        TREE_SPRITE_SIZE,
-        TREE_SPRITE_SIZE,
-        t.sx,
-        t.sy,
-        t.sw,
-        t.sh
-      );
+  const { col, row } = getTreeGridCell(t.spriteIndex);
+  ctx.save();
+  ctx.globalAlpha = 1;
+  if (t.holes && t.holes.length > 0) {
+    if (!treeHoleCanvas || treeHoleCanvas.width !== TREE_SPRITE_SIZE || treeHoleCanvas.height !== TREE_SPRITE_SIZE) {
+      treeHoleCanvas = document.createElement('canvas');
+      treeHoleCanvas.width = TREE_SPRITE_SIZE;
+      treeHoleCanvas.height = TREE_SPRITE_SIZE;
+      treeHoleCtx = treeHoleCanvas.getContext('2d');
     }
-    ctx.restore();
+    treeHoleCtx.clearRect(0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE);
+    treeHoleCtx.drawImage(
+      assets.retrotree,
+      col * TREE_SPRITE_SIZE,
+      row * TREE_SPRITE_SIZE,
+      TREE_SPRITE_SIZE,
+      TREE_SPRITE_SIZE,
+      0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE
+    );
+    const spriteData = treeHoleCtx.getImageData(0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE);
+    for (const hole of t.holes) {
+      const hx = hole.tx;
+      const hy = hole.ty;
+      treeHoleCtx.beginPath();
+      if (hole.jaggedRadii && hole.jaggedRadii.length > 0) {
+        for (let i = 0; i < hole.jaggedRadii.length; i++) {
+          const angle = (i / hole.jaggedRadii.length) * 2 * Math.PI;
+          const r = hole.jaggedRadii[i];
+          const px = hx + Math.cos(angle) * r;
+          const py = hy + Math.sin(angle) * r;
+          if (i === 0) treeHoleCtx.moveTo(px, py);
+          else treeHoleCtx.lineTo(px, py);
+        }
+        treeHoleCtx.closePath();
+      }
+      treeHoleCtx.globalCompositeOperation = 'destination-out';
+      treeHoleCtx.fillStyle = 'rgba(0,0,0,1)';
+      treeHoleCtx.fill();
+      treeHoleCtx.globalCompositeOperation = 'source-over';
+      treeHoleCtx.strokeStyle = '#000';
+      treeHoleCtx.lineWidth = 1;
+      if (hole.jaggedRadii && hole.jaggedRadii.length >= 2) {
+        const n = hole.jaggedRadii.length;
+        for (let i = 0; i < n; i++) {
+          const angle0 = (i / n) * 2 * Math.PI;
+          const angle1 = ((i + 1) / n) * 2 * Math.PI;
+          const v0x = hx + Math.cos(angle0) * hole.jaggedRadii[i];
+          const v0y = hy + Math.sin(angle0) * hole.jaggedRadii[i];
+          const v1x = hx + Math.cos(angle1) * hole.jaggedRadii[(i + 1) % n];
+          const v1y = hy + Math.sin(angle1) * hole.jaggedRadii[(i + 1) % n];
+          const mx = (v0x + v1x) / 2;
+          const my = (v0y + v1y) / 2;
+          const dx = mx - hx;
+          const dy = my - hy;
+          const len = Math.sqrt(dx * dx + dy * dy) || 1;
+          const outX = mx + (dx / len) * 2;
+          const outY = my + (dy / len) * 2;
+          const tx = Math.max(0, Math.min(TREE_SPRITE_SIZE - 1, Math.floor(outX)));
+          const ty = Math.max(0, Math.min(TREE_SPRITE_SIZE - 1, Math.floor(outY)));
+          const idx = (ty * TREE_SPRITE_SIZE + tx) * 4 + 3;
+          if (spriteData.data[idx] > HOLE_EDGE_ALPHA_THRESHOLD_TREE) {
+            treeHoleCtx.beginPath();
+            treeHoleCtx.moveTo(v0x, v0y);
+            treeHoleCtx.lineTo(v1x, v1y);
+            treeHoleCtx.stroke();
+          }
+        }
+      }
+    }
+    ctx.drawImage(treeHoleCanvas, 0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE, t.sx, t.sy, t.sw, t.sh);
+  } else {
+    ctx.drawImage(
+      assets.retrotree,
+      col * TREE_SPRITE_SIZE,
+      row * TREE_SPRITE_SIZE,
+      TREE_SPRITE_SIZE,
+      TREE_SPRITE_SIZE,
+      t.sx,
+      t.sy,
+      t.sw,
+      t.sh
+    );
   }
+  ctx.restore();
+}
+
+function drawTrees() {
+  const visible = getVisibleTrees();
+  visible.sort((a, b) => b.depth - a.depth);
+  for (const t of visible) drawTreeInfo(t);
+}
+
+function drawZombieInfo(z, info) {
+  ctx.save();
+  ctx.globalAlpha = 1;
+  const img = z.sprite || assets.zombieSprites[0];
+  const spriteW = info.spriteW ?? ZOMBIE_SPRITE_W;
+  const spriteH = info.spriteH ?? ZOMBIE_SPRITE_H;
+  if (z.holes && z.holes.length > 0) {
+    const rw = Math.ceil(info.sw);
+    const rh = Math.ceil(info.sh);
+    if (!holeCanvas || holeCanvas.width < rw || holeCanvas.height < rh) {
+      holeCanvas = document.createElement('canvas');
+      holeCanvas.width = Math.max(rw, 1);
+      holeCanvas.height = Math.max(rh, 1);
+      holeCtx = holeCanvas.getContext('2d');
+    }
+    holeCtx.clearRect(0, 0, holeCanvas.width, holeCanvas.height);
+    holeCtx.drawImage(img, 0, 0, spriteW, spriteH, 0, 0, info.sw, info.sh);
+    const holeRadiusScreen = (HOLE_RADIUS_SPRITE / ZOMBIE_SPRITE_W) * info.sw;
+    ensureZombieSampleCanvas(spriteW, spriteH);
+    zombieSampleCtx.clearRect(0, 0, spriteW, spriteH);
+    zombieSampleCtx.drawImage(img, 0, 0, spriteW, spriteH, 0, 0, spriteW, spriteH);
+    const spriteData = zombieSampleCtx.getImageData(0, 0, spriteW, spriteH);
+    const HOLE_EDGE_ALPHA_THRESHOLD = 10;
+    for (const hole of z.holes) {
+      const hx = (hole.tx / spriteW) * info.sw;
+      const hy = (hole.ty / spriteH) * info.sh;
+      const scaleX = info.sw / spriteW;
+      const scaleY = info.sh / spriteH;
+      let vertices = [];
+      holeCtx.beginPath();
+      if (hole.jaggedRadii && hole.jaggedRadii.length > 0) {
+        for (let i = 0; i < hole.jaggedRadii.length; i++) {
+          const angle = (i / hole.jaggedRadii.length) * 2 * Math.PI;
+          const r = hole.jaggedRadii[i];
+          const px = hx + Math.cos(angle) * r * scaleX;
+          const py = hy + Math.sin(angle) * r * scaleY;
+          vertices.push({ x: px, y: py });
+          if (i === 0) holeCtx.moveTo(px, py);
+          else holeCtx.lineTo(px, py);
+        }
+        holeCtx.closePath();
+      } else {
+        holeCtx.arc(hx, hy, holeRadiusScreen, 0, Math.PI * 2);
+        for (let i = 0; i < HOLE_JAGGED_POINTS; i++) {
+          const angle = (i / HOLE_JAGGED_POINTS) * 2 * Math.PI;
+          vertices.push({
+            x: hx + Math.cos(angle) * holeRadiusScreen,
+            y: hy + Math.sin(angle) * holeRadiusScreen,
+          });
+        }
+      }
+      holeCtx.globalCompositeOperation = 'destination-out';
+      holeCtx.fillStyle = 'rgba(0,0,0,1)';
+      holeCtx.fill();
+      holeCtx.globalCompositeOperation = 'source-over';
+      holeCtx.strokeStyle = '#000';
+      holeCtx.lineWidth = 1;
+      if (vertices.length >= 2) {
+        const n = vertices.length;
+        for (let i = 0; i < n; i++) {
+          const v0 = vertices[i];
+          const v1 = vertices[(i + 1) % n];
+          const mx = (v0.x + v1.x) / 2;
+          const my = (v0.y + v1.y) / 2;
+          const dx = mx - hx;
+          const dy = my - hy;
+          const len = Math.sqrt(dx * dx + dy * dy) || 1;
+          const outX = mx + (dx / len) * 2;
+          const outY = my + (dy / len) * 2;
+          const sx = Math.floor((outX / info.sw) * spriteW);
+          const sy = Math.floor((outY / info.sh) * spriteH);
+          const tx = Math.max(0, Math.min(spriteW - 1, sx));
+          const ty = Math.max(0, Math.min(spriteH - 1, sy));
+          const idx = (ty * spriteW + tx) * 4 + 3;
+          if (spriteData.data[idx] > HOLE_EDGE_ALPHA_THRESHOLD) {
+            holeCtx.beginPath();
+            holeCtx.moveTo(v0.x, v0.y);
+            holeCtx.lineTo(v1.x, v1.y);
+            holeCtx.stroke();
+          }
+        }
+      }
+    }
+    if (info.flip) {
+      ctx.save();
+      ctx.translate(info.sx + info.sw, info.sy);
+      ctx.scale(-1, 1);
+      ctx.drawImage(holeCanvas, 0, 0, info.sw, info.sh, 0, 0, info.sw, info.sh);
+      ctx.restore();
+    } else {
+      ctx.drawImage(holeCanvas, 0, 0, info.sw, info.sh, info.sx, info.sy, info.sw, info.sh);
+    }
+  } else {
+    if (info.flip) {
+      ctx.save();
+      ctx.translate(info.sx + info.sw, info.sy);
+      ctx.scale(-1, 1);
+      ctx.drawImage(img, 0, 0, spriteW, spriteH, 0, 0, info.sw, info.sh);
+      ctx.restore();
+    } else {
+      ctx.drawImage(img, 0, 0, spriteW, spriteH, info.sx, info.sy, info.sw, info.sh);
+    }
+  }
+  ctx.restore();
 }
 
 function drawZombies() {
   if (!assets.zombieSprites?.length) return;
   const withInfo = zombies.map((z) => ({ z, info: getZombieDrawInfo(z) })).filter((o) => o.info);
   withInfo.sort((a, b) => b.info.depth - a.info.depth);
-  for (const { z, info } of withInfo) {
-    const fogF = getFogFactor(info.depth);
-    ctx.save();
-    ctx.globalAlpha = 1 - fogF;
-    const img = z.sprite || assets.zombieSprites[0];
-    const spriteW = info.spriteW ?? ZOMBIE_SPRITE_W;
-    const spriteH = info.spriteH ?? ZOMBIE_SPRITE_H;
-    if (z.holes && z.holes.length > 0) {
-      const rw = Math.ceil(info.sw);
-      const rh = Math.ceil(info.sh);
-      if (!holeCanvas || holeCanvas.width < rw || holeCanvas.height < rh) {
-        holeCanvas = document.createElement('canvas');
-        holeCanvas.width = Math.max(rw, 1);
-        holeCanvas.height = Math.max(rh, 1);
-        holeCtx = holeCanvas.getContext('2d');
-      }
-      holeCtx.clearRect(0, 0, holeCanvas.width, holeCanvas.height);
-      holeCtx.drawImage(img, 0, 0, spriteW, spriteH, 0, 0, info.sw, info.sh);
-      const holeRadiusScreen = (HOLE_RADIUS_SPRITE / ZOMBIE_SPRITE_W) * info.sw;
-      ensureZombieSampleCanvas(spriteW, spriteH);
-      zombieSampleCtx.clearRect(0, 0, spriteW, spriteH);
-      zombieSampleCtx.drawImage(img, 0, 0, spriteW, spriteH, 0, 0, spriteW, spriteH);
-      const spriteData = zombieSampleCtx.getImageData(0, 0, spriteW, spriteH);
-      const HOLE_EDGE_ALPHA_THRESHOLD = 10;
-      for (const hole of z.holes) {
-        const hx = (hole.tx / spriteW) * info.sw;
-        const hy = (hole.ty / spriteH) * info.sh;
-        const scaleX = info.sw / spriteW;
-        const scaleY = info.sh / spriteH;
-        let vertices = [];
-        holeCtx.beginPath();
-        if (hole.jaggedRadii && hole.jaggedRadii.length > 0) {
-          for (let i = 0; i < hole.jaggedRadii.length; i++) {
-            const angle = (i / hole.jaggedRadii.length) * 2 * Math.PI;
-            const r = hole.jaggedRadii[i];
-            const px = hx + Math.cos(angle) * r * scaleX;
-            const py = hy + Math.sin(angle) * r * scaleY;
-            vertices.push({ x: px, y: py });
-            if (i === 0) holeCtx.moveTo(px, py);
-            else holeCtx.lineTo(px, py);
-          }
-          holeCtx.closePath();
-        } else {
-          holeCtx.arc(hx, hy, holeRadiusScreen, 0, Math.PI * 2);
-          for (let i = 0; i < HOLE_JAGGED_POINTS; i++) {
-            const angle = (i / HOLE_JAGGED_POINTS) * 2 * Math.PI;
-            vertices.push({
-              x: hx + Math.cos(angle) * holeRadiusScreen,
-              y: hy + Math.sin(angle) * holeRadiusScreen,
-            });
-          }
-        }
-        holeCtx.globalCompositeOperation = 'destination-out';
-        holeCtx.fillStyle = 'rgba(0,0,0,1)';
-        holeCtx.fill();
-        holeCtx.globalCompositeOperation = 'source-over';
-        holeCtx.strokeStyle = '#000';
-        holeCtx.lineWidth = 1;
-        if (vertices.length >= 2) {
-          const n = vertices.length;
-          for (let i = 0; i < n; i++) {
-            const v0 = vertices[i];
-            const v1 = vertices[(i + 1) % n];
-            const mx = (v0.x + v1.x) / 2;
-            const my = (v0.y + v1.y) / 2;
-            const dx = mx - hx;
-            const dy = my - hy;
-            const len = Math.sqrt(dx * dx + dy * dy) || 1;
-            const outX = mx + (dx / len) * 2;
-            const outY = my + (dy / len) * 2;
-            const sx = Math.floor((outX / info.sw) * spriteW);
-            const sy = Math.floor((outY / info.sh) * spriteH);
-            const tx = Math.max(0, Math.min(spriteW - 1, sx));
-            const ty = Math.max(0, Math.min(spriteH - 1, sy));
-            const idx = (ty * spriteW + tx) * 4 + 3;
-            if (spriteData.data[idx] > HOLE_EDGE_ALPHA_THRESHOLD) {
-              holeCtx.beginPath();
-              holeCtx.moveTo(v0.x, v0.y);
-              holeCtx.lineTo(v1.x, v1.y);
-              holeCtx.stroke();
-            }
-          }
-        }
-      }
-      if (info.flip) {
-        ctx.save();
-        ctx.translate(info.sx + info.sw, info.sy);
-        ctx.scale(-1, 1);
-        ctx.drawImage(holeCanvas, 0, 0, info.sw, info.sh, 0, 0, info.sw, info.sh);
-        ctx.restore();
-      } else {
-        ctx.drawImage(holeCanvas, 0, 0, info.sw, info.sh, info.sx, info.sy, info.sw, info.sh);
-      }
-    } else {
-      if (info.flip) {
-        ctx.save();
-        ctx.translate(info.sx + info.sw, info.sy);
-        ctx.scale(-1, 1);
-        ctx.drawImage(img, 0, 0, spriteW, spriteH, 0, 0, info.sw, info.sh);
-        ctx.restore();
-      } else {
-        ctx.drawImage(img, 0, 0, spriteW, spriteH, info.sx, info.sy, info.sw, info.sh);
-      }
-    }
-    ctx.restore();
+  for (const { z, info } of withInfo) drawZombieInfo(z, info);
+}
+
+function drawCharactersDepthSorted() {
+  const drawItems = [];
+  for (const t of getVisibleTrees()) drawItems.push({ type: 'tree', depth: t.depth, t });
+  for (const z of zombies) {
+    const info = getZombieDrawInfo(z);
+    if (!info) continue;
+    drawItems.push({ type: 'zombie', depth: info.depth, z, info });
+  }
+  drawItems.sort((a, b) => b.depth - a.depth);
+  for (const item of drawItems) {
+    if (item.type === 'tree') drawTreeInfo(item.t);
+    else drawZombieInfo(item.z, item.info);
   }
 }
 
@@ -1832,7 +2040,6 @@ function drawBunkerInterior() {
 
   const polys = [];
   const wallColor = '#1e1712';
-  const wallShade = '#2a2119';
   const trimColor = '#564536';
   const floorColor = '#1a1511';
   const ceilingColor = '#100c09';
@@ -1858,51 +2065,54 @@ function drawBunkerInterior() {
     { x: minX, y: BUNKER_WALL_HEIGHT, z: minZ },
   ], ceilingColor);
 
-  function pushWallRect(side, from, to, y0, y1, fill) {
-    if (to - from < 0.02 || y1 - y0 < 0.02) return;
-    if (side === 'north') {
-      pushPolygon(polys, [
-        { x: from, y: y0, z: minZ },
-        { x: to, y: y0, z: minZ },
-        { x: to, y: y1, z: minZ },
-        { x: from, y: y1, z: minZ },
-      ], fill, trimColor);
-    } else if (side === 'south') {
-      pushPolygon(polys, [
-        { x: to, y: y0, z: maxZ },
-        { x: from, y: y0, z: maxZ },
-        { x: from, y: y1, z: maxZ },
-        { x: to, y: y1, z: maxZ },
-      ], fill, trimColor);
-    } else if (side === 'east') {
-      pushPolygon(polys, [
-        { x: maxX, y: y0, z: from },
-        { x: maxX, y: y0, z: to },
-        { x: maxX, y: y1, z: to },
-        { x: maxX, y: y1, z: from },
-      ], fill, trimColor);
-    } else {
-      pushPolygon(polys, [
-        { x: minX, y: y0, z: to },
-        { x: minX, y: y0, z: from },
-        { x: minX, y: y1, z: from },
-        { x: minX, y: y1, z: to },
-      ], fill, trimColor);
+  function pushWallTile(side, tile) {
+    const { img } = getBunkerWallImageAndData(tile.spriteKey);
+    const fill = wallColor;
+    const stroke = img ? null : trimColor;
+    const slices = img ? BUNKER_WALL_TEXTURE_SLICES : 1;
+    const iw = img?.naturalWidth || img?.width || 1;
+    const ih = img?.naturalHeight || img?.height || 1;
+    for (let i = 0; i < slices; i++) {
+      const u0 = i / slices;
+      const u1 = (i + 1) / slices;
+      const a = tile.min + (tile.max - tile.min) * u0;
+      const b = tile.min + (tile.max - tile.min) * u1;
+      const tex = img ? { img, sx: u0 * iw, sy: 0, sw: (u1 - u0) * iw, sh: ih } : null;
+      if (side === 'north') {
+        pushPolygon(polys, [
+          { x: a, y: 0, z: minZ },
+          { x: b, y: 0, z: minZ },
+          { x: b, y: BUNKER_WALL_HEIGHT, z: minZ },
+          { x: a, y: BUNKER_WALL_HEIGHT, z: minZ },
+        ], fill, stroke, tex);
+      } else if (side === 'south') {
+        pushPolygon(polys, [
+          { x: a, y: 0, z: maxZ },
+          { x: b, y: 0, z: maxZ },
+          { x: b, y: BUNKER_WALL_HEIGHT, z: maxZ },
+          { x: a, y: BUNKER_WALL_HEIGHT, z: maxZ },
+        ], fill, stroke, tex);
+      } else if (side === 'east') {
+        pushPolygon(polys, [
+          { x: maxX, y: 0, z: a },
+          { x: maxX, y: 0, z: b },
+          { x: maxX, y: BUNKER_WALL_HEIGHT, z: b },
+          { x: maxX, y: BUNKER_WALL_HEIGHT, z: a },
+        ], fill, stroke, tex);
+      } else {
+        pushPolygon(polys, [
+          { x: minX, y: 0, z: a },
+          { x: minX, y: 0, z: b },
+          { x: minX, y: BUNKER_WALL_HEIGHT, z: b },
+          { x: minX, y: BUNKER_WALL_HEIGHT, z: a },
+        ], fill, stroke, tex);
+      }
     }
   }
 
   function addWallSide(side) {
-    const openings = getWindowOpeningsForSide(side);
-    const rangeMin = side === 'north' || side === 'south' ? minX : minZ;
-    const rangeMax = side === 'north' || side === 'south' ? maxX : maxZ;
-    let cursor = rangeMin;
-    for (const opening of openings) {
-      pushWallRect(side, cursor, opening.min, 0, BUNKER_WALL_HEIGHT, wallColor);
-      pushWallRect(side, opening.min, opening.max, 0, opening.bottom, wallShade);
-      pushWallRect(side, opening.min, opening.max, opening.top, BUNKER_WALL_HEIGHT, wallShade);
-      cursor = opening.max;
-    }
-    pushWallRect(side, cursor, rangeMax, 0, BUNKER_WALL_HEIGHT, wallColor);
+    const tiles = bunkerWallTiles[side] ?? [];
+    for (const tile of tiles) pushWallTile(side, tile);
   }
 
   addWallSide('north');
@@ -2202,8 +2412,7 @@ function draw() {
   drawHorizonForest();
   drawGround();
   drawFogWisps();
-  drawZombies();
-  drawTrees();
+  drawCharactersDepthSorted();
   drawParticles();
   drawBunkerInterior();
   if (!gameOver) drawRifle(1 / 60);
@@ -2226,9 +2435,13 @@ function tick(dt) {
     if (spawnTimer >= SPAWN_DELAY) spawnZombie();
     updateZombies(dt);
   }
+  const activeSlot = getCurrentBunkerSlot();
+  const peek = getPeekOffsetForSlot(activeSlot);
+  const targetCameraX = desiredCameraX + peek.x;
+  const targetCameraZ = desiredCameraZ + peek.z;
   const moveT = 1 - Math.exp(-BUNKER_MOVE_LERP * dt);
-  cameraX += (desiredCameraX - cameraX) * moveT;
-  cameraZ += (desiredCameraZ - cameraZ) * moveT;
+  cameraX += (targetCameraX - cameraX) * moveT;
+  cameraZ += (targetCameraZ - cameraZ) * moveT;
   const chaseT = 1 - Math.exp(-CHASE_LERP * dt);
   cameraYaw += normalizeAngle(desiredYaw - cameraYaw) * chaseT;
   cameraPitch += (desiredPitch - cameraPitch) * chaseT;
