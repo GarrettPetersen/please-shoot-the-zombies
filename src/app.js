@@ -59,8 +59,10 @@ const BUNKER_CRATE_SIDE = 'south';
 const BUNKER_EMPTY_WALL_SIDE = 'west';
 const BUNKER_WALL_HEIGHT = 2.85;
 const BUNKER_WALL_TILE_SCALE = 1.6; // scales wall sprite aspect into world-space tile width
-const BUNKER_WALL_TEXTURE_SLICES = 24;
-const BUNKER_WALL_ALPHA_PASS_THRESHOLD = 8;
+  const BUNKER_WALL_TEXTURE_SLICES = 24;
+  const BUNKER_WALL_ALPHA_PASS_THRESHOLD = 8;
+  const BUNKER_INTER_STATION_WALL_TILES = 1; // non-walkable spacer walls between walkable stations
+const BUNKER_CORNER_WALL_TILES = 1; // extra wall tiles at each corner so windows sit away from corners
 const BUNKER_PEEK_MAX_YAW = 1.42;             // very wide peek (~81°)
 const BUNKER_PEEK_WINDOW_MARGIN = 0.12;       // keep center ray away from window edges/frame
 const BUNKER_PEEK_FORWARD_PUSH_MAX = 0.35;    // slight forward push while peeking hard
@@ -72,11 +74,24 @@ const BUNKER_WINDOW_TOP = 2.15;
 const BUNKER_CRATE_WIDTH = 1.9;
 const BUNKER_CRATE_HEIGHT = 1.15;
 const BUNKER_CRATE_DEPTH = 0.95;
+const BOARDS_PER_WINDOW = 3;
+const BOARD_PLACE_DURATION = 2.5;
+const BOARD_ATTACK_DURATION = 2;
+const BOARD_BREACH_DELAY = 2;
+const BOARD_AT_WINDOW_DIST = 0.8;
+const BOARD_TILT_MAX = 0.12;          // max tilt in rad (~7°) so boards stay horizontal
+const BOARD_WINDOW_Y_LOW = 1.0;       // hip height and up (no boards below hip)
+const BOARD_WINDOW_Y_MID = 1.45;
+const BOARD_WINDOW_Y_HIGH = 1.9;
+const BOARD_FALL_DURATION = 1.5;      // seconds for board to fall when broken
 let bunker = null;
 let bunkerSlots = [];
 let bunkerWallTiles = { north: [], east: [], south: [], west: [] };
 let bunkerTileWorldWidth = BUNKER_SLOT_SPACING;
 let activeSlotIndex = 0;
+let windowBoards = {};  // slotKey -> number of boards on window (0–3); floor has remainder
+let boardPlaceState = null;  // { slotKey, startTime, endTime } while placing
+let fallingBoards = [];    // { slotKey, startTime, endTime, fromPos, toPos, rot, flip }
 
 // Trees: 4x4 grid of 256x256 sprites in RetroTree.png; bottom-left two cells (0,3),(1,3) empty → 14 variants
 const TREE_SPRITE_SIZE = 256;
@@ -359,21 +374,33 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
     ? assets.bunkerWall.naturalWidth / assets.bunkerWall.naturalHeight
     : 1;
   bunkerTileWorldWidth = BUNKER_WALL_HEIGHT * wallAspect * BUNKER_WALL_TILE_SCALE;
-  const tilesX = Math.max(layout.north, layout.south, 1);
-  const tilesZ = Math.max(layout.east, layout.west, 1);
+  const baseTilesX = Math.max(layout.north, layout.south, 1);
+  const baseTilesZ = Math.max(layout.east, layout.west, 1);
+  const gap = Math.max(0, BUNKER_INTER_STATION_WALL_TILES);
+  const corner = Math.max(0, BUNKER_CORNER_WALL_TILES);
+  const tilesX = 2 * corner + baseTilesX + Math.max(0, baseTilesX - 1) * gap;
+  const tilesZ = 2 * corner + baseTilesZ + Math.max(0, baseTilesZ - 1) * gap;
   const halfW = (tilesX * bunkerTileWorldWidth) / 2;
   const halfD = (tilesZ * bunkerTileWorldWidth) / 2;
   const sideCounts = { north: tilesX, east: tilesZ, south: tilesX, west: tilesZ };
   bunkerWallTiles = { north: [], east: [], south: [], west: [] };
 
   function spriteKeyForTile(side, i, count) {
-    const center = Math.floor((count - 1) / 2);
+    if (i < corner || i >= count - corner) return 'wall';
+    const step = gap + 1;
+    const innerIndex = i - corner;
+    if (step > 1 && (innerIndex % step) !== 0) return 'wall';
+    const compactIndex = Math.floor(innerIndex / step);
+    const compactCount = baseTilesX; // north/south
+    const compactCountZ = baseTilesZ; // east/west
+    const baseCount = (side === 'north' || side === 'south') ? compactCount : compactCountZ;
+    const center = Math.floor((baseCount - 1) / 2);
     if (side === BUNKER_EMPTY_WALL_SIDE) return 'wall';
-    if (side === BUNKER_CRATE_SIDE && i === center) return 'door';
-    if (side === 'east' && i === center) return 'hole';
-    if (count <= 1) return 'window';
-    if (count === 2) return i === 0 ? 'window' : 'wall';
-    return i % 2 === 0 ? 'window' : 'wall';
+    if (side === BUNKER_CRATE_SIDE && compactIndex === center) return 'door';
+    if (side === 'east' && compactIndex === center) return 'hole';
+    if (baseCount <= 1) return 'window';
+    if (baseCount === 2) return compactIndex === 0 ? 'window' : 'wall';
+    return compactIndex % 2 === 0 ? 'window' : 'wall';
   }
 
   for (const side of ['north', 'east', 'south', 'west']) {
@@ -439,6 +466,49 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
   bunkerSlots = slots;
   activeSlotIndex = Math.max(0, bunkerSlots.findIndex((slot) => slot.type === 'window'));
   setActiveBunkerSlot(activeSlotIndex, true);
+  initWindowBoards();
+}
+
+function getBoardFloorPositions(slot) {
+  if (!slot || slot.type !== 'window' || !bunker) return [];
+  const key = getSlotKey(slot);
+  const seed = (key.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 0)) >>> 0;
+  const rng = seeded(seed);
+  const wallCoord = getSideWallCoord(slot.side);
+  const positions = [];
+  for (let i = 0; i < BOARDS_PER_WINDOW; i++) {
+    const jitter = (rng() - 0.5) * 0.08;
+    const x = slot.side === 'north' || slot.side === 'south' ? slot.x + jitter : wallCoord;
+    const z = slot.side === 'north' || slot.side === 'south' ? wallCoord : slot.z + jitter;
+    const rot = (rng() - 0.5) * 2 * BOARD_TILT_MAX;
+    positions.push({ x, y: 0, z, rot, flip: rng() < 0.5 });
+  }
+  return positions;
+}
+
+function getBoardWindowPositions(slot) {
+  if (!slot || slot.type !== 'window') return [];
+  const key = getSlotKey(slot);
+  const seed = (key.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 0)) >>> 0;
+  const rng = seeded(seed);
+  const wallCoord = getSideWallCoord(slot.side);
+  const positions = [
+    { y: BOARD_WINDOW_Y_LOW },
+    { y: BOARD_WINDOW_Y_MID },
+    { y: BOARD_WINDOW_Y_HIGH },
+  ];
+  return positions.map((p) => {
+    const rot = (rng() - 0.5) * 2 * BOARD_TILT_MAX;
+    const flip = rng() < 0.5;
+    return {
+      x: slot.side === 'north' || slot.side === 'south' ? slot.x : wallCoord,
+      y: p.y,
+      z: slot.side === 'north' || slot.side === 'south' ? wallCoord : slot.z,
+      side: slot.side,
+      rot,
+      flip,
+    };
+  });
 }
 
 function getCurrentBunkerSlot() {
@@ -554,6 +624,47 @@ function chooseZombieTargetSlot(x, z) {
     }
   }
   return best;
+}
+
+function getSlotKey(slot) {
+  if (!slot) return '';
+  return `${slot.side}-${slot.tileIndex ?? slot.sideIndex ?? 0}`;
+}
+
+function isReticuleOnBoardStack(px, py) {
+  const slot = getCurrentBunkerSlot();
+  if (!slot || slot.type !== 'window') return false;
+  const key = getSlotKey(slot);
+  const onFloor = BOARDS_PER_WINDOW - (windowBoards[key] ?? 0);
+  if (onFloor <= 0) return false;
+  // Minimum look-down so boards at wall foot are visible; wood in frame
+  if (cameraPitch < 0.06) return false;
+  const floorPoses = getBoardFloorPositions(slot);
+  if (floorPoses.length === 0) return false;
+  const first = floorPoses[0];
+  const proj = project(first.x, 0.02, first.z);
+  if (!proj) return false;
+  const dist = Math.sqrt((px - proj.sx) ** 2 + (py - proj.sy) ** 2);
+  const radius = 95;
+  if (dist > radius) return false;
+  // Wood in frame: pile should be in lower part of view
+  if (proj.sy < H / 2 - 60) return false;
+  return true;
+}
+
+function seeded(seed) {
+  return () => {
+    seed = (seed * 1103515245 + 12345) >>> 0;
+    return seed / 0x100000000;
+  };
+}
+
+function initWindowBoards() {
+  windowBoards = {};
+  for (const slot of bunkerSlots) {
+    if (slot.type !== 'window') continue;
+    windowBoards[getSlotKey(slot)] = 0;
+  }
 }
 
 function worldToView(wx, wy, wz) {
@@ -851,6 +962,11 @@ async function loadAssets() {
   assets.bunkerWallWindowData = imageDataFromImage(assets.bunkerWallWindow);
   assets.bunkerWallHoleData = imageDataFromImage(assets.bunkerWallHole);
   assets.bunkerWallDoorData = imageDataFromImage(assets.bunkerWallDoor);
+  assets.board = await loadImage(`${base}/bunker/board.png`);
+  assets.hammerSound = new Audio('assets/sfx/clean/hammer_nails.ogg');
+  assets.hammerSound.preload = 'auto';
+  assets.boardBreakSound = new Audio('assets/sfx/clean/board_breaking.ogg');
+  assets.boardBreakSound.preload = 'auto';
   generateBunkerLayout();
   const horizonPath = `${base}/${HORIZON_BACKGROUND_PATH}`;
   assets.horizonBackground = await loadImage(horizonPath);
@@ -1024,6 +1140,7 @@ function spawnZombie() {
     walkPhase: Math.random() * Math.PI * 2,
     walkDir: Math.random() < 0.5 ? 1 : -1,
     distanceWalked: 0,
+    targetSlot,
     targetSide: targetSlot?.side ?? null,
     targetWindowX: target.x,
     targetWindowZ: target.z,
@@ -1062,20 +1179,65 @@ function updateZombies(dt) {
     const dx = targetX - z.x;
     const dz = targetZ - z.z;
     const d = Math.sqrt(dx * dx + dz * dz) || 0.001;
-    if (d < ZOMBIE_BREACH_DIST) {
-      gameOverZombie = z;
-      gameOver = true;
-      gameOverFlashStart = performance.now() / 1000;
-      const paths = z.useFemaleSounds ? assets.zombieFemaleSoundPaths : assets.zombieSoundPaths;
-      const numPaths = paths?.length ?? 0;
-      if (numPaths > 0) {
-        const url = paths[z.spawnIndex % numPaths];
-        const audio = new Audio(url);
-        audio.volume = 1;
-        audio.play().catch(() => {});
+    const slotKey = z.targetSlot ? getSlotKey(z.targetSlot) : '';
+    const boardsAtWindow = slotKey ? (windowBoards[slotKey] ?? 0) : 0;
+
+    if (d < BOARD_AT_WINDOW_DIST) {
+      if (boardsAtWindow > 0) {
+        z.breachStartTime = null;
+        if (z.attackBoardEndTime == null) {
+          z.attackBoardEndTime = gameTime + BOARD_ATTACK_DURATION;
+        } else if (gameTime >= z.attackBoardEndTime) {
+          const newCount = Math.max(0, boardsAtWindow - 1);
+          windowBoards[slotKey] = newCount;
+          playBoardBreakSound();
+          z.attackBoardEndTime = null;
+          const slot = z.targetSlot;
+          if (slot) {
+            const windowPoses = getBoardWindowPositions(slot);
+            const floorPoses = getBoardFloorPositions(slot);
+            const fromPos = windowPoses[boardsAtWindow - 1];
+            const toIdx = 3 - boardsAtWindow;
+            if (fromPos && floorPoses[toIdx]) {
+              const bounds = getWindowScreenBounds(slot);
+              const boardIdx = boardsAtWindow - 1;
+              const frac = BOARD_WINDOW_FRACTIONS[boardIdx];
+              const fromSx = bounds ? bounds.sx : null;
+              const fromSy = bounds ? bounds.syTop + (bounds.syBottom - bounds.syTop) * frac : null;
+              const fromDepth = bounds ? bounds.depth : null;
+              fallingBoards.push({
+                slotKey,
+                startTime: gameTime,
+                endTime: gameTime + BOARD_FALL_DURATION,
+                fromPos: { x: fromPos.x, y: fromPos.y, z: fromPos.z, rot: fromPos.rot, flip: fromPos.flip },
+                toPos: { x: floorPoses[toIdx].x, y: floorPoses[toIdx].y, z: floorPoses[toIdx].z, rot: floorPoses[toIdx].rot, flip: floorPoses[toIdx].flip },
+                rot: fromPos.rot,
+                flip: fromPos.flip,
+                fromSx, fromSy, fromDepth,
+              });
+            }
+          }
+        }
+      } else {
+        if (z.breachStartTime == null) z.breachStartTime = gameTime;
+        if (gameTime - z.breachStartTime >= BOARD_BREACH_DELAY) {
+          gameOverZombie = z;
+          gameOver = true;
+          gameOverFlashStart = performance.now() / 1000;
+          const paths = z.useFemaleSounds ? assets.zombieFemaleSoundPaths : assets.zombieSoundPaths;
+          const numPaths = paths?.length ?? 0;
+          if (numPaths > 0) {
+            const url = paths[z.spawnIndex % numPaths];
+            const audio = new Audio(url);
+            audio.volume = 1;
+            audio.play().catch(() => {});
+          }
+          return;
+        }
       }
-      return;
+      continue;
     }
+
     const ux = dx / d;
     const uz = dz / d;
     const perpX = -uz;
@@ -2035,6 +2197,250 @@ function drawCharactersDepthSorted() {
   }
 }
 
+const BOARD_SPRITE_WORLD_SIZE = 0.95;
+const BOARD_WINDOW_FRACTIONS = [0.2, 0.35, 0.58];  // from top: top board, middle above rifle, bottom inside window
+
+function getWindowScreenBounds(slot) {
+  if (!slot || slot.type !== 'window' || !bunker) return null;
+  const wallCoord = getSideWallCoord(slot.side);
+  const wx = slot.side === 'north' || slot.side === 'south' ? slot.x : wallCoord;
+  const wz = slot.side === 'north' || slot.side === 'south' ? wallCoord : slot.z;
+  const top = project(wx, BUNKER_WALL_HEIGHT, wz);
+  const bottom = project(wx, 0, wz);
+  const mid = project(wx, BOARD_WINDOW_Y_MID, wz);
+  if (!top || !bottom || !mid || mid.depth <= NEAR) return null;
+  return {
+    sx: mid.sx,
+    syTop: top.sy,
+    syBottom: bottom.sy,
+    depth: mid.depth,
+  };
+}
+
+function drawBoardAt(img, iw, ih, worldX, worldY, worldZ, rot, flip) {
+  const proj = project(worldX, worldY, worldZ);
+  if (!proj || proj.depth <= NEAR) return null;
+  const scale = (BOARD_SPRITE_WORLD_SIZE * H) / (Math.tan(getFOV() / 2) * proj.depth * 2);
+  const w = scale * (iw / Math.max(ih, 1));
+  const h = scale;
+  return { depth: proj.depth, sx: proj.sx, sy: proj.sy, w, h, rot, flip };
+}
+
+function getWallRightUp(side) {
+  const right = { x: 0, y: 0, z: 0 };
+  const up = { x: 0, y: 1, z: 0 };
+  if (side === 'north') right.x = 1;
+  else if (side === 'south') right.x = -1;
+  else if (side === 'east') right.z = -1;
+  else if (side === 'west') right.z = 1;
+  return { right, up };
+}
+
+function getBoardQuadOnWall(slot, boardIndex, windowPoses, iw, ih) {
+  if (!slot || !bunker || boardIndex >= (windowPoses?.length ?? 0)) return null;
+  const wallCoord = getSideWallCoord(slot.side);
+  const frac = BOARD_WINDOW_FRACTIONS[boardIndex];
+  const boardY = BUNKER_WALL_HEIGHT * (1 - frac);
+  const cx = slot.side === 'north' || slot.side === 'south' ? slot.x : wallCoord;
+  const cz = slot.side === 'north' || slot.side === 'south' ? wallCoord : slot.z;
+  const { right, up } = getWallRightUp(slot.side);
+  const halfH = BOARD_SPRITE_WORLD_SIZE / 2;
+  const halfW = (BOARD_SPRITE_WORLD_SIZE * (iw / Math.max(ih, 1))) / 2;
+  const p = windowPoses[boardIndex];
+  const rot = p.rot;
+  const cr = Math.cos(rot);
+  const sr = Math.sin(rot);
+  const uvs = [[-halfW, -halfH], [halfW, -halfH], [halfW, halfH], [-halfW, halfH]];
+  const corners = [];
+  let depthSum = 0;
+  for (const [u, v] of uvs) {
+    const u2 = u * cr - v * sr;
+    const v2 = u * sr + v * cr;
+    const wx = cx + right.x * u2 + up.x * v2;
+    const wy = boardY + right.y * u2 + up.y * v2;
+    const wz = cz + right.z * u2 + up.z * v2;
+    const proj = project(wx, wy, wz);
+    if (!proj || proj.depth <= NEAR) return null;
+    corners.push({ sx: proj.sx, sy: proj.sy, depth: proj.depth });
+    depthSum += proj.depth;
+  }
+  return { corners, depth: depthSum / 4, flip: p.flip };
+}
+
+function drawBoardAtScreen(img, iw, ih, sx, sy, depth, rot, flip) {
+  if (depth <= NEAR) return null;
+  const scale = (BOARD_SPRITE_WORLD_SIZE * H) / (Math.tan(getFOV() / 2) * depth * 2);
+  const w = scale * (iw / Math.max(ih, 1));
+  const h = scale;
+  return { depth, sx, sy, w, h, rot, flip };
+}
+
+function setUvTriangleTransform(uv0, uv1, uv2, p0, p1, p2) {
+  const du1 = uv1.u - uv0.u;
+  const dv1 = uv1.v - uv0.v;
+  const du2 = uv2.u - uv0.u;
+  const dv2 = uv2.v - uv0.v;
+  const det = du1 * dv2 - dv1 * du2;
+  if (Math.abs(det) < 1e-8) return false;
+  const inv = 1 / det;
+  const m00 = dv2 * inv;
+  const m01 = -du2 * inv;
+  const m10 = -dv1 * inv;
+  const m11 = du1 * inv;
+  const dx1 = p1.sx - p0.sx;
+  const dy1 = p1.sy - p0.sy;
+  const dx2 = p2.sx - p0.sx;
+  const dy2 = p2.sy - p0.sy;
+  const a = dx1 * m00 + dx2 * m10;
+  const c = dx1 * m01 + dx2 * m11;
+  const b = dy1 * m00 + dy2 * m10;
+  const d = dy1 * m01 + dy2 * m11;
+  const e = p0.sx - a * uv0.u - c * uv0.v;
+  const f = p0.sy - b * uv0.u - d * uv0.v;
+  ctx.setTransform(a, b, c, d, e, f);
+  return true;
+}
+
+function drawBoardQuadPerspective(img, iw, ih, corners, flip) {
+  // corners: [bottom-left, bottom-right, top-right, top-left]
+  const bl = corners[0], br = corners[1], tr = corners[2], tl = corners[3];
+  const u0 = flip ? iw : 0;
+  const u1 = flip ? 0 : iw;
+
+  // Triangle 1: BL-BR-TR
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(bl.sx, bl.sy);
+  ctx.lineTo(br.sx, br.sy);
+  ctx.lineTo(tr.sx, tr.sy);
+  ctx.closePath();
+  ctx.clip();
+  if (setUvTriangleTransform(
+    { u: u0, v: ih }, { u: u1, v: ih }, { u: u1, v: 0 },
+    bl, br, tr,
+  )) {
+    ctx.drawImage(img, 0, 0, iw, ih, 0, 0, iw, ih);
+  }
+  ctx.restore();
+
+  // Triangle 2: BL-TR-TL
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(bl.sx, bl.sy);
+  ctx.lineTo(tr.sx, tr.sy);
+  ctx.lineTo(tl.sx, tl.sy);
+  ctx.closePath();
+  ctx.clip();
+  if (setUvTriangleTransform(
+    { u: u0, v: ih }, { u: u1, v: 0 }, { u: u0, v: 0 },
+    bl, tr, tl,
+  )) {
+    ctx.drawImage(img, 0, 0, iw, ih, 0, 0, iw, ih);
+  }
+  ctx.restore();
+}
+
+function drawBoards() {
+  if (!bunker || !assets.board?.naturalWidth) return;
+  const img = assets.board;
+  const iw = img.naturalWidth;
+  const ih = img.naturalHeight;
+  const items = [];
+  const placingKey = boardPlaceState?.slotKey ?? null;
+
+  for (const slot of bunkerSlots) {
+    if (slot.type !== 'window') continue;
+    const key = getSlotKey(slot);
+    const onWindow = windowBoards[key] ?? 0;
+    const onFloor = BOARDS_PER_WINDOW - onWindow;
+    const floorPoses = getBoardFloorPositions(slot);
+    const windowPoses = getBoardWindowPositions(slot);
+    const isPlacingHere = placingKey === key;
+
+    let floorCount = onFloor;
+    if (isPlacingHere) floorCount = Math.max(0, onFloor - 1);
+    for (let i = 0; i < floorCount && i < floorPoses.length; i++) {
+      const p = floorPoses[i];
+      const it = drawBoardAt(img, iw, ih, p.x, p.y + 0.04, p.z, p.rot, p.flip);
+      if (it) items.push(it);
+    }
+
+    const bounds = getWindowScreenBounds(slot);
+
+    if (isPlacingHere && boardPlaceState && onFloor > 0 && onWindow < windowPoses.length && bounds) {
+      const startTime = boardPlaceState.startTime;
+      const endTime = boardPlaceState.endTime;
+      const t = Math.min(1, Math.max(0, (gameTime - startTime) / (endTime - startTime)));
+      const from = floorPoses[onFloor - 1];
+      const fromProj = project(from.x, from.y + 0.04, from.z);
+      const frac = BOARD_WINDOW_FRACTIONS[onWindow];
+      const toSy = bounds.syTop + (bounds.syBottom - bounds.syTop) * frac;
+      const toSx = bounds.sx;
+      const toDepth = bounds.depth;
+      const sx = fromProj ? fromProj.sx + (toSx - fromProj.sx) * t : toSx;
+      const sy = fromProj ? fromProj.sy + (toSy - fromProj.sy) * t : toSy;
+      const depth = fromProj ? fromProj.depth + (toDepth - fromProj.depth) * t : toDepth;
+      const rot = from.rot + (windowPoses[onWindow].rot - from.rot) * t;
+      const it = drawBoardAtScreen(img, iw, ih, sx, sy, depth, rot, windowPoses[onWindow].flip);
+      if (it) items.push(it);
+    }
+
+    if (bounds) {
+      for (let i = 0; i < onWindow && i < windowPoses.length; i++) {
+        const quad = getBoardQuadOnWall(slot, i, windowPoses, iw, ih);
+        if (quad) {
+          items.push({ type: 'quad', depth: quad.depth, corners: quad.corners, flip: quad.flip });
+        } else {
+          const frac = BOARD_WINDOW_FRACTIONS[i];
+          const sy = bounds.syTop + (bounds.syBottom - bounds.syTop) * frac;
+          const p = windowPoses[i];
+          const it = drawBoardAtScreen(img, iw, ih, bounds.sx, sy, bounds.depth, p.rot, p.flip);
+          if (it) items.push(it);
+        }
+      }
+    } else {
+      for (let i = 0; i < onWindow && i < windowPoses.length; i++) {
+        const p = windowPoses[i];
+        const it = drawBoardAt(img, iw, ih, p.x, p.y, p.z, p.rot, p.flip);
+        if (it) items.push(it);
+      }
+    }
+  }
+
+  for (const fb of fallingBoards) {
+    const t = Math.min(1, Math.max(0, (gameTime - fb.startTime) / (fb.endTime - fb.startTime)));
+    const toProj = project(fb.toPos.x, fb.toPos.y + 0.04, fb.toPos.z);
+    const rot = fb.fromPos.rot + (fb.toPos.rot - fb.fromPos.rot) * t;
+    let it;
+    if (fb.fromSx != null && fb.fromSy != null && fb.fromDepth != null && toProj) {
+      const sx = fb.fromSx + (toProj.sx - fb.fromSx) * t;
+      const sy = fb.fromSy + (toProj.sy - fb.fromSy) * t;
+      const depth = fb.fromDepth + (toProj.depth - fb.fromDepth) * t;
+      it = drawBoardAtScreen(img, iw, ih, sx, sy, depth, rot, fb.flip);
+    } else if (toProj) {
+      const x = fb.fromPos.x + (fb.toPos.x - fb.fromPos.x) * t;
+      const y = fb.fromPos.y + (fb.toPos.y - fb.fromPos.y) * t;
+      const z = fb.fromPos.z + (fb.toPos.z - fb.fromPos.z) * t;
+      it = drawBoardAt(img, iw, ih, x, y, z, rot, fb.flip);
+    }
+    if (it) items.push(it);
+  }
+
+  items.sort((a, b) => b.depth - a.depth);
+  for (const it of items) {
+    if (it.type === 'quad') {
+      drawBoardQuadPerspective(img, iw, ih, it.corners, it.flip);
+    } else {
+      ctx.save();
+      ctx.translate(it.sx, it.sy);
+      ctx.rotate(it.rot);
+      if (it.flip) ctx.scale(-1, 1);
+      ctx.drawImage(img, 0, 0, iw, ih, -it.w / 2, -it.h / 2, it.w, it.h);
+      ctx.restore();
+    }
+  }
+}
+
 function drawBunkerInterior() {
   if (!bunker) return;
 
@@ -2342,6 +2748,7 @@ function drawReticule() {
   const cy = Math.round(H / 2 + ro.y);
   const slot = getCurrentBunkerSlot();
   const pointingAtCrate = slot?.type === 'crate' && isReticuleOnCrate(cx, cy);
+  const pointingAtBoardStack = !boardPlaceState && slot?.type === 'window' && isReticuleOnBoardStack(cx, cy);
 
   if (pointingAtCrate) {
     ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
@@ -2349,6 +2756,16 @@ function drawReticule() {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText('\u2340', cx, cy);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    return;
+  }
+  if (pointingAtBoardStack) {
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+    ctx.font = `32px ${FONT_FAMILY}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('\uD83D\uDD28', cx, cy);
     ctx.textAlign = 'left';
     ctx.textBaseline = 'alphabetic';
     return;
@@ -2415,7 +2832,8 @@ function draw() {
   drawCharactersDepthSorted();
   drawParticles();
   drawBunkerInterior();
-  if (!gameOver) drawRifle(1 / 60);
+  drawBoards();
+  if (!gameOver && !boardPlaceState) drawRifle(1 / 60);
   drawScore();
   drawPositionLabel();
   drawReticule();
@@ -2429,6 +2847,12 @@ function tick(dt) {
   hitFeedbackTime = Math.max(0, hitFeedbackTime - dt);
   outOfAmmoMessageTime = Math.max(0, outOfAmmoMessageTime - dt);
   ironSightsRecoilKick *= IRON_SIGHTS_RECOIL_DECAY;
+  if (boardPlaceState && gameTime >= boardPlaceState.endTime) {
+    const key = boardPlaceState.slotKey;
+    windowBoards[key] = Math.min(BOARDS_PER_WINDOW, (windowBoards[key] ?? 0) + 1);
+    boardPlaceState = null;
+  }
+  fallingBoards = fallingBoards.filter((fb) => gameTime < fb.endTime);
   updateParticles(dt);
   if (!gameOver) {
     spawnTimer += 1;
@@ -2453,8 +2877,25 @@ function tick(dt) {
 
 const PITCH_LIMIT = Math.PI / 2 - 0.1;
 
+function playHammerSound() {
+  if (assets.hammerSound) {
+    assets.hammerSound.currentTime = 0;
+    assets.hammerSound.volume = 0.8;
+    assets.hammerSound.play().catch(() => {});
+  }
+}
+
+function playBoardBreakSound() {
+  if (assets.boardBreakSound) {
+    assets.boardBreakSound.currentTime = 0;
+    assets.boardBreakSound.volume = 1;
+    assets.boardBreakSound.play().catch(() => {});
+  }
+}
+
 canvas.addEventListener('click', (e) => {
   if (gameOver) return;
+  if (boardPlaceState) return;
   if (!pointerLocked) {
     canvas.requestPointerLock();
     return;
@@ -2464,6 +2905,17 @@ canvas.addEventListener('click', (e) => {
   const py = H / 2 + ro.y;
   const slot = getCurrentBunkerSlot();
   const pointingAtCrate = slot?.type === 'crate' && isReticuleOnCrate(px, py);
+  const pointingAtBoardStack = slot?.type === 'window' && isReticuleOnBoardStack(px, py);
+
+  if (pointingAtBoardStack) {
+    const key = getSlotKey(slot);
+    const onFloor = BOARDS_PER_WINDOW - (windowBoards[key] ?? 0);
+    if (onFloor > 0) {
+      boardPlaceState = { slotKey: key, startTime: gameTime, endTime: gameTime + BOARD_PLACE_DURATION };
+      playHammerSound();
+    }
+    return;
+  }
 
   if (pointingAtCrate) {
     playPickUpSound();
@@ -2557,6 +3009,7 @@ canvas.addEventListener('mousemove', (e) => {
 
 document.addEventListener('keydown', (e) => {
   if (gameOver) return;
+  if (boardPlaceState) return;
   if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
     ironSightsHeld = true;
   } else if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
