@@ -33,15 +33,18 @@ const ASPECT = W / H;
 const NEAR = 0.1;
 const FAR = 500;
 
-// World colors
-const GROUND_COLOR = '#3d3d35';
-const SKY_COLOR = '#2a3548';
+// World colors (set from horizon background image at load; these are fallbacks if no image)
+let GROUND_COLOR = '#3d3d35';
+let SKY_COLOR = '#2a3548';
 const FOG_COLOR = '#3a4555';
 const FOG_RGB = { r: 0x3a, g: 0x45, b: 0x55 };
+
+// Horizon background: one source for tiled ring + derived sky/ground colors (swap path to change scene)
+const HORIZON_BACKGROUND_PATH = 'backgrounds/spooky_forest.png';
 const FOG_DENSITY = 0.028;
 const FOG_START = 4;  // no fog this close; fog ramps in beyond
-const FOG_WISP_COUNT = 5;       // number of wisp sprite variants
-const FOG_WISP_POSITIONS = 58;  // world positions (orbit at various distances)
+const FOG_WISP_COUNT = 5;        // number of wisp sprite variants
+const FOG_WISP_POSITIONS = 116;  // world positions (orbit at various distances); doubled for more wisps
 const FOG_WISP_SPRITE_SIZE = 96;
 const FOG_WISP_REF_DEPTH = 25;  // reference depth for screen size
 const FOG_WISP_BASE_ALPHA = 0.18;
@@ -68,7 +71,8 @@ let activeSlotIndex = 0;
 const TREE_SPRITE_SIZE = 256;
 const TREE_GRID_COLS = 4;
 const TREE_GRID_ROWS = 4;
-const TREE_HEIGHT = 25;           // world units (tall so at min dist they use full 256px and dwarf zombies)
+const TREE_HEIGHT = 16;           // world units; tuned to sit closer to zombie scale and perspective
+const TREE_BASE_SINK_RATIO = 0.06; // sprite bottoms have a little transparent padding; sink into ground slightly
 const TREE_MIN_DIST = 22;
 const TREE_MAX_DIST = 55;
 const TREE_COUNT = 32;
@@ -118,6 +122,7 @@ const ZOMBIE_BREACH_DIST = 0.45;  // bunker lost if zombie reaches its assigned 
 const ZOMBIE_DIR_CHANGE_DIST = 2.5;   // world units walked before maybe changing direction
 const ZOMBIE_DIR_CHANGE_CHANCE = 0.35; // probability to flip direction when threshold reached
 const GAME_OVER_FLASH_DURATION = 0.6;
+const GAME_OVER_FACE_DURATION = 2;  // seconds of zombie face + red tint before showing "game over" text
 const ZOMBIE_SOUND_INTERVAL = 4;      // seconds between groans; deterministic from spawnIndex/spawnTime
 
 let assets = {};
@@ -133,6 +138,7 @@ let spawnTimer = 0;
 let pointerLocked = false;
 let gameOver = false;
 let gameOverFlashStart = 0;
+let gameOverZombie = null;  // zombie that breached (for face + sound)
 let hitFeedbackTime = 0;  // seconds to show hit reticule (CoD-style diagonal)
 let audioContext = null;  // Web Audio API context for positional sounds
 let gameTime = 0;        // seconds since start (for deterministic zombie sounds)
@@ -647,16 +653,25 @@ async function loadAssets() {
   assets.zombieFront = await loadImage(`${base}/front_facing_zombie.png`);
   assets.zombiePickelhaube = await loadImage(`${base}/pickelhaube_zombie.png`);
   assets.zombieFemaleGhoul = await loadImage(`${base}/female_ghoul_in_nightgown.png`);
-  assets.zombieSprites = [assets.zombie, assets.zombieFront, assets.zombiePickelhaube, assets.zombieFemaleGhoul].filter(Boolean);
+  assets.zombieGasMask = await loadImage(`${base}/gas_mask_zombie.png`);
+  assets.zombieSprites = [assets.zombie, assets.zombieFront, assets.zombiePickelhaube, assets.zombieFemaleGhoul, assets.zombieGasMask].filter(Boolean);
   assets.zombieHeadshotMask = await loadImage(`${base}/german_zombie_headshot_area.png`);
   assets.zombieFrontHeadshotMask = await loadImage(`${base}/front_facing_zombie_headshot_area.png`);
   assets.zombiePickelhaubeHeadshotMask = await loadImage(`${base}/pickelhaube_zombie_headshot_area.png`);
   assets.zombieFemaleGhoulHeadshotMask = await loadImage(`${base}/female_ghoul_in_nightgown_headshot_area.png`);
+  assets.zombieGasMaskHeadshotMask = await loadImage(`${base}/gas_mask_zombie_headshot_area.png`);
   assets.zombieHeadshotData = imageDataFromImage(assets.zombieHeadshotMask);
   assets.zombieFrontHeadshotData = imageDataFromImage(assets.zombieFrontHeadshotMask);
   assets.zombiePickelhaubeHeadshotData = imageDataFromImage(assets.zombiePickelhaubeHeadshotMask);
   assets.zombieFemaleGhoulHeadshotData = imageDataFromImage(assets.zombieFemaleGhoulHeadshotMask);
+  assets.zombieGasMaskHeadshotData = imageDataFromImage(assets.zombieGasMaskHeadshotMask);
   assets.retrotree = await loadImage(`${base}/RetroTree.png`);
+  const horizonPath = `${base}/${HORIZON_BACKGROUND_PATH}`;
+  assets.horizonBackground = await loadImage(horizonPath);
+  if (assets.horizonBackground) {
+    applyHorizonBackgroundColors(assets.horizonBackground);
+    buildHorizonForestTexture();
+  }
   const ironBase = `${base}/lee-enfield_iron_sights`;
   assets.ironSightsFront = await loadImage(`${ironBase}/0_front.png`);
   assets.ironSightsRear = await loadImage(`${ironBase}/1_rear.png`);
@@ -862,8 +877,17 @@ function updateZombies(dt) {
     const dz = targetZ - z.z;
     const d = Math.sqrt(dx * dx + dz * dz) || 0.001;
     if (d < ZOMBIE_BREACH_DIST) {
+      gameOverZombie = z;
       gameOver = true;
       gameOverFlashStart = performance.now() / 1000;
+      const paths = z.useFemaleSounds ? assets.zombieFemaleSoundPaths : assets.zombieSoundPaths;
+      const numPaths = paths?.length ?? 0;
+      if (numPaths > 0) {
+        const url = paths[z.spawnIndex % numPaths];
+        const audio = new Audio(url);
+        audio.volume = 1;
+        audio.play().catch(() => {});
+      }
       return;
     }
     const ux = dx / d;
@@ -1078,7 +1102,8 @@ function isHeadShotFromMask(z, info, hitTx, hitTy) {
   const data = z.sprite === assets.zombieFront ? assets.zombieFrontHeadshotData
     : z.sprite === assets.zombiePickelhaube ? assets.zombiePickelhaubeHeadshotData
       : z.sprite === assets.zombieFemaleGhoul ? assets.zombieFemaleGhoulHeadshotData
-        : assets.zombieHeadshotData;
+        : z.sprite === assets.zombieGasMask ? assets.zombieGasMaskHeadshotData
+          : assets.zombieHeadshotData;
   if (!data) return false;
   const u = hitTx / spriteW;
   const v = hitTy / spriteH;
@@ -1345,34 +1370,212 @@ function getFogFactor(depth) {
   return 1 - Math.exp(-d * FOG_DENSITY);
 }
 
+// Horizon forest: preprocessed texture = forest + top row extended up with increasing gaussian blur into sky
+let horizonForestTexture = null;
+const HORIZON_FOREST_BLUR_ROWS = 80;
+const HORIZON_FOREST_BLUR_SIGMA_MIN = 1;
+const HORIZON_FOREST_BLUR_SIGMA_MAX = 40;
+
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return { r: (n >> 16) & 0xff, g: (n >> 8) & 0xff, b: n & 0xff };
+}
+
+function rgbToHex(r, g, b) {
+  return '#' + [r, g, b].map((c) => Math.max(0, Math.min(255, Math.round(c))).toString(16).padStart(2, '0')).join('');
+}
+
+/** Return the modal (most common) color in a row of pixel data as hex. Quantizes to 32 levels per channel for stability. */
+function modalColorFromRow(imageData) {
+  const data = imageData.data;
+  const count = new Map();
+  const shift = 3;
+  const mask = 31;
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] < 128) continue;
+    const key = (data[i] >> shift) << (2 * (8 - shift)) | (data[i + 1] >> shift) << (8 - shift) | (data[i + 2] >> shift);
+    count.set(key, (count.get(key) || 0) + 1);
+  }
+  let bestKey = 0;
+  let bestCount = 0;
+  for (const [key, n] of count) {
+    if (n > bestCount) {
+      bestCount = n;
+      bestKey = key;
+    }
+  }
+  const r = ((bestKey >> (2 * (8 - shift))) & mask) << shift;
+  const g = ((bestKey >> (8 - shift)) & mask) << shift;
+  const b = (bestKey & mask) << shift;
+  return rgbToHex(r, g, b);
+}
+
+/** Set SKY_COLOR from modal of top row and GROUND_COLOR from modal of bottom row of the horizon background image. */
+function applyHorizonBackgroundColors(img) {
+  if (!img?.naturalWidth) return;
+  const c = document.createElement('canvas');
+  c.width = img.naturalWidth;
+  c.height = img.naturalHeight;
+  const cx = c.getContext('2d');
+  cx.drawImage(img, 0, 0);
+  const topRow = cx.getImageData(0, 0, c.width, 1);
+  const bottomRow = cx.getImageData(0, c.height - 1, c.width, 1);
+  SKY_COLOR = modalColorFromRow(topRow);
+  GROUND_COLOR = modalColorFromRow(bottomRow);
+}
+
+function buildHorizonForestTexture() {
+  const img = assets.horizonBackground;
+  if (!img?.naturalWidth) return;
+  const iw = img.naturalWidth;
+  const ih = img.naturalHeight;
+  const totalH = ih + HORIZON_FOREST_BLUR_ROWS;
+  const c = document.createElement('canvas');
+  c.width = iw;
+  c.height = totalH;
+  const cx = c.getContext('2d');
+  cx.drawImage(img, 0, 0, iw, ih, 0, HORIZON_FOREST_BLUR_ROWS, iw, ih);
+  const topRow = cx.getImageData(0, HORIZON_FOREST_BLUR_ROWS, iw, 1);
+  const sky = hexToRgb(SKY_COLOR);
+  const kernelRadius = (sigma) => Math.min(iw, Math.ceil(sigma * 3));
+  const gauss = (x, sigma) => Math.exp(-(x * x) / (2 * sigma * sigma));
+  for (let r = 0; r < HORIZON_FOREST_BLUR_ROWS; r++) {
+    const t = r / HORIZON_FOREST_BLUR_ROWS;
+    const sigma = HORIZON_FOREST_BLUR_SIGMA_MIN + t * (HORIZON_FOREST_BLUR_SIGMA_MAX - HORIZON_FOREST_BLUR_SIGMA_MIN);
+    const rad = kernelRadius(sigma);
+    const rowData = cx.createImageData(iw, 1);
+    for (let x = 0; x < iw; x++) {
+      let ar = 0, ag = 0, ab = 0, aa = 0, wsum = 0;
+      for (let dx = -rad; dx <= rad; dx++) {
+        const sx = (x + dx + iw) % iw;
+        const w = gauss(dx / sigma, 1);
+        const i = sx * 4;
+        ar += topRow.data[i] * w;
+        ag += topRow.data[i + 1] * w;
+        ab += topRow.data[i + 2] * w;
+        aa += topRow.data[i + 3] * w;
+        wsum += w;
+      }
+      if (wsum > 0) {
+        ar /= wsum;
+        ag /= wsum;
+        ab /= wsum;
+        aa /= wsum;
+      }
+      const blend = t;
+      rowData.data[x * 4] = ar * (1 - blend) + sky.r * blend;
+      rowData.data[x * 4 + 1] = ag * (1 - blend) + sky.g * blend;
+      rowData.data[x * 4 + 2] = ab * (1 - blend) + sky.b * blend;
+      rowData.data[x * 4 + 3] = 255;
+    }
+    cx.putImageData(rowData, 0, HORIZON_FOREST_BLUR_ROWS - 1 - r);
+  }
+  horizonForestTexture = c;
+}
+
+function screenXToHorizonAngle(screenX, horizonY) {
+  const dir = getShotDirection(screenX, horizonY);
+  if (Math.abs(dir.y) < 1e-6) return 0;
+  const t = -CAMERA_Y / dir.y;
+  const wx = cameraX + t * dir.x;
+  const wz = cameraZ + t * dir.z;
+  return Math.atan2(wz - cameraZ, wx - cameraX);
+}
+
+const HORIZON_FOREST_STRIP_RATIO = 0.3;
+const HORIZON_FOREST_REPEAT_COUNT = 32;
+const HORIZON_FOREST_HORIZON_ROW = 275;
+const HORIZON_FOREST_GROUND_FADE_RATIO = 0.4;
+const HORIZON_FOREST_GROUND_ALPHA = 0.65;
+
+function getHorizonForestDrawState() {
+  if (!horizonForestTexture) return null;
+  const { forward } = getViewVectors();
+  const lenXZ = Math.sqrt(forward.x * forward.x + forward.z * forward.z);
+  if (lenXZ < 1e-6) return null;
+  const far = 10000;
+  const hx = cameraX + (forward.x / lenXZ) * far;
+  const hz = cameraZ + (forward.z / lenXZ) * far;
+  const horizonProj = project(hx, 0, hz);
+  const horizonY = horizonProj ? horizonProj.sy : H / 2;
+  const stripHeight = H * HORIZON_FOREST_STRIP_RATIO;
+  const centerAngle = Math.atan2(forward.z, forward.x);
+  const angle0Ray = screenXToHorizonAngle(0, horizonY);
+  const angle1Ray = screenXToHorizonAngle(W, horizonY);
+  let angleSpan = angle1Ray - angle0Ray;
+  while (angleSpan <= 0) angleSpan += Math.PI * 2;
+  while (angleSpan > Math.PI * 2) angleSpan -= Math.PI * 2;
+  if (angleSpan < 0.01) angleSpan = Math.PI * 2;
+  const angle0 = ((centerAngle - angleSpan / 2) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2);
+  const tw = horizonForestTexture.width;
+  const th = horizonForestTexture.height;
+  const patternWidth = tw * HORIZON_FOREST_REPEAT_COUNT;
+  const visibleTextureWidth = (angleSpan / (2 * Math.PI)) * patternWidth;
+  if (visibleTextureWidth < 1e-6) return null;
+  const scaleX = W / visibleTextureWidth;
+  const scaleY = stripHeight / th;
+  const offsetX = -scaleX * (angle0 / (2 * Math.PI)) * patternWidth;
+  const textureHorizonRow = HORIZON_FOREST_BLUR_ROWS + HORIZON_FOREST_HORIZON_ROW;
+  const stripTop = horizonY - textureHorizonRow * scaleY;
+  return {
+    horizonY,
+    stripHeight,
+    stripTop,
+    scaleX,
+    scaleY,
+    offsetX,
+  };
+}
+
+function drawHorizonForest() {
+  const state = getHorizonForestDrawState();
+  if (!state) return;
+  const pattern = ctx.createPattern(horizonForestTexture, 'repeat-x');
+  if (!pattern) return;
+  pattern.setTransform(new DOMMatrix([state.scaleX, 0, 0, state.scaleY, state.offsetX, 0]));
+  ctx.save();
+  ctx.translate(0, state.stripTop);
+  ctx.fillStyle = pattern;
+  ctx.fillRect(0, 0, W, state.stripHeight);
+  ctx.restore();
+}
+
 function drawSky() {
   ctx.fillStyle = SKY_COLOR;
   ctx.fillRect(0, 0, W, H);
 }
 
 function drawGround() {
-  // Horizon = where ground (y=0) meets sky. Project a point on the ground in our horizontal look direction.
-  const { forward } = getViewVectors();
-  const lenXZ = Math.sqrt(forward.x * forward.x + forward.z * forward.z);
-  if (lenXZ < 1e-6) {
-    ctx.fillStyle = GROUND_COLOR;
-    ctx.fillRect(0, 0, W, H);
-    return;
-  }
-  const far = 10000;
-  const hx = cameraX + (forward.x / lenXZ) * far;
-  const hz = cameraZ + (forward.z / lenXZ) * far;
-  const horizonProj = project(hx, 0, hz);
-  const horizonY = horizonProj ? horizonProj.sy : H / 2;
-  const floorHorizon = Math.floor(horizonY);
+  const state = getHorizonForestDrawState();
+  const floorHorizon = Math.floor(state ? state.horizonY : H / 2);
   const groundH = Math.max(0, H - floorHorizon);
   ctx.fillStyle = GROUND_COLOR;
   ctx.fillRect(0, floorHorizon, W, groundH);
-  const fog = ctx.createLinearGradient(0, floorHorizon, 0, H);
-  fog.addColorStop(0, FOG_COLOR + '80');
-  fog.addColorStop(1, FOG_COLOR + '00');
-  ctx.fillStyle = fog;
-  ctx.fillRect(0, floorHorizon, W, groundH);
+  if (!state || groundH <= 0) return;
+  const pattern = ctx.createPattern(horizonForestTexture, 'repeat-x');
+  if (!pattern) return;
+  pattern.setTransform(new DOMMatrix([state.scaleX, 0, 0, state.scaleY, state.offsetX, 0]));
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, floorHorizon, W, groundH);
+  ctx.clip();
+  ctx.globalAlpha = HORIZON_FOREST_GROUND_ALPHA;
+  ctx.translate(0, state.stripTop);
+  ctx.fillStyle = pattern;
+  ctx.fillRect(0, 0, W, H - state.stripTop);
+  ctx.restore();
+  const fadeEnd = Math.min(H, floorHorizon + groundH * HORIZON_FOREST_GROUND_FADE_RATIO);
+  if (fadeEnd > floorHorizon) {
+    const fade = ctx.createLinearGradient(0, floorHorizon, 0, fadeEnd);
+    fade.addColorStop(0, GROUND_COLOR + '00');
+    fade.addColorStop(1, GROUND_COLOR);
+    ctx.fillStyle = fade;
+    ctx.fillRect(0, floorHorizon, W, fadeEnd - floorHorizon);
+  }
+  if (fadeEnd < H) {
+    ctx.fillStyle = GROUND_COLOR;
+    ctx.fillRect(0, fadeEnd, W, H - fadeEnd);
+  }
 }
 
 function drawFogWisps() {
@@ -1404,18 +1607,21 @@ function drawTrees() {
   if (!assets.retrotree) return;
   const visible = trees
     .map((t) => {
-      const top = project(t.x, TREE_HEIGHT, t.z);
       const base = project(t.x, 0, t.z);
-      if (!top || !base || top.depth <= NEAR) return null;
-      const screenH = base.sy - top.sy;
+      const center = project(t.x, TREE_HEIGHT * 0.5, t.z);
+      if (!base || !center || center.depth <= NEAR) return null;
+      const pixelsPerUnit = (H / 2) / (Math.tan(getFOV() / 2) * center.depth);
+      const screenH = TREE_HEIGHT * pixelsPerUnit;
+      if (screenH <= 0) return null;
       const screenW = screenH;
+      const baseScreenY = base.sy + screenH * TREE_BASE_SINK_RATIO;
       return {
         ...t,
-        sx: top.sx - screenW / 2,
-        sy: top.sy,
+        sx: center.sx - screenW / 2,
+        sy: baseScreenY - screenH,
         sw: screenW,
         sh: screenH,
-        depth: top.depth,
+        depth: center.depth,
       };
     })
     .filter(Boolean);
@@ -1423,9 +1629,8 @@ function drawTrees() {
   const HOLE_EDGE_ALPHA_THRESHOLD_TREE = 10;
   for (const t of visible) {
     const { col, row } = getTreeGridCell(t.spriteIndex);
-    const fogF = getFogFactor(t.depth);
     ctx.save();
-    ctx.globalAlpha = 1 - fogF;
+    ctx.globalAlpha = 1;
     if (t.holes && t.holes.length > 0) {
       if (!treeHoleCanvas || treeHoleCanvas.width !== TREE_SPRITE_SIZE || treeHoleCanvas.height !== TREE_SPRITE_SIZE) {
         treeHoleCanvas = document.createElement('canvas');
@@ -1954,26 +2159,51 @@ function drawHint() {
 }
 
 function drawGameOver() {
-  const elapsed = performance.now() / 1000 - gameOverFlashStart;
-  const flash = Math.max(0, 1 - elapsed / GAME_OVER_FLASH_DURATION);
-  const alpha = 0.4 + 0.5 * flash;
-  ctx.fillStyle = `rgba(180, 0, 0, ${alpha})`;
-  ctx.fillRect(0, 0, W, H);
-  ctx.fillStyle = '#fff';
-  ctx.font = `${FONT_SIZE * 2}px ${FONT_FAMILY}`;
-  ctx.textAlign = 'center';
-  ctx.fillText('BUNKER OVERRUN', W / 2, H / 2 - 6);
-  ctx.font = `${Math.floor(FONT_SIZE * 0.65)}px ${FONT_FAMILY}`;
-  ctx.fillText('A zombie got through a window', W / 2, H / 2 + 18);
-  ctx.textAlign = 'left';
+  try {
+    const elapsed = performance.now() / 1000 - gameOverFlashStart;
+    const redAlpha = 0.5 + 0.35 * Math.max(0, 1 - elapsed / GAME_OVER_FLASH_DURATION);
+    ctx.fillStyle = `rgba(140, 0, 0, ${redAlpha})`;
+    ctx.fillRect(0, 0, W, H);
+
+    const showZombieFace = elapsed < GAME_OVER_FACE_DURATION && gameOverZombie?.sprite;
+    const img = showZombieFace ? gameOverZombie.sprite : null;
+    const imgReady = img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0;
+
+    if (showZombieFace && imgReady) {
+      const iw = img.naturalWidth;
+      const ih = img.naturalHeight;
+      const baseSize = Math.min(W, H) * 0.85;
+      const scale = (3 * baseSize) / Math.max(iw, ih, 1);
+      const drawW = iw * scale;
+      const drawH = ih * scale;
+      const x = (W - drawW) / 2;
+      const y = 0;
+      ctx.drawImage(img, 0, 0, iw, ih, x, y, drawW, drawH);
+    } else {
+      ctx.fillStyle = '#fff';
+      ctx.font = `${FONT_SIZE * 2}px ${FONT_FAMILY}`;
+      ctx.textAlign = 'center';
+      ctx.fillText('BUNKER OVERRUN', W / 2, H / 2 - 6);
+      ctx.font = `${Math.floor(FONT_SIZE * 0.65)}px ${FONT_FAMILY}`;
+      ctx.fillText('A zombie got through a window', W / 2, H / 2 + 18);
+      ctx.textAlign = 'left';
+    }
+  } catch (e) {
+    ctx.fillStyle = '#fff';
+    ctx.font = `${FONT_SIZE * 2}px ${FONT_FAMILY}`;
+    ctx.textAlign = 'center';
+    ctx.fillText('BUNKER OVERRUN', W / 2, H / 2);
+    ctx.textAlign = 'left';
+  }
 }
 
 function draw() {
   drawSky();
+  drawHorizonForest();
   drawGround();
   drawFogWisps();
-  drawTrees();
   drawZombies();
+  drawTrees();
   drawParticles();
   drawBunkerInterior();
   if (!gameOver) drawRifle(1 / 60);
