@@ -26,7 +26,8 @@ const LEE_ENFIELD_FRAME_W = 455;
 const LEE_ENFIELD_FRAME_H = 256;
 const BACKGROUND_PATH = path.join(ASSETS, 'backgrounds', 'spooky_forest.png');
 
-// Capsule definitions: [name, width, height, filename base]
+// Capsule definitions: [name, width, height, filename base, options?]
+// options: { noText } = artwork only (no title); { titleOnly } = logo/title only (e.g. library logo overlay)
 const CAPSULES = [
   ['header', 920, 430, 'header'],
   ['small', 462, 174, 'small'],
@@ -34,7 +35,14 @@ const CAPSULES = [
   ['vertical', 748, 896, 'vertical'],
   ['library_capsule', 600, 900, 'library_capsule'],
   ['library_header', 920, 430, 'library_header'],
-  ['library_hero', 3840, 1240, 'library_hero'],
+  ['library_hero', 3840, 1240, 'library_hero', { noText: true }], // Steam: artwork only (no logo)
+  ['page_background', 1438, 810, 'page_background', { noText: true }], // optional; subtle background
+  ['library_logo', 1280, 720, 'library_logo', { titleOnly: true }], // overlay on library hero
+];
+// Icons: generated after main capsule (center-crop square, scale). [filename base, size, ext]
+const ICONS = [
+  ['shortcut_icon', 256, 'png'],
+  ['app_icon', 184, 'jpg'],
 ];
 
 // Text: "Zombies" with 0 (skull) as the second letter
@@ -57,8 +65,9 @@ const TEXT_GAP_RATIO = 0.02; // gap between text right edge and character left
 
 /**
  * Draw background: spooky_forest.png scaled to canvas height, tiled horizontally if not wide enough.
+ * If dim is 0..1, fill with semi-transparent dark overlay to make it subtler (e.g. page background).
  */
-function drawBackground(ctx, w, h, bgImage) {
+function drawBackground(ctx, w, h, bgImage, dim = 0) {
   if (!bgImage) {
     ctx.fillStyle = '#1a0a2e';
     ctx.fillRect(0, 0, w, h);
@@ -72,6 +81,10 @@ function drawBackground(ctx, w, h, bgImage) {
   const drawH = h;
   for (let x = 0; x < w; x += drawW) {
     ctx.drawImage(bgImage, 0, 0, iw, ih, x, 0, drawW, drawH);
+  }
+  if (dim > 0) {
+    ctx.fillStyle = `rgba(0,0,0,${dim})`;
+    ctx.fillRect(0, 0, w, h);
   }
 }
 
@@ -150,21 +163,25 @@ function fontSizeForWidth(font, line, targetWidth, maxFontSize = MAX_FONT_SIZE) 
  * Draw title so it fits inside the title box. White text.
  * Wide capsule: most of height, equidistant from top-left and bottom-left (vertically centered on left).
  * Tall capsule: most of width, equidistant from top-left and top-right (horizontally centered at top).
+ * If centerBox is true (e.g. library logo), use a centered box over most of the canvas.
  */
-function drawTitle(ctx, w, h, font) {
+function drawTitle(ctx, w, h, font, centerBox = false) {
   if (!font) return;
   const margin = Math.min(w, h) * TITLE_MARGIN_RATIO;
   const isWide = w >= h;
 
   let boxLeft, boxTop, boxWidth, boxHeight;
-  if (isWide) {
-    // Text stays left of character block (zombies to the right)
+  if (centerBox) {
+    boxWidth = w * 0.9;
+    boxHeight = h * 0.7;
+    boxLeft = (w - boxWidth) / 2;
+    boxTop = (h - boxHeight) / 2;
+  } else if (isWide) {
     boxHeight = h * TITLE_USE_DIMENSION_RATIO;
     boxTop = (h - boxHeight) / 2;
     boxLeft = margin;
     boxWidth = Math.min(w * 0.48, w * ART_LEFT_RATIO - margin - w * TEXT_GAP_RATIO);
   } else {
-    // Text stays left of character block (zombies to the right)
     boxTop = margin;
     boxHeight = h * 0.38;
     boxLeft = margin;
@@ -174,7 +191,6 @@ function drawTitle(ctx, w, h, font) {
   const unitsPerEm = font.unitsPerEm || 1000;
   const ascender = font.ascender != null ? font.ascender : 800;
 
-  // Use a target width all three lines can achieve (cap by max font size so library hero stays consistent)
   const maxWidthAtCap = Math.min(...LINES.map((line) => font.getAdvanceWidth(line, MAX_FONT_SIZE)));
   const targetWidth = Math.min(boxWidth, maxWidthAtCap);
   let fontSizes = LINES.map((line) => fontSizeForWidth(font, line, targetWidth));
@@ -190,7 +206,6 @@ function drawTitle(ctx, w, h, font) {
     totalHeight = boxHeight;
   }
 
-  // Vertically center the block within the box
   let lineTop = boxTop + (boxHeight - totalHeight) / 2;
   const white = '#ffffff';
   ctx.fillStyle = white;
@@ -206,26 +221,32 @@ function drawTitle(ctx, w, h, font) {
   });
 }
 
-async function generateOne(name, width, height, filenameBase, femaleGhoul, gasMask, rifleImage, backgroundImage, font) {
+async function generateOne(name, width, height, filenameBase, femaleGhoul, gasMask, rifleImage, backgroundImage, font, options = {}) {
+  const { noText = false, titleOnly = false } = options;
   const canvas = createCanvas(width, height);
   const ctx = canvas.getContext('2d');
 
   ctx.imageSmoothingEnabled = false;
 
-  drawBackground(ctx, width, height, backgroundImage);
+  if (titleOnly) {
+    // Library logo: title only on transparent background (overlays on hero)
+    drawTitle(ctx, width, height, font, true);
+  } else {
+    const dim = name === 'page_background' ? 0.4 : 0;
+    drawBackground(ctx, width, height, backgroundImage, dim);
+    const margin = Math.min(width, height) * 0.05;
+    const maxArtW = (width - margin) - width * ART_LEFT_RATIO;
+    const maxArtH = height * ART_HEIGHT_RATIO;
+    const maxSw = Math.max(femaleGhoul?.width ?? 0, gasMask?.width ?? 0) || 1;
+    const maxSh = Math.max(femaleGhoul?.height ?? 0, gasMask?.height ?? 0) || 1;
+    let artScale = integerScale(maxSw, maxSh, maxArtW, maxArtH * 1.15);
+    if (name !== 'small') artScale *= 2;
 
-  const margin = Math.min(width, height) * 0.05;
-  const maxArtW = (width - margin) - width * ART_LEFT_RATIO;
-  const maxArtH = height * ART_HEIGHT_RATIO;
-  const maxSw = Math.max(femaleGhoul?.width ?? 0, gasMask?.width ?? 0) || 1;
-  const maxSh = Math.max(femaleGhoul?.height ?? 0, gasMask?.height ?? 0) || 1;
-  let artScale = integerScale(maxSw, maxSh, maxArtW, maxArtH * 1.15);
-  if (name !== 'small') artScale *= 2;
+    await drawCharacters(ctx, width, height, femaleGhoul, gasMask, artScale);
+    drawRifle(ctx, width, height, rifleImage, artScale);
 
-  await drawCharacters(ctx, width, height, femaleGhoul, gasMask, artScale);
-  drawRifle(ctx, width, height, rifleImage, artScale);
-
-  drawTitle(ctx, width, height, font);
+    if (!noText) drawTitle(ctx, width, height, font);
+  }
 
   const outPath = path.join(OUT_DIR, `${filenameBase}_english.png`);
   const buf = canvas.toBuffer('image/png');
@@ -274,8 +295,35 @@ async function main() {
 
   if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
 
-  for (const [name, w, h, base] of CAPSULES) {
-    await generateOne(name, w, h, base, femaleGhoul, gasMask, rifleImage, backgroundImage, font);
+  for (const row of CAPSULES) {
+    const [name, w, h, base] = row;
+    const options = row[4] || {};
+    await generateOne(name, w, h, base, femaleGhoul, gasMask, rifleImage, backgroundImage, font, options);
+  }
+
+  // Icons: center-crop from main capsule and scale
+  const mainPath = path.join(OUT_DIR, 'main_english.png');
+  if (fs.existsSync(mainPath)) {
+    const mainBuf = fs.readFileSync(mainPath);
+    const mainMeta = await sharp(mainBuf).metadata();
+    const iw = mainMeta.width || 1232;
+    const ih = mainMeta.height || 706;
+    const cropSize = Math.min(iw, ih);
+    const left = Math.floor((iw - cropSize) / 2);
+    const top = Math.floor((ih - cropSize) / 2);
+    for (const [base, size, ext] of ICONS) {
+      const outPath = path.join(OUT_DIR, `${base}_english.${ext}`);
+      let pipeline = sharp(mainBuf).extract({ left, top, width: cropSize, height: cropSize }).resize(size, size);
+      if (ext === 'jpg') {
+        pipeline = pipeline.jpeg({ quality: 92 });
+      } else {
+        pipeline = pipeline.png();
+      }
+      await pipeline.toFile(outPath);
+      console.log(`Wrote ${outPath}`);
+    }
+  } else {
+    console.warn('Skipping icons (main_english.png not found). Generate capsules first.');
   }
 
   console.log('Done.');

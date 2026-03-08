@@ -17,9 +17,43 @@ Design for the smallest size first (e.g. small capsule at 462×174, or the 120×
 
 ---
 
-## Dimensions and which capsule each size is for
+## Directory of asset formats (Steam)
 
-All dimensions are **width × height** in pixels. PNG is typical.
+Steam groups assets into three areas. All dimensions are **width × height** in pixels unless noted. Check the platform’s latest docs for required/optional and formats.
+
+### Store graphical assets (store page)
+
+| Dimensions (W×H) | Name            | Required | Notes |
+|------------------|-----------------|----------|--------|
+| **920 × 430**    | Header capsule  | Yes      | Store page top, recommendations, Big Picture. Logo and artwork. |
+| **462 × 174**    | Small capsule  | Yes      | Search results, lists. Steam derives smaller thumbnails (e.g. 120×45) — keep logo readable at small size. |
+| **1232 × 706**   | Main capsule   | Yes      | Homepage carousel, wishlist emails. Logo and artwork. |
+| **748 × 896**    | Vertical capsule | Yes    | Seasonal sales, some sale layouts. Logo and artwork. |
+| **1920 × 1080** (or larger, 16∶9) | Screenshots | Yes (min. 1) | In-game or UI screenshots; 16∶9 ratio. |
+| **1438 × 810**   | Page background | No      | Store page background; keep subtle, not too bright. |
+| (varies)         | Bundle images  | No*      | *Required only if you set up a bundle. See Steam bundle asset docs. |
+
+### Community and client icons
+
+| Dimensions (W×H) | Name           | Required | Format | Notes |
+|------------------|----------------|----------|--------|--------|
+| **256 × 256**    | Shortcut icon  | Yes      | .ico or .png | Desktop/taskbar; Steam can generate .ico from .png. |
+| **184 × 184**    | App icon       | Yes      | .jpg  | Small logo or representative icon for client/community. |
+
+### Library assets (Steam client library)
+
+| Dimensions (W×H) | Name               | Required | Notes |
+|------------------|--------------------|----------|--------|
+| **600 × 900**    | Library capsule    | Yes      | Library grid, collections. Logo and artwork. |
+| **3840 × 1240**  | Library hero       | Yes      | .png. Wide hero banner; artwork only (no logo). Keep key content in a safe area (e.g. center). |
+| **1280** wide **and/or** **720** tall | Library logo | Yes | .png. Shown on top of library hero. Either 1280px wide and/or 720px tall. |
+| **920 × 430**    | Library header capsule | Yes  | Library locations, recent games. Logo and artwork. |
+
+---
+
+## Dimensions and which capsule each size is for (summary)
+
+Same sizes in a compact “where it appears” view. PNG is typical unless noted above.
 
 ### Store capsules (store page, search, recommendations)
 
@@ -42,8 +76,9 @@ All dimensions are **width × height** in pixels. PNG is typical.
 
 | Dimensions (W×H) | Purpose |
 |------------------|--------|
-| **1280 × 720**   | Library logo (transparent or on a neutral background; aspect often 16∶9). |
-| **256 × 256**    | Shortcut / game icon (e.g. desktop, taskbar). |
+| **1280 × 720** (or 1280 wide and/or 720 tall) | Library logo (transparent or neutral background). |
+| **256 × 256**    | Shortcut / game icon (e.g. desktop, taskbar); .ico or .png. |
+| **184 × 184**    | App icon; .jpg (client/community). |
 | **1438 × 810**   | Page background (optional; store page background). |
 
 ---

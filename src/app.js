@@ -391,9 +391,8 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
     const innerIndex = i - corner;
     if (step > 1 && (innerIndex % step) !== 0) return 'wall';
     const compactIndex = Math.floor(innerIndex / step);
-    const compactCount = baseTilesX; // north/south
-    const compactCountZ = baseTilesZ; // east/west
-    const baseCount = (side === 'north' || side === 'south') ? compactCount : compactCountZ;
+    const baseCount = Math.max(0, layout[side] ?? 0);
+    if (baseCount === 0 || compactIndex >= baseCount) return 'wall';
     const center = Math.floor((baseCount - 1) / 2);
     if (side === BUNKER_EMPTY_WALL_SIDE) return 'wall';
     if (side === BUNKER_CRATE_SIDE && compactIndex === center) return 'door';
@@ -1523,6 +1522,7 @@ function getZombieDrawInfo(z) {
 }
 
 const PIXEL_HIT_ALPHA_THRESHOLD = 1;
+const TREE_PIXEL_HIT_ALPHA_THRESHOLD = 128; // only block on clearly opaque pixels; let shot through transparent/anti-aliased edges
 
 function hitTestZombies(px, py) {
   if (!assets.zombieSprites?.length) return -1;
@@ -1597,6 +1597,7 @@ function treeBlocksPoint(t, info, px, py) {
     treeHoleCanvas.height = TREE_SPRITE_SIZE;
     treeHoleCtx = treeHoleCanvas.getContext('2d');
   }
+  treeHoleCtx.clearRect(0, 0, TREE_SPRITE_SIZE, TREE_SPRITE_SIZE);
   const { col, row } = getTreeGridCell(t.spriteIndex);
   treeHoleCtx.drawImage(
     assets.retrotree,
@@ -1611,7 +1612,7 @@ function treeBlocksPoint(t, info, px, py) {
   const ty = Math.floor(hitTy);
   if (tx < 0 || tx >= TREE_SPRITE_SIZE || ty < 0 || ty >= TREE_SPRITE_SIZE) return false;
   const alpha = idata.data[(ty * TREE_SPRITE_SIZE + tx) * 4 + 3];
-  return alpha >= PIXEL_HIT_ALPHA_THRESHOLD;
+  return alpha >= TREE_PIXEL_HIT_ALPHA_THRESHOLD;
 }
 
 /** Returns { type: 'zombie'|'tree', index } for the closest hit, or null. */
@@ -1830,8 +1831,8 @@ function screenXToHorizonAngle(screenX, horizonY) {
   return Math.atan2(wz - cameraZ, wx - cameraX);
 }
 
-const HORIZON_FOREST_STRIP_RATIO = 0.3;
-const HORIZON_FOREST_REPEAT_COUNT = 32;
+const HORIZON_FOREST_STRIP_RATIO = 0.5;
+const HORIZON_FOREST_REPEAT_COUNT = 26;
 const HORIZON_FOREST_HORIZON_ROW = 275;
 const HORIZON_FOREST_GROUND_FADE_RATIO = 0.4;
 const HORIZON_FOREST_GROUND_ALPHA = 0.65;
@@ -1846,7 +1847,8 @@ function getHorizonForestDrawState() {
   const hz = cameraZ + (forward.z / lenXZ) * far;
   const horizonProj = project(hx, 0, hz);
   const horizonY = horizonProj ? horizonProj.sy : H / 2;
-  const stripHeight = H * HORIZON_FOREST_STRIP_RATIO;
+  const fovZoom = FOV / getFOV();
+  const stripHeight = H * HORIZON_FOREST_STRIP_RATIO * fovZoom;
   const centerAngle = Math.atan2(forward.z, forward.x);
   const angle0Ray = screenXToHorizonAngle(0, horizonY);
   const angle1Ray = screenXToHorizonAngle(W, horizonY);
