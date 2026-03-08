@@ -39,11 +39,12 @@ const CAPSULES = [
   ['page_background', 1438, 810, 'page_background', { noText: true }], // optional; subtle background
   ['library_logo', 1280, 720, 'library_logo', { titleOnly: true }], // overlay on library hero
 ];
-// Icons: generated after main capsule (center-crop square, scale). [filename base, size, ext]
+// Icons: background + female ghoul centered only (no text, no rifle). [filename base, size, ext]
 const ICONS = [
   ['shortcut_icon', 256, 'png'],
   ['app_icon', 184, 'jpg'],
 ];
+const ICON_GHOUL_HEIGHT_RATIO = 2;
 
 // Text: "Zombies" with 0 (skull) as the second letter
 const LINES = ['Please', 'Shoot the', 'Z0mbies'];
@@ -100,46 +101,60 @@ function integerScale(srcW, srcH, maxW, maxH) {
 /**
  * Draw character art: gas mask behind, female ghoul on the right (on top).
  * Block is to the right of text (ART_LEFT_RATIO); top-anchored; feet extend below.
+ * opts: { shiftGhoulLeft, shiftGhoulRight, shiftZombieRight, shiftZombieLeft, anchorBottom, anchorFractionBelow, artScaleMultiplier, zombieCenterFactor, characterShiftDown } for per-capsule layout.
  */
-async function drawCharacters(ctx, w, h, femaleGhoul, gasMask, artScale) {
+async function drawCharacters(ctx, w, h, femaleGhoul, gasMask, artScale, opts = {}) {
   const margin = Math.min(w, h) * 0.05;
   const left = w * ART_LEFT_RATIO;
   const right = w - margin;
   const maxArtW = right - left;
-  const topAnchor = 0;
+  const shiftGhoulLeft = opts.shiftGhoulLeft ?? 0;
+  const shiftGhoulRight = opts.shiftGhoulRight ?? 0;
+  const shiftZombieRight = opts.shiftZombieRight ?? 0;
+  const shiftZombieLeft = opts.shiftZombieLeft ?? 0;
+  const anchorBottom = opts.anchorBottom ?? false;
+  const anchorFractionBelow = opts.anchorFractionBelow ?? 0.5;
+  const scale = artScale * (opts.artScaleMultiplier ?? 1);
+  // gas mask default position factor (0.3 = 30% from left of art block); lower = closer to center
+  const zombieCenterFactor = opts.zombieCenterFactor ?? 0.3;
 
   const swG = femaleGhoul ? femaleGhoul.width : 0;
   const shG = femaleGhoul ? femaleGhoul.height : 0;
   const swM = gasMask ? gasMask.width : 0;
   const shM = gasMask ? gasMask.height : 0;
-  const scale = artScale;
+
+  const pw = gasMask && scale >= 1 ? swM * scale : 0;
+  const ph = gasMask && scale >= 1 ? shM * scale : 0;
+  const artW = femaleGhoul && scale >= 1 ? swG * scale : 0;
+  const artH = femaleGhoul && scale >= 1 ? shG * scale : 0;
+  const maxH = Math.max(ph, artH);
+  const characterShiftDown = opts.characterShiftDown ?? 0;
+  const topAnchor = (anchorBottom ? h - maxH * (1 - anchorFractionBelow) : 0) + characterShiftDown;
 
   if (gasMask && scale >= 1) {
-    const pw = swM * scale;
-    const ph = shM * scale;
-    const px = left + (maxArtW - pw) * 0.3;
+    const px = left + (maxArtW - pw) * zombieCenterFactor + shiftZombieRight - shiftZombieLeft;
     ctx.drawImage(gasMask, 0, 0, swM, shM, Math.round(px), Math.round(topAnchor), pw, ph);
   }
 
   if (femaleGhoul && scale >= 1) {
-    const artW = swG * scale;
-    const artH = shG * scale;
-    const ghoulLeft = right - artW;
+    const ghoulLeft = right - artW - shiftGhoulLeft + shiftGhoulRight;
     ctx.drawImage(femaleGhoul, 0, 0, swG, shG, Math.round(ghoulLeft), Math.round(topAnchor), artW, artH);
   }
 }
 
 /**
- * Draw Lee Enfield flush in the bottom right corner. Uses same integer scale as zombies (artScale).
+ * Draw Lee Enfield in the bottom right. Scale = artScale * rifleScaleMultiplier.
+ * rifleShiftRight shifts gun right (pixels). rifleShiftDown shifts gun down (pixels).
  */
-function drawRifle(ctx, w, h, rifleImage, artScale) {
+function drawRifle(ctx, w, h, rifleImage, artScale, rifleScaleMultiplier = 1, rifleShiftRight = 0, rifleShiftDown = 0) {
   if (!rifleImage || !artScale) return;
   const frameW = rifleImage.width;
   const frameH = rifleImage.height;
-  const drawW = frameW * artScale;
-  const drawH = frameH * artScale;
-  const x = w - drawW;
-  const y = h - drawH;
+  const scale = artScale * rifleScaleMultiplier;
+  const drawW = frameW * scale;
+  const drawH = frameH * scale;
+  const x = w - drawW + rifleShiftRight;
+  const y = h - drawH + rifleShiftDown;
   ctx.drawImage(rifleImage, 0, 0, frameW, frameH, Math.round(x), Math.round(y), drawW, drawH);
 }
 
@@ -164,8 +179,10 @@ function fontSizeForWidth(font, line, targetWidth, maxFontSize = MAX_FONT_SIZE) 
  * Wide capsule: most of height, equidistant from top-left and bottom-left (vertically centered on left).
  * Tall capsule: most of width, equidistant from top-left and top-right (horizontally centered at top).
  * If centerBox is true (e.g. library logo), use a centered box over most of the canvas.
+ * If fullWidthTitle is true (e.g. library_capsule, vertical), use full horizontal space with consistent margins.
+ * If titleBoxHalfHeight is true (vertical capsules), title box is half canvas height and text is centered horizontally.
  */
-function drawTitle(ctx, w, h, font, centerBox = false) {
+function drawTitle(ctx, w, h, font, centerBox = false, fullWidthTitle = false, titleBoxHalfHeight = false, centerHorizontally = false) {
   if (!font) return;
   const margin = Math.min(w, h) * TITLE_MARGIN_RATIO;
   const isWide = w >= h;
@@ -183,16 +200,35 @@ function drawTitle(ctx, w, h, font, centerBox = false) {
     boxWidth = Math.min(w * 0.48, w * ART_LEFT_RATIO - margin - w * TEXT_GAP_RATIO);
   } else {
     boxTop = margin;
-    boxHeight = h * 0.38;
+    // Tall + fullWidthTitle: half height when titleBoxHalfHeight, else most of height.
+    boxHeight = fullWidthTitle ? (titleBoxHalfHeight ? h * 0.5 : h * TITLE_USE_DIMENSION_RATIO) : h * 0.38;
     boxLeft = margin;
-    boxWidth = Math.min(w * TITLE_USE_DIMENSION_RATIO, w * ART_LEFT_RATIO - margin - w * TEXT_GAP_RATIO);
+    boxWidth = fullWidthTitle ? w - 2 * margin : Math.min(w * TITLE_USE_DIMENSION_RATIO, w * ART_LEFT_RATIO - margin - w * TEXT_GAP_RATIO);
   }
 
   const unitsPerEm = font.unitsPerEm || 1000;
   const ascender = font.ascender != null ? font.ascender : 800;
 
   const maxWidthAtCap = Math.min(...LINES.map((line) => font.getAdvanceWidth(line, MAX_FONT_SIZE)));
-  const targetWidth = Math.min(boxWidth, maxWidthAtCap);
+  let targetWidth = Math.min(boxWidth, maxWidthAtCap);
+
+  // Find largest targetWidth so totalHeight <= boxHeight (fill the box; no scale-down).
+  if (!centerBox) {
+    let low = 1;
+    let high = Math.min(boxWidth, maxWidthAtCap);
+    for (let i = 0; i < 40; i++) {
+      const mid = (low + high) / 2;
+      const sizes = LINES.map((line) => fontSizeForWidth(font, line, mid));
+      let th = 0;
+      sizes.forEach((fs, idx) => {
+        th += fs * LINE_HEIGHT_RATIO + (idx < LINES.length - 1 ? LINE_SPACING_PX : 0);
+      });
+      if (th <= boxHeight) low = mid;
+      else high = mid;
+    }
+    targetWidth = (low + high) / 2;
+  }
+
   let fontSizes = LINES.map((line) => fontSizeForWidth(font, line, targetWidth));
 
   let totalHeight = 0;
@@ -213,7 +249,9 @@ function drawTitle(ctx, w, h, font, centerBox = false) {
   LINES.forEach((line, i) => {
     const fontSize = fontSizes[i];
     const baseline = lineTop + (ascender / unitsPerEm) * fontSize;
-    const path = font.getPath(line, boxLeft, baseline, fontSize);
+    const lineWidth = font.getAdvanceWidth(line, fontSize);
+    const x = centerHorizontally ? boxLeft + (boxWidth - lineWidth) / 2 : boxLeft;
+    const path = font.getPath(line, x, baseline, fontSize);
     if (path.fill !== undefined) path.fill = white;
     ctx.fillStyle = white;
     path.draw(ctx);
@@ -231,9 +269,10 @@ async function generateOne(name, width, height, filenameBase, femaleGhoul, gasMa
   if (titleOnly) {
     // Library logo: title only on transparent background (overlays on hero)
     drawTitle(ctx, width, height, font, true);
+  } else if (name === 'page_background') {
+    drawBackground(ctx, width, height, backgroundImage, 0);
   } else {
-    const dim = name === 'page_background' ? 0.4 : 0;
-    drawBackground(ctx, width, height, backgroundImage, dim);
+    drawBackground(ctx, width, height, backgroundImage, 0);
     const margin = Math.min(width, height) * 0.05;
     const maxArtW = (width - margin) - width * ART_LEFT_RATIO;
     const maxArtH = height * ART_HEIGHT_RATIO;
@@ -242,15 +281,94 @@ async function generateOne(name, width, height, filenameBase, femaleGhoul, gasMa
     let artScale = integerScale(maxSw, maxSh, maxArtW, maxArtH * 1.15);
     if (name !== 'small') artScale *= 2;
 
-    await drawCharacters(ctx, width, height, femaleGhoul, gasMask, artScale);
-    drawRifle(ctx, width, height, rifleImage, artScale);
+    const shift = width / 5;
+    const w8 = width / 8;
+    const w6 = width / 6;
+    const w4 = width / 4;
+    const w16 = width / 16;
+    const h20 = height / 20;
+    const charOpts = {};
+    let rifleShiftRight = 0;
+    let rifleShiftDown = 0;
 
-    if (!noText) drawTitle(ctx, width, height, font);
+    if (name === 'header' || name === 'library_header') {
+      charOpts.shiftGhoulLeft = shift;
+      charOpts.shiftZombieRight = shift;
+      charOpts.shiftGhoulRight = w8;
+      rifleShiftRight = w8;
+      rifleShiftDown = name === 'library_header' ? height / 12 : h20;
+    } else if (name === 'library_capsule' || name === 'vertical') {
+      charOpts.anchorBottom = true;
+      charOpts.anchorFractionBelow = 0.5;
+      charOpts.artScaleMultiplier = 2;
+      charOpts.zombieCenterFactor = 0.5;
+      charOpts.characterShiftDown = h20;
+      charOpts.shiftGhoulRight = w6;
+      rifleShiftDown = h20;
+      rifleShiftRight = w6;
+    } else if (name === 'library_hero') {
+      charOpts.shiftGhoulLeft = shift + w16;
+      charOpts.shiftZombieRight = shift;
+      charOpts.shiftGhoulRight = w4;
+      rifleShiftDown = h20;
+    } else if (name === 'main') {
+      charOpts.shiftGhoulRight = w8 + w16 + w16;
+      charOpts.shiftZombieRight = w8 + w16;
+      rifleShiftRight = w8;
+    } else if (name === 'small') {
+      charOpts.shiftGhoulLeft = width * 0.36;
+      charOpts.shiftGhoulRight = width / 3;
+      charOpts.shiftZombieRight = width * 0.45;
+    }
+
+    const rifleMultiplier = (name === 'main' || name === 'library_hero' || name === 'small') ? 0.5 : 1;
+
+    await drawCharacters(ctx, width, height, femaleGhoul, null, artScale, charOpts);
+    drawRifle(ctx, width, height, rifleImage, artScale, rifleMultiplier, rifleShiftRight, rifleShiftDown);
+
+    const isVerticalCapsule = name === 'library_capsule' || name === 'vertical';
+    const fullWidthTitle = isVerticalCapsule;
+    const titleBoxHalfHeight = isVerticalCapsule;
+    const centerHorizontally = isVerticalCapsule;
+    if (!noText) drawTitle(ctx, width, height, font, false, fullWidthTitle, titleBoxHalfHeight, centerHorizontally);
   }
 
   const outPath = path.join(OUT_DIR, `${filenameBase}_english.png`);
   const buf = canvas.toBuffer('image/png');
   fs.writeFileSync(outPath, buf);
+  console.log(`Wrote ${outPath}`);
+}
+
+/**
+ * Generate app/shortcut icon: spooky forest background + female ghoul centered. No text or other sprites.
+ */
+async function generateIcon(size, filenameBase, ext, femaleGhoul, backgroundImage) {
+  const canvas = createCanvas(size, size);
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+
+  drawBackground(ctx, size, size, backgroundImage, 0);
+
+  if (femaleGhoul) {
+    const maxH = size * ICON_GHOUL_HEIGHT_RATIO;
+    const sw = femaleGhoul.width;
+    const sh = femaleGhoul.height;
+    const scale = maxH / sh; // scale by height only so she reaches portrait size (may overflow sides)
+    const drawW = sw * scale;
+    const drawH = sh * scale;
+    const x = (size - drawW) / 2;
+    const y = 0; // top-aligned so face is at top of icon
+    ctx.drawImage(femaleGhoul, 0, 0, sw, sh, Math.round(x), Math.round(y), drawW, drawH);
+  }
+
+  const outPath = path.join(OUT_DIR, `${filenameBase}_english.${ext}`);
+  if (ext === 'jpg') {
+    const buf = canvas.toBuffer('image/jpeg', { quality: 0.92 });
+    fs.writeFileSync(outPath, buf);
+  } else {
+    const buf = canvas.toBuffer('image/png');
+    fs.writeFileSync(outPath, buf);
+  }
   console.log(`Wrote ${outPath}`);
 }
 
@@ -301,29 +419,9 @@ async function main() {
     await generateOne(name, w, h, base, femaleGhoul, gasMask, rifleImage, backgroundImage, font, options);
   }
 
-  // Icons: center-crop from main capsule and scale
-  const mainPath = path.join(OUT_DIR, 'main_english.png');
-  if (fs.existsSync(mainPath)) {
-    const mainBuf = fs.readFileSync(mainPath);
-    const mainMeta = await sharp(mainBuf).metadata();
-    const iw = mainMeta.width || 1232;
-    const ih = mainMeta.height || 706;
-    const cropSize = Math.min(iw, ih);
-    const left = Math.floor((iw - cropSize) / 2);
-    const top = Math.floor((ih - cropSize) / 2);
-    for (const [base, size, ext] of ICONS) {
-      const outPath = path.join(OUT_DIR, `${base}_english.${ext}`);
-      let pipeline = sharp(mainBuf).extract({ left, top, width: cropSize, height: cropSize }).resize(size, size);
-      if (ext === 'jpg') {
-        pipeline = pipeline.jpeg({ quality: 92 });
-      } else {
-        pipeline = pipeline.png();
-      }
-      await pipeline.toFile(outPath);
-      console.log(`Wrote ${outPath}`);
-    }
-  } else {
-    console.warn('Skipping icons (main_english.png not found). Generate capsules first.');
+  // Icons: spooky forest + female ghoul centered only
+  for (const [base, iconSize, ext] of ICONS) {
+    await generateIcon(iconSize, base, ext, femaleGhoul, backgroundImage);
   }
 
   console.log('Done.');
