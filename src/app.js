@@ -23,6 +23,11 @@ let cameraX = WORLD_CENTER_X;
 let cameraZ = WORLD_CENTER_Z;
 let desiredCameraX = WORLD_CENTER_X;
 let desiredCameraZ = WORLD_CENTER_Z;
+let movementStartTime = null;  // gameTime when run between slots started
+let movementStartX = 0;
+let movementStartZ = 0;
+let movementEndX = 0;
+let movementEndZ = 0;
 let cameraYaw = 0;   // left-right (rotation around Y)
 let cameraPitch = 0; // up-down
 
@@ -55,6 +60,12 @@ const BUNKER_LAYOUT = { north: 3, east: 2, south: 3, west: 2 };
 const BUNKER_SLOT_SPACING = 4.5;
 const BUNKER_WALL_INSET = 2.8;
 const BUNKER_MOVE_LERP = 10;
+const BUNKER_MOVE_DURATION = 2;  // seconds to run between slots
+const RUN_BOB_STEPS_PER_SEC = 2.4;
+const RUN_BOB_LEFT = 28;   // gun held left (running pose)
+const RUN_BOB_DOWN = 72;   // gun held low
+const RUN_BOB_SWAY = 52;   // horizontal swing (arms)
+const RUN_BOB_BOUNCE = 22; // vertical dip per step
 const BUNKER_CRATE_SIDE = 'south';
 const BUNKER_EMPTY_WALL_SIDE = 'west';
 const BUNKER_WALL_HEIGHT = 2.85;
@@ -236,7 +247,8 @@ function getFOV() {
 }
 
 function isIronSightsActive() {
-  return ironSightsHeld && rifleState !== 'reloading';
+  const isRunning = movementStartTime != null && (gameTime - movementStartTime) < BUNKER_MOVE_DURATION;
+  return ironSightsHeld && rifleState !== 'reloading' && !isRunning;
 }
 
 function project(wx, wy, wz) {
@@ -527,6 +539,7 @@ function getSideWallCoord(side) {
 
 function setActiveBunkerSlot(index, snap = false) {
   if (bunkerSlots.length === 0) return;
+  const prevIndex = activeSlotIndex;
   activeSlotIndex = (index + bunkerSlots.length) % bunkerSlots.length;
   const slot = getCurrentBunkerSlot();
   desiredCameraX = slot.x;
@@ -538,9 +551,18 @@ function setActiveBunkerSlot(index, snap = false) {
     cameraZ = desiredCameraZ;
     cameraYaw = desiredYaw;
     cameraPitch = 0;
+    movementStartTime = null;
+    if (assets.runningSound) { assets.runningSound.pause(); assets.runningSound.currentTime = 0; }
   } else {
-    cameraYaw = desiredYaw;
-    cameraPitch = 0;
+    if (activeSlotIndex !== prevIndex) {
+      movementStartTime = gameTime;
+      movementStartX = cameraX;
+      movementStartZ = cameraZ;
+      movementEndX = desiredCameraX;
+      movementEndZ = desiredCameraZ;
+      ironSightsHeld = false;
+      if (assets.runningSound) assets.runningSound.play().catch(() => {});
+    }
   }
 }
 
@@ -1005,6 +1027,9 @@ async function loadAssets() {
   assets.hammerSound.preload = 'auto';
   assets.boardBreakSound = new Audio('assets/sfx/clean/board_breaking.ogg');
   assets.boardBreakSound.preload = 'auto';
+  assets.runningSound = new Audio('assets/sfx/clean/boots_running.ogg');
+  assets.runningSound.preload = 'auto';
+  assets.runningSound.loop = true;
   generateBunkerLayout();
   const horizonPath = `${base}/${HORIZON_BACKGROUND_PATH}`;
   assets.horizonBackground = await loadImage(horizonPath);
@@ -2758,6 +2783,13 @@ function drawRifle(dt) {
   let rifleShiftX = (ro.x + RETICULE_CLAMP_X) * GUN_PX_PER_RETICULE_PX;
   let rifleShiftY = (ro.y + RETICULE_CLAMP_Y) * GUN_PX_PER_RETICULE_PX_Y;
   if (pointingAtCrate) rifleShiftY += GUN_LOWERED_OFFSET_Y;
+  const isRunning = movementStartTime != null && (gameTime - movementStartTime) < BUNKER_MOVE_DURATION;
+  if (isRunning) {
+    const runPhase = ((gameTime - movementStartTime) * RUN_BOB_STEPS_PER_SEC) % 1;
+    const angle = Math.PI * (runPhase < 0.5 ? 2 * runPhase : 2 * (1 - runPhase));
+    rifleShiftX -= RUN_BOB_LEFT + RUN_BOB_SWAY * Math.cos(angle);
+    rifleShiftY += RUN_BOB_DOWN + RUN_BOB_BOUNCE * Math.sin(angle);
+  }
   // During reload: move gun toward (0,0) (slower out), peak at frame 52 when bullets go in, faster back
   if (rifleState === 'reloading') {
     const RELOAD_PEAK_FRAME = 51; // 0-indexed; frame 52 = push bullets in
@@ -2958,11 +2990,30 @@ function tick(dt) {
   }
   const activeSlot = getCurrentBunkerSlot();
   const peek = getPeekOffsetForSlot(activeSlot);
-  const targetCameraX = desiredCameraX + peek.x;
-  const targetCameraZ = desiredCameraZ + peek.z;
-  const moveT = 1 - Math.exp(-BUNKER_MOVE_LERP * dt);
-  cameraX += (targetCameraX - cameraX) * moveT;
-  cameraZ += (targetCameraZ - cameraZ) * moveT;
+  if (movementStartTime != null && gameTime - movementStartTime < BUNKER_MOVE_DURATION) {
+    const t = Math.min(1, (gameTime - movementStartTime) / BUNKER_MOVE_DURATION);
+    const s = t * t * (3 - 2 * t);
+    cameraX = movementStartX + (movementEndX - movementStartX) * s;
+    cameraZ = movementStartZ + (movementEndZ - movementStartZ) * s;
+    if (t >= 1) {
+      movementStartTime = null;
+      cameraX = movementEndX;
+      cameraZ = movementEndZ;
+      if (assets.runningSound) { assets.runningSound.pause(); assets.runningSound.currentTime = 0; }
+    }
+  } else {
+    if (movementStartTime != null) {
+      movementStartTime = null;
+      cameraX = movementEndX;
+      cameraZ = movementEndZ;
+      if (assets.runningSound) { assets.runningSound.pause(); assets.runningSound.currentTime = 0; }
+    }
+    const targetCameraX = desiredCameraX + peek.x;
+    const targetCameraZ = desiredCameraZ + peek.z;
+    const moveT = 1 - Math.exp(-BUNKER_MOVE_LERP * dt);
+    cameraX += (targetCameraX - cameraX) * moveT;
+    cameraZ += (targetCameraZ - cameraZ) * moveT;
+  }
   const chaseT = 1 - Math.exp(-CHASE_LERP * dt);
   cameraYaw += normalizeAngle(desiredYaw - cameraYaw) * chaseT;
   cameraPitch += (desiredPitch - cameraPitch) * chaseT;
