@@ -71,6 +71,7 @@ const BUNKER_PEEK_FADE_END_YAW = 1.75;        // fully centered again by this ya
 const BUNKER_WINDOW_WIDTH = 1.9;
 const BUNKER_WINDOW_BOTTOM = 0.9;
 const BUNKER_WINDOW_TOP = 2.15;
+const BUNKER_FLOOR_Y = 0.02;
 const BUNKER_CRATE_WIDTH = 1.9;
 const BUNKER_CRATE_HEIGHT = 1.15;
 const BUNKER_CRATE_DEPTH = 0.95;
@@ -417,7 +418,7 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
       const logicalIndex = reverse ? (count - 1 - i) : i;
       const tile = bunkerWallTiles[side][logicalIndex];
       if (!tile) continue;
-      if (tile.spriteKey === 'wall') continue;
+      if (tile.spriteKey === 'wall' || tile.spriteKey === 'wall_ammo') continue;
       const centerCoord = (tile.min + tile.max) / 2;
       const type = 'window';
       slots.push(horizontal
@@ -435,6 +436,8 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
   const crateCenterIndex = Math.floor((crateCount - 1) / 2);
   const crateTile = bunkerWallTiles[BUNKER_EMPTY_WALL_SIDE]?.[crateCenterIndex];
   if (crateTile) {
+    // Bind AMMO art to the exact wall tile behind the crate.
+    crateTile.spriteKey = 'wall_ammo';
     const centerCoord = (crateTile.min + crateTile.max) / 2;
     if (BUNKER_EMPTY_WALL_SIDE === 'north' || BUNKER_EMPTY_WALL_SIDE === 'south') {
       slots.push({
@@ -584,7 +587,7 @@ function getPeekOffsetForSlot(slot) {
 
 function getWindowOpeningsForSide(side) {
   return (bunkerWallTiles[side] ?? [])
-    .filter((tile) => tile.spriteKey !== 'wall')
+    .filter((tile) => tile.spriteKey !== 'wall' && tile.spriteKey !== 'wall_ammo')
     .map((tile) => ({
       min: tile.min,
       max: tile.max,
@@ -792,10 +795,42 @@ function getShotDirection(px, py) {
   return { x: dir.x / len, y: dir.y / len, z: dir.z / len };
 }
 
+/** Draw "AMMO" + down arrow onto a wall texture so the label appears on the wall above the crate. */
+function createWallTextureWithAmmoLabel(wallImg) {
+  if (!wallImg?.width && !wallImg?.naturalWidth) return wallImg;
+  const w = wallImg.naturalWidth || wallImg.width;
+  const h = wallImg.naturalHeight || wallImg.height;
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(wallImg, 0, 0);
+  const cx = w / 2;
+  const labelY = h * 0.26;
+  const fontSize = Math.max(24, Math.floor(h * 0.15));
+  ctx.font = `${fontSize}px Gogozombie`;
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  // West-wall UV is mirrored; writing reversed text renders as "AMMO" in-world.
+  ctx.fillText('OMMA', cx, labelY);
+  const arrowTop = labelY + 4;
+  const arrowTip = labelY + 4 + Math.floor(fontSize * 0.6);
+  ctx.beginPath();
+  ctx.moveTo(cx, arrowTip);
+  ctx.lineTo(cx - fontSize * 0.35, arrowTop);
+  ctx.lineTo(cx + fontSize * 0.35, arrowTop);
+  ctx.closePath();
+  ctx.fillStyle = '#fff';
+  ctx.fill();
+  return canvas;
+}
+
 function getBunkerWallImageAndData(spriteKey) {
   if (spriteKey === 'window') return { img: assets.bunkerWallWindow, data: assets.bunkerWallWindowData };
   if (spriteKey === 'hole') return { img: assets.bunkerWallHole, data: assets.bunkerWallHoleData };
   if (spriteKey === 'door') return { img: assets.bunkerWallDoor, data: assets.bunkerWallDoorData };
+  if (spriteKey === 'wall_ammo') return { img: assets.bunkerWallWithAmmo, data: assets.bunkerWallWithAmmoData };
   return { img: assets.bunkerWall, data: assets.bunkerWallData };
 }
 
@@ -805,7 +840,7 @@ function sampleBunkerWallAlpha(side, coord, y) {
   if (!tile) return 255;
   const { data } = getBunkerWallImageAndData(tile.spriteKey);
   if (!data?.width || !data?.height) {
-    return tile.spriteKey === 'wall' ? 255 : 0;
+    return (tile.spriteKey === 'wall' || tile.spriteKey === 'wall_ammo') ? 255 : 0;
   }
   const u = Math.max(0, Math.min(0.999999, (coord - tile.min) / Math.max(tile.max - tile.min, 1e-6)));
   const v = Math.max(0, Math.min(0.999999, 1 - y / BUNKER_WALL_HEIGHT));
@@ -882,7 +917,7 @@ function getCrateAABB() {
   }
   return {
     minX: crateMinX, maxX: crateMaxX,
-    minY: 0, maxY: BUNKER_CRATE_HEIGHT,
+    minY: BUNKER_FLOOR_Y, maxY: BUNKER_FLOOR_Y + BUNKER_CRATE_HEIGHT,
     minZ: crateMinZ, maxZ: crateMaxZ,
   };
 }
@@ -957,11 +992,15 @@ async function loadAssets() {
   assets.bunkerWallWindow = await loadImage(`${base}/bunker/wall_with_window.png`);
   assets.bunkerWallHole = await loadImage(`${base}/bunker/wall_with_hole.png`);
   assets.bunkerWallDoor = await loadImage(`${base}/bunker/wall_with_door.png`);
+  if (document.fonts?.load) await document.fonts.load('1em Gogozombie');
+  assets.bunkerWallWithAmmo = createWallTextureWithAmmoLabel(assets.bunkerWall) || assets.bunkerWall;
   assets.bunkerWallData = imageDataFromImage(assets.bunkerWall);
   assets.bunkerWallWindowData = imageDataFromImage(assets.bunkerWallWindow);
   assets.bunkerWallHoleData = imageDataFromImage(assets.bunkerWallHole);
   assets.bunkerWallDoorData = imageDataFromImage(assets.bunkerWallDoor);
+  assets.bunkerWallWithAmmoData = imageDataFromImage(assets.bunkerWallWithAmmo);
   assets.board = await loadImage(`${base}/bunker/board.png`);
+  assets.crateSpriteSheet = await loadImage(`${base}/bunker/crate_sprite_sheet.png`);
   assets.hammerSound = new Audio('assets/sfx/clean/hammer_nails.ogg');
   assets.hammerSound.preload = 'auto';
   assets.boardBreakSound = new Audio('assets/sfx/clean/board_breaking.ogg');
@@ -2447,6 +2486,7 @@ function drawBunkerInterior() {
   if (!bunker) return;
 
   const polys = [];
+  const backgroundPolys = [];
   const wallColor = '#1e1712';
   const trimColor = '#564536';
   const floorColor = '#1a1511';
@@ -2460,13 +2500,14 @@ function drawBunkerInterior() {
   const minZ = WORLD_CENTER_Z - bunker.halfD;
   const maxZ = WORLD_CENTER_Z + bunker.halfD;
 
-  pushPolygon(polys, [
-    { x: minX, y: 0.02, z: minZ },
-    { x: maxX, y: 0.02, z: minZ },
-    { x: maxX, y: 0.02, z: maxZ },
-    { x: minX, y: 0.02, z: maxZ },
+  // Draw floor/ceiling in a dedicated pass to avoid painter-order popping against crate faces.
+  pushPolygon(backgroundPolys, [
+    { x: minX, y: BUNKER_FLOOR_Y, z: minZ },
+    { x: maxX, y: BUNKER_FLOOR_Y, z: minZ },
+    { x: maxX, y: BUNKER_FLOOR_Y, z: maxZ },
+    { x: minX, y: BUNKER_FLOOR_Y, z: maxZ },
   ], floorColor);
-  pushPolygon(polys, [
+  pushPolygon(backgroundPolys, [
     { x: minX, y: BUNKER_WALL_HEIGHT, z: maxZ },
     { x: maxX, y: BUNKER_WALL_HEIGHT, z: maxZ },
     { x: maxX, y: BUNKER_WALL_HEIGHT, z: minZ },
@@ -2555,39 +2596,93 @@ function drawBunkerInterior() {
         crateMinX = crateMaxX - BUNKER_CRATE_DEPTH;
       }
     }
-    const crateY1 = BUNKER_CRATE_HEIGHT;
-    pushPolygon(polys, [
-      { x: crateMinX, y: 0, z: crateMinZ },
-      { x: crateMaxX, y: 0, z: crateMinZ },
-      { x: crateMaxX, y: crateY1, z: crateMinZ },
-      { x: crateMinX, y: crateY1, z: crateMinZ },
-    ], crateSide, '#3f2b1b');
-    pushPolygon(polys, [
-      { x: crateMaxX, y: 0, z: crateMinZ },
-      { x: crateMaxX, y: 0, z: crateMaxZ },
-      { x: crateMaxX, y: crateY1, z: crateMaxZ },
-      { x: crateMaxX, y: crateY1, z: crateMinZ },
-    ], crateSide, '#3f2b1b');
-    pushPolygon(polys, [
-      { x: crateMinX, y: 0, z: crateMaxZ },
-      { x: crateMinX, y: 0, z: crateMinZ },
-      { x: crateMinX, y: crateY1, z: crateMinZ },
-      { x: crateMinX, y: crateY1, z: crateMaxZ },
-    ], crateSide, '#3f2b1b');
-    pushPolygon(polys, [
-      { x: crateMinX, y: crateY1, z: crateMinZ },
-      { x: crateMaxX, y: crateY1, z: crateMinZ },
-      { x: crateMaxX, y: crateY1, z: crateMaxZ },
-      { x: crateMinX, y: crateY1, z: crateMaxZ },
-    ], crateTop, '#3f2b1b');
-    pushPolygon(polys, [
-      { x: crateMinX, y: 0, z: crateMaxZ },
-      { x: crateMaxX, y: 0, z: crateMaxZ },
-      { x: crateMaxX, y: crateY1, z: crateMaxZ },
-      { x: crateMinX, y: crateY1, z: crateMaxZ },
-    ], crateFront, '#3f2b1b');
+    const crateY0 = BUNKER_FLOOR_Y;
+    const crateY1 = BUNKER_FLOOR_Y + BUNKER_CRATE_HEIGHT;
+    const crateSheet = assets.crateSpriteSheet;
+    // Crate sprite sheet: 4 columns x 5 rows. Row 0=front, 1=left, 2=right, 3=back, 4=top.
+    let crateTexFront, crateTexLeft, crateTexRight, crateTexBack, crateTexTop;
+    if (crateSheet) {
+      const w = crateSheet.naturalWidth || crateSheet.width;
+      const h = crateSheet.naturalHeight || crateSheet.height;
+      const fw = Math.floor(w / 4);
+      const fh = Math.floor(h / 5);
+      const tex = (col, row) => ({ img: crateSheet, sx: col * fw, sy: row * fh, sw: fw, sh: fh });
+      crateTexFront = tex(0, 0);
+      crateTexLeft = tex(0, 1);
+      crateTexRight = tex(0, 2);
+      crateTexBack = tex(0, 3);
+      crateTexTop = tex(0, 4);
+    }
+    const crateCenterX = (crateMinX + crateMaxX) * 0.5;
+    const crateCenterZ = (crateMinZ + crateMaxZ) * 0.5;
+    const cameraOnEast = cameraX >= crateCenterX;
+    const cameraOnSouth = cameraZ >= crateCenterZ;
+    // For this axis-aligned box, draw only camera-facing vertical faces (+ top) to prevent far-face popping.
+    const visibleFaces = [];
+    visibleFaces.push(cameraOnSouth
+      ? {
+          points: [
+            { x: crateMinX, y: crateY0, z: crateMaxZ },
+            { x: crateMaxX, y: crateY0, z: crateMaxZ },
+            { x: crateMaxX, y: crateY1, z: crateMaxZ },
+            { x: crateMinX, y: crateY1, z: crateMaxZ },
+          ],
+          tex: crateTexFront,
+          fill: crateFront,
+        }
+      : {
+          points: [
+            { x: crateMinX, y: crateY0, z: crateMinZ },
+            { x: crateMaxX, y: crateY0, z: crateMinZ },
+            { x: crateMaxX, y: crateY1, z: crateMinZ },
+            { x: crateMinX, y: crateY1, z: crateMinZ },
+          ],
+          tex: crateTexBack,
+          fill: crateSide,
+        });
+    visibleFaces.push(cameraOnEast
+      ? {
+          points: [
+            { x: crateMaxX, y: crateY0, z: crateMinZ },
+            { x: crateMaxX, y: crateY0, z: crateMaxZ },
+            { x: crateMaxX, y: crateY1, z: crateMaxZ },
+            { x: crateMaxX, y: crateY1, z: crateMinZ },
+          ],
+          tex: crateTexRight,
+          fill: crateSide,
+        }
+      : {
+          points: [
+            { x: crateMinX, y: crateY0, z: crateMaxZ },
+            { x: crateMinX, y: crateY0, z: crateMinZ },
+            { x: crateMinX, y: crateY1, z: crateMinZ },
+            { x: crateMinX, y: crateY1, z: crateMaxZ },
+          ],
+          tex: crateTexLeft,
+          fill: crateSide,
+        });
+    // Draw top after the farthest visible vertical face, before nearest one.
+    const crateTopPoly = {
+      points: [
+        { x: crateMinX, y: crateY1, z: crateMinZ },
+        { x: crateMaxX, y: crateY1, z: crateMinZ },
+        { x: crateMaxX, y: crateY1, z: crateMaxZ },
+        { x: crateMinX, y: crateY1, z: crateMaxZ },
+      ],
+      tex: crateTexTop,
+      fill: crateTop,
+    };
+    const crateFacePolys = [];
+    pushPolygon(crateFacePolys, visibleFaces[0].points, visibleFaces[0].fill, '#3f2b1b', visibleFaces[0].tex);
+    pushPolygon(crateFacePolys, visibleFaces[1].points, visibleFaces[1].fill, '#3f2b1b', visibleFaces[1].tex);
+    crateFacePolys.sort((a, b) => b.avgDepth - a.avgDepth);
+    if (crateFacePolys[0]) polys.push(crateFacePolys[0]);
+    pushPolygon(polys, crateTopPoly.points, crateTopPoly.fill, '#3f2b1b', crateTopPoly.tex);
+    if (crateFacePolys[1]) polys.push(crateFacePolys[1]);
   }
 
+  backgroundPolys.sort((a, b) => b.avgDepth - a.avgDepth);
+  for (const poly of backgroundPolys) drawProjectedPolygon(poly);
   polys.sort((a, b) => b.avgDepth - a.avgDepth);
   for (const poly of polys) drawProjectedPolygon(poly);
 }
