@@ -12,7 +12,7 @@ A retro pixel art multiplayer shooter: defend a bunker against wave after wave o
 
 ```
 ├── assets/           # Sprites and art (Lee Enfield, zombies, etc.)
-├── docs/             # Design: AWS setup, proximity voice, game sync, deploy (DEPLOY.md)
+├── docs/             # Design: AWS, proximity voice, game sync, deploy, multiplayer spec (MULTIPLAYER_SPEC.md)
 ├── server/           # WebSocket game server (run on EC2)
 ├── src/              # Game client (canvas, input, game loop)
 ├── main.js           # Electron main process
@@ -34,6 +34,8 @@ npm start
 - [ ] Networking + AWS ECS game servers
 - [ ] Proximity voice chat
 - [ ] 64 players × 96 windows scale
+
+Full multiplayer plan (Steam matchmaking & voice, handshake, relayed messages, player history, bots): [MULTIPLAYER_SPEC.md](docs/MULTIPLAYER_SPEC.md).
 
 ## Assets
 
