@@ -186,8 +186,8 @@ const GAME_OVER_FACE_DURATION = 2;  // seconds of zombie face + red tint before 
 const ZOMBIE_SOUND_INTERVAL = 4;      // seconds between groans; deterministic from spawnIndex/spawnTime
 const GAME_PARAM_SEED = 13371337;
 const GAME_PARAM_WAVE_COUNT = 6;
-const WAVE_FIRST_SIZE = 4;
-const WAVE_SIZE_GROWTH = 3;
+const WAVE_TRIANGLE_CONSTANT = 3;
+const WAVE_TRIANGLE_OFFSET = 1; // waveSize = constant + T(waveIndex1Based + offset)
 const WAVE_SPAWN_INTERVAL = 1.35;
 const WAVE_GAP_SECONDS = 4.2;
 const ZOMBIE_MIN_PATH_LENGTH = 34;
@@ -208,6 +208,8 @@ let pointerLocked = false;
 let gameOver = false;
 let gameOverFlashStart = 0;
 let gameOverZombie = null;  // zombie that breached (for face + sound)
+let gameWon = false;
+let gameWonAt = 0;
 let hitFeedbackTime = 0;  // seconds to show hit reticule (CoD-style diagonal)
 let audioContext = null;  // Web Audio API context for positional sounds
 let gameTime = 0;        // seconds since start (for deterministic zombie sounds)
@@ -216,6 +218,9 @@ let fogWispSprites = [];
 let fogWispPositions = [];
 let gameParams = null;
 let gameParamsHash = '';
+let tallyWallTileRef = null; // { segmentIndex, tileIndex }
+let tallyWallLastKilled = -1;
+let tallyWallLastRemaining = -1;
 
 // Aiming: desired direction (reticule leads), camera chases with delay — turn any direction
 let desiredYaw = 0;
@@ -429,7 +434,7 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
   bunkerWallSegments = [];
 
   function normalizeSpriteKey(key) {
-    if (key === 'window' || key === 'door' || key === 'hole' || key === 'wall_ammo' || key === 'wall_ammo_mirrored' || key === 'ammo') return key;
+    if (key === 'window' || key === 'door' || key === 'hole' || key === 'wall_ammo' || key === 'wall_ammo_mirrored' || key === 'wall_tally' || key === 'wall_tally_mirrored' || key === 'ammo') return key;
     return 'wall';
   }
   function yawFromDir(x, z) {
@@ -518,6 +523,28 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
       }
     }
     bunkerWallSegments.push(segment);
+  }
+
+  // Pick a nearby blank wall tile for zombie tally (closest wall tile to ammo crate).
+  tallyWallTileRef = null;
+  const crateSlot = slots.find((s) => s.type === 'crate');
+  if (crateSlot) {
+    let best = null;
+    for (const segment of bunkerWallSegments) {
+      for (const tile of segment.tiles) {
+        if (tile.spriteKey !== 'wall') continue;
+        const d = Math.hypot(tile.centerX - crateSlot.wallX, tile.centerZ - crateSlot.wallZ);
+        if (!best || d < best.dist) best = { segmentIndex: segment.index, tileIndex: tile.tileIndex, dist: d };
+      }
+    }
+    if (best) {
+      const segment = bunkerWallSegments[best.segmentIndex];
+      const tile = segment?.tiles?.[best.tileIndex];
+      if (tile) {
+        tile.spriteKey = 'wall_tally';
+        tallyWallTileRef = { segmentIndex: best.segmentIndex, tileIndex: best.tileIndex };
+      }
+    }
   }
 
   const xs = corners.map((c) => c.x);
@@ -864,7 +891,7 @@ function getWindowOpeningsForSide(side) {
   return bunkerWallSegments
     .filter((seg) => seg.inward.x * sideNormal.x + seg.inward.z * sideNormal.z < -0.8)
     .flatMap((seg) => seg.tiles
-      .filter((tile) => tile.spriteKey !== 'wall' && tile.spriteKey !== 'wall_ammo' && tile.spriteKey !== 'ammo')
+      .filter((tile) => tile.spriteKey !== 'wall' && tile.spriteKey !== 'wall_ammo' && tile.spriteKey !== 'wall_ammo_mirrored' && tile.spriteKey !== 'wall_tally' && tile.spriteKey !== 'wall_tally_mirrored' && tile.spriteKey !== 'ammo')
       .map((tile) => ({
         min: tile.minT,
         max: tile.maxT,
@@ -1131,8 +1158,10 @@ function generateGameParameters(seed = GAME_PARAM_SEED, waveCount = GAME_PARAM_W
   let spawnIdx = 0;
   const windowSlots = getWindowSlots();
   const treeList = params.trees.map((t) => ({ x: t.x, z: t.z }));
+  const triangular = (n) => (n * (n + 1)) / 2;
   for (let wave = 0; wave < waveCount; wave++) {
-    const waveSize = WAVE_FIRST_SIZE + wave * WAVE_SIZE_GROWTH;
+    const w1 = wave + 1;
+    const waveSize = WAVE_TRIANGLE_CONSTANT + triangular(w1 + WAVE_TRIANGLE_OFFSET);
     for (let n = 0; n < waveSize; n++) {
       let targetSlot = windowSlots.length ? windowSlots[(spawnIdx + n) % windowSlots.length] : null;
       if (!targetSlot) continue;
@@ -1371,12 +1400,164 @@ function createWallTextureWithAmmoLabel(wallImg, mirrored = false) {
   return canvas;
 }
 
+function makeTallyMarks(n) {
+  // Tally Mark font mapping from assets/font/Readme.txt:
+  // a=1, b=2, c=3, d=4, e=5
+  const ONE = 'a';
+  const TWO = 'b';
+  const THREE = 'c';
+  const FOUR = 'd';
+  const FIVE = 'e';
+  const count = Math.max(0, Math.floor(n));
+  const groups = Math.floor(count / 5);
+  const rem = count % 5;
+  const remSymbol = rem === 1 ? ONE : rem === 2 ? TWO : rem === 3 ? THREE : rem === 4 ? FOUR : '';
+  const body = `${FIVE.repeat(groups)}${remSymbol}`;
+  return body || '-';
+}
+
+function wrapTallyText(text, maxCharsPerLine = 10) {
+  const chars = Array.from(text || '');
+  if (chars.length <= maxCharsPerLine) return [text];
+  const lines = [];
+  for (let i = 0; i < chars.length; i += maxCharsPerLine) {
+    lines.push(chars.slice(i, i + maxCharsPerLine).join(''));
+  }
+  return lines;
+}
+
+function splitTallyByPixelWidth(ctx, text, maxWidth) {
+  const chars = Array.from(text || '');
+  if (!chars.length) return ['-'];
+  const lines = [];
+  let line = '';
+  for (const ch of chars) {
+    const next = line + ch;
+    if (line && ctx.measureText(next).width > maxWidth) {
+      lines.push(line);
+      line = ch;
+    } else {
+      line = next;
+    }
+  }
+  if (line) lines.push(line);
+  return lines.length ? lines : ['-'];
+}
+
+function updateTallyWallTextures() {
+  if (!assets.bunkerWall) return;
+  const total = gameParams?.zombieCount ?? zombieSpawnPlan.length ?? 0;
+  const killed = Math.max(0, score);
+  const remaining = Math.max(0, total - killed);
+  if (killed === tallyWallLastKilled && remaining === tallyWallLastRemaining && assets.bunkerWallWithTally && assets.bunkerWallWithTallyMirrored) return;
+  tallyWallLastKilled = killed;
+  tallyWallLastRemaining = remaining;
+
+  const wallImg = assets.bunkerWall;
+  const w = wallImg.naturalWidth || wallImg.width;
+  const h = wallImg.naturalHeight || wallImg.height;
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const cx = canvas.getContext('2d');
+  cx.drawImage(wallImg, 0, 0);
+  cx.fillStyle = '#fff';
+  const labelKilled = 'Zombies killed:';
+  const labelRemaining = 'Zombies remaining:';
+  const killedText = makeTallyMarks(killed);
+  const remainingText = makeTallyMarks(remaining);
+  const left = Math.floor(w * 0.08);
+  const top = Math.floor(h * 0.08);
+  const maxW = Math.floor(w * 0.84);
+  const maxH = Math.floor(h * 0.84);
+  const sectionGap = Math.floor(h * 0.045);
+  const minTally = 10;
+  let tallySize = Math.max(16, Math.floor(h * 0.19));
+  let titleSize = Math.max(10, Math.floor(tallySize * 0.62));
+  let chosen = null;
+
+  for (; tallySize >= minTally; tallySize--) {
+    titleSize = Math.max(10, Math.floor(tallySize * 0.62));
+    const lineH = Math.max(8, Math.floor(tallySize * 0.78)); // tight spacing
+
+    cx.font = `${titleSize}px Gogozombie`;
+    const labelKilledW = cx.measureText(`${labelKilled} `).width;
+    const labelRemainingW = cx.measureText(`${labelRemaining} `).width;
+
+    cx.font = `${tallySize}px "Tally Mark", Gogozombie, sans-serif`;
+    const killedFirstWidth = Math.max(12, maxW - labelKilledW);
+    const remainingFirstWidth = Math.max(12, maxW - labelRemainingW);
+    const killedLines = splitTallyByPixelWidth(cx, killedText, killedFirstWidth);
+    const remainingLines = splitTallyByPixelWidth(cx, remainingText, remainingFirstWidth);
+    if (killedLines.length > 1) {
+      const rest = splitTallyByPixelWidth(cx, killedLines.slice(1).join(''), maxW);
+      killedLines.splice(1, killedLines.length - 1, ...rest);
+    }
+    if (remainingLines.length > 1) {
+      const rest = splitTallyByPixelWidth(cx, remainingLines.slice(1).join(''), maxW);
+      remainingLines.splice(1, remainingLines.length - 1, ...rest);
+    }
+
+    const sec1H = Math.max(titleSize, lineH * killedLines.length);
+    const sec2H = Math.max(titleSize, lineH * remainingLines.length);
+    const totalH = sec1H + sectionGap + sec2H;
+    if (totalH <= maxH) {
+      chosen = { titleSize, tallySize, lineH, labelKilledW, labelRemainingW, killedLines, remainingLines, sec1H };
+      break;
+    }
+  }
+
+  if (!chosen) {
+    // Fallback: tiny but guaranteed to fit.
+    chosen = {
+      titleSize: 10,
+      tallySize: 10,
+      lineH: 8,
+      labelKilledW: 70,
+      labelRemainingW: 95,
+      killedLines: splitTallyByPixelWidth(cx, killedText, maxW),
+      remainingLines: splitTallyByPixelWidth(cx, remainingText, maxW),
+      sec1H: 24,
+    };
+  }
+
+  cx.textAlign = 'left';
+  cx.textBaseline = 'top';
+  cx.font = `${chosen.titleSize}px Gogozombie`;
+  cx.fillText(labelKilled, left, top);
+  cx.fillText(labelRemaining, left, top + chosen.sec1H + sectionGap);
+
+  cx.font = `${chosen.tallySize}px "Tally Mark", Gogozombie, sans-serif`;
+  for (let i = 0; i < chosen.killedLines.length; i++) {
+    const x = i === 0 ? left + Math.floor(chosen.labelKilledW) : left;
+    const y = top + i * chosen.lineH;
+    cx.fillText(chosen.killedLines[i], x, y);
+  }
+  for (let i = 0; i < chosen.remainingLines.length; i++) {
+    const x = i === 0 ? left + Math.floor(chosen.labelRemainingW) : left;
+    const y = top + chosen.sec1H + sectionGap + i * chosen.lineH;
+    cx.fillText(chosen.remainingLines[i], x, y);
+  }
+  assets.bunkerWallWithTally = canvas;
+
+  const flipped = document.createElement('canvas');
+  flipped.width = w;
+  flipped.height = h;
+  const fx = flipped.getContext('2d');
+  fx.translate(w, 0);
+  fx.scale(-1, 1);
+  fx.drawImage(canvas, 0, 0);
+  assets.bunkerWallWithTallyMirrored = flipped;
+}
+
 function getBunkerWallImageAndData(spriteKey) {
   if (spriteKey === 'window') return { img: assets.bunkerWallWindow, data: assets.bunkerWallWindowData };
   if (spriteKey === 'hole') return { img: assets.bunkerWallHole, data: assets.bunkerWallHoleData };
   if (spriteKey === 'door') return { img: assets.bunkerWallDoor, data: assets.bunkerWallDoorData };
   if (spriteKey === 'wall_ammo') return { img: assets.bunkerWallWithAmmo, data: assets.bunkerWallWithAmmoData };
   if (spriteKey === 'wall_ammo_mirrored') return { img: assets.bunkerWallWithAmmoMirrored, data: assets.bunkerWallWithAmmoMirroredData };
+  if (spriteKey === 'wall_tally') return { img: assets.bunkerWallWithTally || assets.bunkerWall, data: assets.bunkerWallData };
+  if (spriteKey === 'wall_tally_mirrored') return { img: assets.bunkerWallWithTallyMirrored || assets.bunkerWall, data: assets.bunkerWallData };
   return { img: assets.bunkerWall, data: assets.bunkerWallData };
 }
 
@@ -1388,7 +1569,7 @@ function sampleBunkerWallAlpha(segment, u, y) {
   if (!tile) return 255;
   const { data } = getBunkerWallImageAndData(tile.spriteKey);
   if (!data?.width || !data?.height) {
-    return (tile.spriteKey === 'wall' || tile.spriteKey === 'wall_ammo' || tile.spriteKey === 'wall_ammo_mirrored') ? 255 : 0;
+    return (tile.spriteKey === 'wall' || tile.spriteKey === 'wall_ammo' || tile.spriteKey === 'wall_ammo_mirrored' || tile.spriteKey === 'wall_tally' || tile.spriteKey === 'wall_tally_mirrored') ? 255 : 0;
   }
   const tileU = Math.max(0, Math.min(0.999999, (clampedU - tile.minT) / Math.max(tile.maxT - tile.minT, 1e-6)));
   const v = Math.max(0, Math.min(0.999999, 1 - y / BUNKER_WALL_HEIGHT));
@@ -1613,6 +1794,7 @@ async function loadAssets() {
   window.__gameParameters = gameParams;
   window.__gameParametersHash = gameParamsHash;
   console.log(`Game params hash: ${gameParamsHash}`);
+  if (document.fonts?.load) await document.fonts.load('1em "Tally Mark"');
 }
 
 function playShotSound() {
@@ -3066,6 +3248,7 @@ function drawBoards() {
 
 function drawBunkerInterior() {
   if (!bunker) return;
+  updateTallyWallTextures();
 
   const polys = [];
   const backgroundPolys = [];
@@ -3113,11 +3296,12 @@ function drawBunkerInterior() {
     for (const segment of bunkerWallSegments) {
       for (const tile of segment.tiles) {
         let spriteKey = tile.spriteKey;
-        if (tile.spriteKey === 'ammo') {
+        if (tile.spriteKey === 'ammo' || tile.spriteKey === 'wall_tally') {
           // Pick AMMO orientation from interior-facing "right" direction vs segment tangent.
           const interiorRight = { x: segment.inward.z, z: -segment.inward.x };
           const mirrored = (segment.tangent.x * interiorRight.x + segment.tangent.z * interiorRight.z) < 0;
-          spriteKey = mirrored ? 'wall_ammo_mirrored' : 'wall_ammo';
+          if (tile.spriteKey === 'ammo') spriteKey = mirrored ? 'wall_ammo_mirrored' : 'wall_ammo';
+          else spriteKey = mirrored ? 'wall_tally_mirrored' : 'wall_tally';
         }
         pushWallTile(segment, { ...tile, spriteKey });
       }
@@ -3465,6 +3649,20 @@ function drawGameOver() {
   }
 }
 
+function drawVictory() {
+  const elapsed = Math.max(0, performance.now() / 1000 - gameWonAt);
+  const pulse = 0.25 + 0.2 * Math.sin(elapsed * 2.8);
+  ctx.fillStyle = `rgba(20, 70, 35, ${0.62 + pulse * 0.4})`;
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#d9ffd9';
+  ctx.font = `${Math.floor(FONT_SIZE * 1.8)}px ${FONT_FAMILY}`;
+  ctx.textAlign = 'center';
+  ctx.fillText('VICTORY', W / 2, H / 2 - 10);
+  ctx.font = `${Math.floor(FONT_SIZE * 0.7)}px ${FONT_FAMILY}`;
+  ctx.fillText('All zombies defeated', W / 2, H / 2 + 18);
+  ctx.textAlign = 'left';
+}
+
 function draw() {
   drawSky();
   drawHorizonForest();
@@ -3475,11 +3673,9 @@ function draw() {
   drawBunkerInterior();
   drawBoards();
   if (!gameOver && !boardPlaceState) drawRifle(1 / 60);
-  drawScore();
-  drawPositionLabel();
   drawReticule();
-  drawOutOfAmmoMessage();
   if (gameOver) drawGameOver();
+  else if (gameWon) drawVictory();
   else if (!pointerLocked) drawHint();
 }
 
@@ -3495,13 +3691,26 @@ function tick(dt) {
   }
   fallingBoards = fallingBoards.filter((fb) => gameTime < fb.endTime);
   updateParticles(dt);
-  if (!gameOver) {
+  if (!gameOver && !gameWon) {
     while (nextZombiePlanIndex < zombieSpawnPlan.length) {
       const nextPlan = zombieSpawnPlan[nextZombiePlanIndex];
       if (!nextPlan || gameTime < (nextPlan.spawnTime ?? 0)) break;
       spawnZombie();
     }
     updateZombies(dt);
+    const hasPlannedZombies = zombieSpawnPlan.length > 0;
+    if (hasPlannedZombies && nextZombiePlanIndex >= zombieSpawnPlan.length && zombies.length === 0) {
+      gameWon = true;
+      gameWonAt = performance.now() / 1000;
+      if (assets.runningSound) { assets.runningSound.pause(); assets.runningSound.currentTime = 0; }
+      movementStartTime = null;
+      movementPathPoints = [];
+      movementPathLengths = [];
+      movementPathTotalLength = 0;
+      desiredPitch = 0;
+      cameraPitch = 0;
+      ironSightsHeld = false;
+    }
   }
   const activeSlot = getCurrentBunkerSlot();
   const peek = getPeekOffsetForSlot(activeSlot);
@@ -3564,7 +3773,7 @@ function playBoardBreakSound() {
 }
 
 canvas.addEventListener('click', (e) => {
-  if (gameOver) return;
+  if (gameOver || gameWon) return;
   if (boardPlaceState) return;
   if (!pointerLocked) {
     canvas.requestPointerLock();
@@ -3678,7 +3887,7 @@ canvas.addEventListener('mousemove', (e) => {
 });
 
 document.addEventListener('keydown', (e) => {
-  if (gameOver) return;
+  if (gameOver || gameWon) return;
   if (boardPlaceState) return;
   if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
     ironSightsHeld = true;
