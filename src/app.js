@@ -109,7 +109,7 @@ const BUNKER_CRATE_HEIGHT = 1.15;
 const BUNKER_CRATE_DEPTH = 0.95;
 const BOARDS_PER_WINDOW = 3;
 const BOARD_PLACE_DURATION = 2.5;
-const BOARD_ATTACK_DURATION = 2;
+const BOARD_ATTACK_DURATION = 5;
 const BOARD_BREACH_DELAY = 2;
 const BOARD_AT_WINDOW_DIST = 0.8;
 const BOARD_TILT_MAX = 0.12;          // max tilt in rad (~7°) so boards stay horizontal
@@ -170,9 +170,8 @@ const ZOMBIE_DAMAGE_BODY = 1;
 const ZOMBIE_DAMAGE_HEAD = 3;
 
 // Spawn: start far away; they walk toward player
-const SPAWN_MIN_DIST = 28;
-const SPAWN_MAX_DIST = 55;
-const SPAWN_DELAY = 520;
+const SPAWN_MIN_DIST = 38;
+const SPAWN_MAX_DIST = 70;
 const MAX_ZOMBIES = 20;
 const ZOMBIE_SPEED = 0.35;       // world units/sec (average); each zombie has speedMult for variation
 const ZOMBIE_ZIGZAG = 0.5;      // lateral sway (world units)
@@ -185,6 +184,14 @@ const ZOMBIE_DIR_CHANGE_CHANCE = 0.35; // probability to flip direction when thr
 const GAME_OVER_FLASH_DURATION = 0.6;
 const GAME_OVER_FACE_DURATION = 2;  // seconds of zombie face + red tint before showing "game over" text
 const ZOMBIE_SOUND_INTERVAL = 4;      // seconds between groans; deterministic from spawnIndex/spawnTime
+const GAME_PARAM_SEED = 13371337;
+const GAME_PARAM_WAVE_COUNT = 6;
+const WAVE_FIRST_SIZE = 4;
+const WAVE_SIZE_GROWTH = 3;
+const WAVE_SPAWN_INTERVAL = 1.35;
+const WAVE_GAP_SECONDS = 4.2;
+const ZOMBIE_MIN_PATH_LENGTH = 34;
+const TREE_BLOCK_RADIUS = 0.9;
 
 let assets = {};
 let score = 0;
@@ -195,7 +202,8 @@ let shotsInClip = RIFLE_CLIP_SIZE;
 let clipsCarried = MAX_CLIPS;
 let outOfAmmoMessageTime = 0;
 let zombies = [];  // { x, y, z } in world space
-let spawnTimer = 0;
+let zombieSpawnPlan = [];
+let nextZombiePlanIndex = 0;
 let pointerLocked = false;
 let gameOver = false;
 let gameOverFlashStart = 0;
@@ -206,6 +214,8 @@ let gameTime = 0;        // seconds since start (for deterministic zombie sounds
 let spawnCounter = 0;    // increments per spawn so each zombie has a stable spawnIndex
 let fogWispSprites = [];
 let fogWispPositions = [];
+let gameParams = null;
+let gameParamsHash = '';
 
 // Aiming: desired direction (reticule leads), camera chases with delay — turn any direction
 let desiredYaw = 0;
@@ -384,15 +394,14 @@ function generateFogWisps() {
 }
 
 function generateTrees() {
-  function seeded(initial) {
-    let s = initial;
-    return () => {
-      s = (s * 1103515245 + 12345) >>> 0;
-      return s / 0x100000000;
-    };
-  }
-  const rng = seeded(99999);
   trees = [];
+  if (gameParams?.trees?.length) {
+    for (const t of gameParams.trees) {
+      trees.push({ x: t.x, z: t.z, spriteIndex: t.spriteIndex, hp: TREE_HP });
+    }
+    return;
+  }
+  const rng = createSeededRng(GAME_PARAM_SEED);
   for (let i = 0; i < TREE_COUNT; i++) {
     const dist = TREE_MIN_DIST + rng() * (TREE_MAX_DIST - TREE_MIN_DIST);
     const angle = rng() * Math.PI * 2;
@@ -420,7 +429,7 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
   bunkerWallSegments = [];
 
   function normalizeSpriteKey(key) {
-    if (key === 'window' || key === 'door' || key === 'hole' || key === 'wall_ammo' || key === 'ammo') return key;
+    if (key === 'window' || key === 'door' || key === 'hole' || key === 'wall_ammo' || key === 'wall_ammo_mirrored' || key === 'ammo') return key;
     return 'wall';
   }
   function yawFromDir(x, z) {
@@ -934,6 +943,278 @@ function initWindowBoards() {
   }
 }
 
+function createSeededRng(seed) {
+  let s = (seed >>> 0) || 1;
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 0x100000000;
+  };
+}
+
+function stableStringify(value) {
+  if (value == null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((v) => stableStringify(v)).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+}
+
+function hashStringFNV1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+function distancePointToSegment(px, pz, ax, az, bx, bz) {
+  const abx = bx - ax;
+  const abz = bz - az;
+  const lenSq = abx * abx + abz * abz;
+  if (lenSq <= 1e-8) return Math.hypot(px - ax, pz - az);
+  const t = Math.max(0, Math.min(1, ((px - ax) * abx + (pz - az) * abz) / lenSq));
+  const qx = ax + abx * t;
+  const qz = az + abz * t;
+  return Math.hypot(px - qx, pz - qz);
+}
+
+function isPointInsidePolygon(x, z, corners) {
+  let inside = false;
+  for (let i = 0, j = corners.length - 1; i < corners.length; j = i++) {
+    const xi = corners[i].x;
+    const zi = corners[i].z;
+    const xj = corners[j].x;
+    const zj = corners[j].z;
+    const intersects = ((zi > z) !== (zj > z))
+      && (x < ((xj - xi) * (z - zi)) / Math.max(1e-8, (zj - zi)) + xi);
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+function isPathSegmentBlocked(ax, az, bx, bz, y, treeList, allowTouchAtEnd = false) {
+  if (isPointInsidePolygon(ax, az, bunker.corners) || isPointInsidePolygon(bx, bz, bunker.corners)) return true;
+  const segLen = Math.hypot(bx - ax, bz - az);
+  if (segLen <= 1e-6) return false;
+  // block on trees
+  for (const t of treeList) {
+    if (distancePointToSegment(t.x, t.z, ax, az, bx, bz) < TREE_BLOCK_RADIUS) return true;
+  }
+  // block on bunker walls
+  const EPS = 1e-5;
+  const cross2 = (ux, uz, vx, vz) => ux * vz - uz * vx;
+  const rX = bx - ax;
+  const rZ = bz - az;
+  for (const segment of bunkerWallSegments) {
+    const sX = segment.b.x - segment.a.x;
+    const sZ = segment.b.z - segment.a.z;
+    const rxs = cross2(rX, rZ, sX, sZ);
+    if (Math.abs(rxs) < EPS) continue;
+    const qmpX = segment.a.x - ax;
+    const qmpZ = segment.a.z - az;
+    const t = cross2(qmpX, qmpZ, sX, sZ) / rxs;
+    const u = cross2(qmpX, qmpZ, rX, rZ) / rxs;
+    const maxT = allowTouchAtEnd ? 1.0 - 0.001 : 0.999;
+    if (t <= 0.001 || t >= maxT || u < -EPS || u > 1 + EPS) continue;
+    if (y <= 0 || y >= BUNKER_WALL_HEIGHT) continue;
+    const alpha = sampleBunkerWallAlpha(segment, Math.max(0, Math.min(1, u)), y);
+    if (alpha > BUNKER_WALL_ALPHA_PASS_THRESHOLD) return true;
+  }
+  return false;
+}
+
+function pathLength(points) {
+  let total = 0;
+  for (let i = 1; i < points.length; i++) total += Math.hypot(points[i].x - points[i - 1].x, points[i].z - points[i - 1].z);
+  return total;
+}
+
+function choosePathForZombie(start, target, rng, treeList) {
+  const targetPt = { x: target.x, z: target.z };
+  const direct = [start, targetPt];
+  const choices = [];
+  if (!isPathSegmentBlocked(start.x, start.z, targetPt.x, targetPt.z, CAMERA_Y, treeList, true)) {
+    choices.push({ style: 'direct', points: direct });
+  }
+
+  // Around-bunker routes using inset corners
+  const cornerPts = bunker.corners.map((c, i) => {
+    const n1 = bunkerWallSegments[(i - 1 + bunkerWallSegments.length) % bunkerWallSegments.length]?.inward ?? { x: 0, z: 0 };
+    const n2 = bunkerWallSegments[i]?.inward ?? { x: 0, z: 0 };
+    return { x: c.x + (n1.x + n2.x) * BUNKER_WALL_INSET * 0.8, z: c.z + (n1.z + n2.z) * BUNKER_WALL_INSET * 0.8 };
+  });
+  function nearestCornerIndex(p) {
+    let best = 0;
+    let bestD = Infinity;
+    for (let i = 0; i < cornerPts.length; i++) {
+      const d = Math.hypot(p.x - cornerPts[i].x, p.z - cornerPts[i].z);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+  }
+  const ciStart = nearestCornerIndex(start);
+  const ciEnd = nearestCornerIndex(targetPt);
+  for (const dir of [1, -1]) {
+    const pts = [start];
+    let i = ciStart;
+    let safety = 0;
+    while (i !== ciEnd && safety++ < cornerPts.length + 2) {
+      i = (i + dir + cornerPts.length) % cornerPts.length;
+      pts.push(cornerPts[i]);
+    }
+    pts.push(targetPt);
+    let ok = true;
+    for (let p = 1; p < pts.length; p++) {
+      if (isPathSegmentBlocked(pts[p - 1].x, pts[p - 1].z, pts[p].x, pts[p].z, CAMERA_Y, treeList, p === pts.length - 1)) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) choices.push({ style: dir > 0 ? 'around_cw' : 'around_ccw', points: pts });
+  }
+
+  // Zigzag: one random mid waypoint offset from direct line
+  const dx = targetPt.x - start.x;
+  const dz = targetPt.z - start.z;
+  const d = Math.hypot(dx, dz);
+  if (d > 1) {
+    const ux = dx / d;
+    const uz = dz / d;
+    const px = -uz;
+    const pz = ux;
+    const midT = 0.35 + rng() * 0.3;
+    const bend = (rng() < 0.5 ? -1 : 1) * (2.5 + rng() * 4.0);
+    const mid = { x: start.x + dx * midT + px * bend, z: start.z + dz * midT + pz * bend };
+    const zz = [start, mid, targetPt];
+    let ok = !isPathSegmentBlocked(start.x, start.z, mid.x, mid.z, CAMERA_Y, treeList, false)
+      && !isPathSegmentBlocked(mid.x, mid.z, targetPt.x, targetPt.z, CAMERA_Y, treeList, true);
+    if (ok) choices.push({ style: 'zigzag', points: zz });
+  }
+
+  if (!choices.length) return { style: 'direct', points: direct };
+  return choices[Math.floor(rng() * choices.length)];
+}
+
+function generateGameParameters(seed = GAME_PARAM_SEED, waveCount = GAME_PARAM_WAVE_COUNT) {
+  const rng = createSeededRng(seed);
+  const params = {
+    version: 1,
+    seed,
+    waveCount,
+    bunker: {
+      corners: (bunker.corners ?? []).map((c) => ({ x: +c.x.toFixed(3), z: +c.z.toFixed(3) })),
+      segments: bunkerWallSegments.map((s) => ({
+        index: s.index,
+        tiles: s.tiles.map((t) => t.spriteKey),
+      })),
+    },
+    trees: [],
+    zombies: [],
+  };
+
+  // trees from seed
+  for (let i = 0; i < TREE_COUNT; i++) {
+    let placed = false;
+    for (let tries = 0; tries < 80 && !placed; tries++) {
+      const dist = TREE_MIN_DIST + rng() * (TREE_MAX_DIST - TREE_MIN_DIST);
+      const angle = rng() * Math.PI * 2;
+      const x = WORLD_CENTER_X + Math.cos(angle) * dist;
+      const z = WORLD_CENTER_Z + Math.sin(angle) * dist;
+      if (isPointInsidePolygon(x, z, bunker.corners)) continue;
+      if (params.trees.some((t) => Math.hypot(t.x - x, t.z - z) < TREE_BLOCK_RADIUS * 2.5)) continue;
+      params.trees.push({ x: +x.toFixed(3), z: +z.toFixed(3), spriteIndex: Math.floor(rng() * 14), hp: TREE_HP });
+      placed = true;
+    }
+  }
+
+  let tSpawn = 0;
+  let spawnIdx = 0;
+  const windowSlots = getWindowSlots();
+  const treeList = params.trees.map((t) => ({ x: t.x, z: t.z }));
+  for (let wave = 0; wave < waveCount; wave++) {
+    const waveSize = WAVE_FIRST_SIZE + wave * WAVE_SIZE_GROWTH;
+    for (let n = 0; n < waveSize; n++) {
+      let targetSlot = windowSlots.length ? windowSlots[(spawnIdx + n) % windowSlots.length] : null;
+      if (!targetSlot) continue;
+      const target = getZombieWindowTarget(targetSlot);
+      const targetNormal = targetSlot.normal ?? { x: 0, z: 1 }; // inward
+      const approach = { x: target.x - targetNormal.x * 3.8, z: target.z - targetNormal.z * 3.8 };
+      let start = null;
+      let planned = null;
+      for (let tries = 0; tries < 160; tries++) {
+        const angle = rng() * Math.PI * 2;
+        const dist = SPAWN_MIN_DIST + rng() * (SPAWN_MAX_DIST - SPAWN_MIN_DIST);
+        const sx = WORLD_CENTER_X + Math.cos(angle) * dist;
+        const sz = WORLD_CENTER_Z + Math.sin(angle) * dist;
+        if (isPointInsidePolygon(sx, sz, bunker.corners)) continue;
+        if (treeList.some((tt) => Math.hypot(tt.x - sx, tt.z - sz) < TREE_BLOCK_RADIUS * 1.2)) continue;
+        const path = choosePathForZombie({ x: sx, z: sz }, approach, rng, treeList);
+        const pathWithFinal = { style: path.style, points: [...path.points, target] };
+        const last = pathWithFinal.points.length - 1;
+        if (last < 1) continue;
+        if (isPathSegmentBlocked(
+          pathWithFinal.points[last - 1].x,
+          pathWithFinal.points[last - 1].z,
+          pathWithFinal.points[last].x,
+          pathWithFinal.points[last].z,
+          CAMERA_Y,
+          treeList,
+          true,
+        )) continue;
+        const plen = pathLength(pathWithFinal.points);
+        if (plen < ZOMBIE_MIN_PATH_LENGTH) continue;
+        start = { x: sx, z: sz };
+        planned = pathWithFinal;
+        break;
+      }
+      if (!start || !planned) {
+        const sx = target.x - targetNormal.x * (SPAWN_MAX_DIST + 8);
+        const sz = target.z - targetNormal.z * (SPAWN_MAX_DIST + 8);
+        const fallback = [{ x: sx, z: sz }, approach, target];
+        let ok = true;
+        for (let pIdx = 1; pIdx < fallback.length; pIdx++) {
+          if (isPathSegmentBlocked(
+            fallback[pIdx - 1].x, fallback[pIdx - 1].z,
+            fallback[pIdx].x, fallback[pIdx].z,
+            CAMERA_Y, treeList, pIdx === fallback.length - 1,
+          )) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok && pathLength(fallback) >= ZOMBIE_MIN_PATH_LENGTH) {
+          start = { x: sx, z: sz };
+          planned = { style: 'fallback', points: fallback };
+        }
+      }
+      if (!start || !planned) continue;
+      const speedMult = 0.72 + rng() * 0.58;
+      const walkPhase = rng() * Math.PI * 2;
+      const spriteIndex = Math.floor(rng() * Math.max(1, assets.zombieSprites.length));
+      params.zombies.push({
+        id: spawnIdx,
+        wave,
+        spawnTime: +tSpawn.toFixed(3),
+        speedMult: +speedMult.toFixed(4),
+        walkPhase: +walkPhase.toFixed(4),
+        spriteIndex,
+        targetSlotKey: getSlotKey(targetSlot),
+        targetWindowX: +target.x.toFixed(3),
+        targetWindowZ: +target.z.toFixed(3),
+        pathStyle: planned.style,
+        path: planned.points.map((p) => ({ x: +p.x.toFixed(3), z: +p.z.toFixed(3) })),
+      });
+      tSpawn += WAVE_SPAWN_INTERVAL;
+      spawnIdx++;
+    }
+    tSpawn += WAVE_GAP_SECONDS;
+  }
+
+  params.zombieCount = params.zombies.length;
+  const hashInput = stableStringify(params);
+  return { params, hash: hashStringFNV1a(hashInput) };
+}
+
 function worldToView(wx, wy, wz) {
   const dx = wx - cameraX;
   const dy = wy - CAMERA_Y;
@@ -1060,8 +1341,8 @@ function getShotDirection(px, py) {
   return { x: dir.x / len, y: dir.y / len, z: dir.z / len };
 }
 
-/** Draw "AMMO" + down arrow onto a wall texture so the label appears on the wall above the crate. */
-function createWallTextureWithAmmoLabel(wallImg) {
+/** Draw "AMMO" + down arrow onto a wall texture; mirrored variant is used on reversed UV segments. */
+function createWallTextureWithAmmoLabel(wallImg, mirrored = false) {
   if (!wallImg?.width && !wallImg?.naturalWidth) return wallImg;
   const w = wallImg.naturalWidth || wallImg.width;
   const h = wallImg.naturalHeight || wallImg.height;
@@ -1077,8 +1358,7 @@ function createWallTextureWithAmmoLabel(wallImg) {
   ctx.fillStyle = '#fff';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'bottom';
-  // West-wall UV is mirrored; writing reversed text renders as "AMMO" in-world.
-  ctx.fillText('OMMA', cx, labelY);
+  ctx.fillText(mirrored ? 'OMMA' : 'AMMO', cx, labelY);
   const arrowTop = labelY + 4;
   const arrowTip = labelY + 4 + Math.floor(fontSize * 0.6);
   ctx.beginPath();
@@ -1096,6 +1376,7 @@ function getBunkerWallImageAndData(spriteKey) {
   if (spriteKey === 'hole') return { img: assets.bunkerWallHole, data: assets.bunkerWallHoleData };
   if (spriteKey === 'door') return { img: assets.bunkerWallDoor, data: assets.bunkerWallDoorData };
   if (spriteKey === 'wall_ammo') return { img: assets.bunkerWallWithAmmo, data: assets.bunkerWallWithAmmoData };
+  if (spriteKey === 'wall_ammo_mirrored') return { img: assets.bunkerWallWithAmmoMirrored, data: assets.bunkerWallWithAmmoMirroredData };
   return { img: assets.bunkerWall, data: assets.bunkerWallData };
 }
 
@@ -1107,7 +1388,7 @@ function sampleBunkerWallAlpha(segment, u, y) {
   if (!tile) return 255;
   const { data } = getBunkerWallImageAndData(tile.spriteKey);
   if (!data?.width || !data?.height) {
-    return (tile.spriteKey === 'wall' || tile.spriteKey === 'wall_ammo') ? 255 : 0;
+    return (tile.spriteKey === 'wall' || tile.spriteKey === 'wall_ammo' || tile.spriteKey === 'wall_ammo_mirrored') ? 255 : 0;
   }
   const tileU = Math.max(0, Math.min(0.999999, (clampedU - tile.minT) / Math.max(tile.maxT - tile.minT, 1e-6)));
   const v = Math.max(0, Math.min(0.999999, 1 - y / BUNKER_WALL_HEIGHT));
@@ -1269,12 +1550,14 @@ async function loadAssets() {
   assets.bunkerWallHole = await loadImage(`${base}/bunker/wall_with_hole.png`);
   assets.bunkerWallDoor = await loadImage(`${base}/bunker/wall_with_door.png`);
   if (document.fonts?.load) await document.fonts.load('1em Gogozombie');
-  assets.bunkerWallWithAmmo = createWallTextureWithAmmoLabel(assets.bunkerWall) || assets.bunkerWall;
+  assets.bunkerWallWithAmmo = createWallTextureWithAmmoLabel(assets.bunkerWall, false) || assets.bunkerWall;
+  assets.bunkerWallWithAmmoMirrored = createWallTextureWithAmmoLabel(assets.bunkerWall, true) || assets.bunkerWall;
   assets.bunkerWallData = imageDataFromImage(assets.bunkerWall);
   assets.bunkerWallWindowData = imageDataFromImage(assets.bunkerWallWindow);
   assets.bunkerWallHoleData = imageDataFromImage(assets.bunkerWallHole);
   assets.bunkerWallDoorData = imageDataFromImage(assets.bunkerWallDoor);
   assets.bunkerWallWithAmmoData = imageDataFromImage(assets.bunkerWallWithAmmo);
+  assets.bunkerWallWithAmmoMirroredData = imageDataFromImage(assets.bunkerWallWithAmmoMirrored);
   assets.board = await loadImage(`${base}/bunker/board.png`);
   assets.crateSpriteSheet = await loadImage(`${base}/bunker/crate_sprite_sheet.png`);
   assets.hammerSound = new Audio('assets/sfx/clean/hammer_nails.ogg');
@@ -1320,7 +1603,16 @@ async function loadAssets() {
   assets.zombieSoundPaths = ZOMBIE_SOUND_NAMES.map((n) => `${base}/sfx/clean/${n}.ogg`);
   assets.zombieFemaleSoundPaths = ZOMBIE_FEMALE_SOUND_NAMES.map((n) => `${base}/sfx/clean/${n}.ogg`);
   generateFogWisps();
+  const planned = generateGameParameters(GAME_PARAM_SEED, GAME_PARAM_WAVE_COUNT);
+  gameParams = planned.params;
+  gameParamsHash = planned.hash;
+  zombieSpawnPlan = gameParams.zombies ?? [];
+  nextZombiePlanIndex = 0;
+  spawnCounter = 0;
   generateTrees();
+  window.__gameParameters = gameParams;
+  window.__gameParametersHash = gameParamsHash;
+  console.log(`Game params hash: ${gameParamsHash}`);
 }
 
 function playShotSound() {
@@ -1436,39 +1728,50 @@ function createPositionalGraph(worldX, worldZ) {
 // ---- Zombies ----
 
 function spawnZombie() {
-  if (zombies.length >= MAX_ZOMBIES) return;
-  const angle = Math.random() * Math.PI * 2;
-  const dist = SPAWN_MIN_DIST + Math.random() * (SPAWN_MAX_DIST - SPAWN_MIN_DIST);
-  const x = WORLD_CENTER_X + Math.cos(angle) * dist;
-  const z = WORLD_CENTER_Z + Math.sin(angle) * dist;
-  const targetSlot = chooseZombieTargetSlot(x, z);
-  const target = getZombieWindowTarget(targetSlot);
+  if (nextZombiePlanIndex >= zombieSpawnPlan.length) return;
+  const p = zombieSpawnPlan[nextZombiePlanIndex];
+  if (!p || gameTime < (p.spawnTime ?? 0)) return;
+  nextZombiePlanIndex++;
+
+  const pathPoints = (p.path ?? []).map((q) => ({ x: q.x, z: q.z }));
+  if (pathPoints.length < 2) return;
+  const pathLengths = [0];
+  let pathTotal = 0;
+  for (let i = 1; i < pathPoints.length; i++) {
+    pathTotal += Math.hypot(pathPoints[i].x - pathPoints[i - 1].x, pathPoints[i].z - pathPoints[i - 1].z);
+    pathLengths.push(pathTotal);
+  }
+  const x = pathPoints[0].x;
+  const z = pathPoints[0].z;
+  const targetSlot = bunkerSlots.find((s) => getSlotKey(s) === p.targetSlotKey) || chooseZombieTargetSlot(x, z);
+  const target = { x: p.targetWindowX, z: p.targetWindowZ };
   const sprite = assets.zombieSprites.length > 0
-    ? assets.zombieSprites[Math.floor(Math.random() * assets.zombieSprites.length)]
+    ? assets.zombieSprites[(p.spriteIndex ?? 0) % assets.zombieSprites.length]
     : assets.zombie;
   const spawnIndex = spawnCounter++;
   const spawnTime = gameTime;
   const useFemaleSounds = sprite === assets.zombieFemaleGhoul;
   const paths = useFemaleSounds ? assets.zombieFemaleSoundPaths : assets.zombieSoundPaths;
   const numPaths = paths?.length ?? 0;
-  const speedMult = 0.7 + Math.random() * 0.6;
   zombies.push({
     x, y: 0, z, hp: ZOMBIE_HP_MAX,
-    walkPhase: Math.random() * Math.PI * 2,
-    walkDir: Math.random() < 0.5 ? 1 : -1,
-    distanceWalked: 0,
+    walkPhase: p.walkPhase ?? 0,
     targetSlot,
     targetSide: targetSlot?.side ?? null,
     targetWindowX: target.x,
     targetWindowZ: target.z,
-    speedMult,
+    speedMult: p.speedMult ?? 1,
     sprite,
     spriteW: sprite?.naturalWidth ?? ZOMBIE_SPRITE_W,
     spriteH: sprite?.naturalHeight ?? ZOMBIE_SPRITE_H,
     spawnIndex,
     spawnTime,
-    lastSoundN: 0,   // 0 = played on spawn; next at n=1, 2, ...
+    lastSoundN: 0,
     useFemaleSounds,
+    pathPoints,
+    pathLengths,
+    pathTotal,
+    pathDist: 0,
   });
   if (numPaths > 0) {
     const which = spawnIndex % numPaths;
@@ -1555,21 +1858,25 @@ function updateZombies(dt) {
       continue;
     }
 
-    const ux = dx / d;
-    const uz = dz / d;
-    const perpX = -uz;
-    const perpZ = ux;
-    const walkDir = z.walkDir ?? 1;
-    const zigzag = walkDir * Math.sin(z.walkPhase * ZOMBIE_ZIGZAG_SPEED) * ZOMBIE_ZIGZAG;
     const speed = ZOMBIE_SPEED * (z.speedMult ?? 1);
-    const vx = (ux * speed + perpX * zigzag) * dt;
-    const vz = (uz * speed + perpZ * zigzag) * dt;
-    z.x += vx;
-    z.z += vz;
-    z.distanceWalked = (z.distanceWalked ?? 0) + Math.sqrt(vx * vx + vz * vz);
-    if (z.distanceWalked >= ZOMBIE_DIR_CHANGE_DIST && Math.random() < ZOMBIE_DIR_CHANGE_CHANCE) {
-      z.walkDir = -walkDir;
-      z.distanceWalked = 0;
+    if (z.pathPoints?.length >= 2 && z.pathTotal > 1e-6) {
+      z.pathDist = Math.min(z.pathTotal, (z.pathDist ?? 0) + speed * dt);
+      const distAlong = z.pathDist;
+      let segIndex = 1;
+      while (segIndex < z.pathLengths.length && distAlong > z.pathLengths[segIndex]) segIndex++;
+      segIndex = Math.min(segIndex, z.pathLengths.length - 1);
+      const prevLen = z.pathLengths[segIndex - 1];
+      const segLen = Math.max(1e-6, z.pathLengths[segIndex] - prevLen);
+      const t = (distAlong - prevLen) / segLen;
+      const a = z.pathPoints[segIndex - 1];
+      const b = z.pathPoints[segIndex];
+      z.x = a.x + (b.x - a.x) * t;
+      z.z = a.z + (b.z - a.z) * t;
+    } else {
+      const ux = dx / d;
+      const uz = dz / d;
+      z.x += ux * speed * dt;
+      z.z += uz * speed * dt;
     }
   }
 }
@@ -1807,7 +2114,6 @@ function damageZombie(idx, hitPx, hitPy) {
     spawnDeathParticles(z, info);
     zombies.splice(idx, 1);
     score += 1;
-    spawnTimer = 0;
   } else {
     if (!z.holes) z.holes = [];
     z.holes.push({ tx: hitTx, ty: hitTy, jaggedRadii });
@@ -2806,7 +3112,13 @@ function drawBunkerInterior() {
   function addWallSegments() {
     for (const segment of bunkerWallSegments) {
       for (const tile of segment.tiles) {
-        const spriteKey = tile.spriteKey === 'ammo' ? 'wall_ammo' : tile.spriteKey;
+        let spriteKey = tile.spriteKey;
+        if (tile.spriteKey === 'ammo') {
+          // Pick AMMO orientation from interior-facing "right" direction vs segment tangent.
+          const interiorRight = { x: segment.inward.z, z: -segment.inward.x };
+          const mirrored = (segment.tangent.x * interiorRight.x + segment.tangent.z * interiorRight.z) < 0;
+          spriteKey = mirrored ? 'wall_ammo_mirrored' : 'wall_ammo';
+        }
         pushWallTile(segment, { ...tile, spriteKey });
       }
     }
@@ -3184,8 +3496,11 @@ function tick(dt) {
   fallingBoards = fallingBoards.filter((fb) => gameTime < fb.endTime);
   updateParticles(dt);
   if (!gameOver) {
-    spawnTimer += 1;
-    if (spawnTimer >= SPAWN_DELAY) spawnZombie();
+    while (nextZombiePlanIndex < zombieSpawnPlan.length) {
+      const nextPlan = zombieSpawnPlan[nextZombiePlanIndex];
+      if (!nextPlan || gameTime < (nextPlan.spawnTime ?? 0)) break;
+      spawnZombie();
+    }
     updateZombies(dt);
   }
   const activeSlot = getCurrentBunkerSlot();
