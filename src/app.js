@@ -28,6 +28,9 @@ let movementStartX = 0;
 let movementStartZ = 0;
 let movementEndX = 0;
 let movementEndZ = 0;
+let movementPathPoints = [];
+let movementPathLengths = [];
+let movementPathTotalLength = 0;
 let cameraYaw = 0;   // left-right (rotation around Y)
 let cameraPitch = 0; // up-down
 
@@ -55,8 +58,26 @@ const FOG_WISP_REF_DEPTH = 25;  // reference depth for screen size
 const FOG_WISP_BASE_ALPHA = 0.18;
 const FOG_WISP_ROT_SPEED = 0.026;  // rad/sec; each wisp gets ± this (clockwise vs counterclockwise)
 
-// Bunker: generate a rectangular ring of discrete standing positions.
-const BUNKER_LAYOUT = { north: 3, east: 2, south: 3, west: 2 };
+// Bunker: arbitrary polygon defined in wall-tile units.
+// Each edge gets one sprite key per 1-tile segment.
+const BUNKER_LAYOUT = {
+  unitCorners: [
+    { x: -6, z: -4 },
+    { x: 4, z: -4 },
+    { x: 4, z: -1 },
+    { x: 1, z: -1 },
+    { x: 1, z: 4 },
+    { x: -6, z: 4 },
+  ],
+  segmentTiles: [
+    ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
+    ['wall', 'window', 'wall'],
+    ['wall', 'door', 'wall'],
+    ['wall', 'window', 'wall', 'window', 'wall'],
+    ['wall', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
+    ['wall', 'ammo', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
+  ],
+};
 const BUNKER_SLOT_SPACING = 4.5;
 const BUNKER_WALL_INSET = 2.8;
 const BUNKER_MOVE_LERP = 10;
@@ -99,6 +120,7 @@ const BOARD_FALL_DURATION = 1.5;      // seconds for board to fall when broken
 let bunker = null;
 let bunkerSlots = [];
 let bunkerWallTiles = { north: [], east: [], south: [], west: [] };
+let bunkerWallSegments = [];
 let bunkerTileWorldWidth = BUNKER_SLOT_SPACING;
 let activeSlotIndex = 0;
 let windowBoards = {};  // slotKey -> number of boards on window (0–3); floor has remainder
@@ -382,103 +404,130 @@ function generateTrees() {
 }
 
 function generateBunkerLayout(layout = BUNKER_LAYOUT) {
-  const slots = [];
   const wallAspect = assets.bunkerWall?.naturalWidth && assets.bunkerWall?.naturalHeight
     ? assets.bunkerWall.naturalWidth / assets.bunkerWall.naturalHeight
     : 1;
   bunkerTileWorldWidth = BUNKER_WALL_HEIGHT * wallAspect * BUNKER_WALL_TILE_SCALE;
-  const baseTilesX = Math.max(layout.north, layout.south, 1);
-  const baseTilesZ = Math.max(layout.east, layout.west, 1);
-  const gap = Math.max(0, BUNKER_INTER_STATION_WALL_TILES);
-  const corner = Math.max(0, BUNKER_CORNER_WALL_TILES);
-  const tilesX = 2 * corner + baseTilesX + Math.max(0, baseTilesX - 1) * gap;
-  const tilesZ = 2 * corner + baseTilesZ + Math.max(0, baseTilesZ - 1) * gap;
-  const halfW = (tilesX * bunkerTileWorldWidth) / 2;
-  const halfD = (tilesZ * bunkerTileWorldWidth) / 2;
-  const sideCounts = { north: tilesX, east: tilesZ, south: tilesX, west: tilesZ };
+  const unitCorners = Array.isArray(layout.unitCorners) && layout.unitCorners.length >= 3
+    ? layout.unitCorners
+    : [{ x: -3, z: -2 }, { x: 3, z: -2 }, { x: 3, z: 2 }, { x: -3, z: 2 }];
+  const corners = unitCorners.map((p) => ({
+    x: WORLD_CENTER_X + p.x * bunkerTileWorldWidth,
+    z: WORLD_CENTER_Z + p.z * bunkerTileWorldWidth,
+  }));
+  const slots = [];
   bunkerWallTiles = { north: [], east: [], south: [], west: [] };
+  bunkerWallSegments = [];
 
-  function spriteKeyForTile(side, i, count) {
-    if (i < corner || i >= count - corner) return 'wall';
-    const step = gap + 1;
-    const innerIndex = i - corner;
-    if (step > 1 && (innerIndex % step) !== 0) return 'wall';
-    const compactIndex = Math.floor(innerIndex / step);
-    const baseCount = Math.max(0, layout[side] ?? 0);
-    if (baseCount === 0 || compactIndex >= baseCount) return 'wall';
-    const center = Math.floor((baseCount - 1) / 2);
-    if (side === BUNKER_EMPTY_WALL_SIDE) return 'wall';
-    if (side === BUNKER_CRATE_SIDE && compactIndex === center) return 'door';
-    if (side === 'east' && compactIndex === center) return 'hole';
-    if (baseCount <= 1) return 'window';
-    if (baseCount === 2) return compactIndex === 0 ? 'window' : 'wall';
-    return compactIndex % 2 === 0 ? 'window' : 'wall';
+  function normalizeSpriteKey(key) {
+    if (key === 'window' || key === 'door' || key === 'hole' || key === 'wall_ammo' || key === 'ammo') return key;
+    return 'wall';
+  }
+  function yawFromDir(x, z) {
+    return Math.atan2(x, -z);
   }
 
-  for (const side of ['north', 'east', 'south', 'west']) {
-    const count = sideCounts[side];
-    const rangeMin = side === 'north' || side === 'south' ? WORLD_CENTER_X - halfW : WORLD_CENTER_Z - halfD;
-    for (let i = 0; i < count; i++) {
-      const min = rangeMin + i * bunkerTileWorldWidth;
-      const max = min + bunkerTileWorldWidth;
-      bunkerWallTiles[side].push({ side, sideIndex: i, min, max, spriteKey: spriteKeyForTile(side, i, count) });
+  let signedArea2 = 0;
+  for (let i = 0; i < corners.length; i++) {
+    const a = corners[i];
+    const b = corners[(i + 1) % corners.length];
+    signedArea2 += a.x * b.z - b.x * a.z;
+  }
+  const isCCW = signedArea2 > 0;
+
+  for (let i = 0; i < corners.length; i++) {
+    const a = corners[i];
+    const b = corners[(i + 1) % corners.length];
+    const dx = b.x - a.x;
+    const dz = b.z - a.z;
+    const len = Math.hypot(dx, dz);
+    if (len <= 1e-6) continue;
+    const count = Math.max(1, Math.round(len / bunkerTileWorldWidth));
+    const tx = dx / len;
+    const tz = dz / len;
+    const inward = isCCW ? { x: -tz, z: tx } : { x: tz, z: -tx };
+    const segment = {
+      index: bunkerWallSegments.length,
+      a,
+      b,
+      tangent: { x: tx, z: tz },
+      inward,
+      length: len,
+      tiles: [],
+    };
+    const tileKeys = Array.isArray(layout.segmentTiles?.[i]) ? layout.segmentTiles[i] : [];
+    for (let j = 0; j < count; j++) {
+      const t0 = j / count;
+      const t1 = (j + 1) / count;
+      const tc = (t0 + t1) / 2;
+      const cx = a.x + dx * tc;
+      const cz = a.z + dz * tc;
+      const spriteKey = normalizeSpriteKey(tileKeys[j] ?? 'wall');
+      const tile = {
+        segmentIndex: segment.index,
+        tileIndex: j,
+        minT: t0,
+        maxT: t1,
+        centerX: cx,
+        centerZ: cz,
+        spriteKey,
+      };
+      segment.tiles.push(tile);
+
+      if (spriteKey === 'ammo') {
+        slots.push({
+          segmentIndex: segment.index,
+          tileIndex: j,
+          tileSpriteKey: 'wall',
+          type: 'crate',
+          x: cx + inward.x * BUNKER_WALL_INSET,
+          z: cz + inward.z * BUNKER_WALL_INSET,
+          wallX: cx,
+          wallZ: cz,
+          tangent: { ...segment.tangent },
+          normal: { ...inward },
+          tileWidth: bunkerTileWorldWidth,
+          baseYaw: yawFromDir(-inward.x, -inward.z),
+          label: 'Ammo Crate',
+        });
+      } else if (spriteKey !== 'wall' && spriteKey !== 'wall_ammo') {
+        slots.push({
+          segmentIndex: segment.index,
+          tileIndex: j,
+          tileSpriteKey: spriteKey,
+          type: 'window',
+          x: cx + inward.x * BUNKER_WALL_INSET,
+          z: cz + inward.z * BUNKER_WALL_INSET,
+          wallX: cx,
+          wallZ: cz,
+          tangent: { ...segment.tangent },
+          normal: { ...inward },
+          tileWidth: bunkerTileWorldWidth,
+          baseYaw: yawFromDir(-inward.x, -inward.z),
+          label: `Window ${segment.index + 1}-${j + 1}`,
+        });
+      }
     }
+    bunkerWallSegments.push(segment);
   }
 
-  function addSideSlots(side, count, baseYaw, fixedCoord, horizontal, reverse = false) {
-    for (let i = 0; i < count; i++) {
-      const logicalIndex = reverse ? (count - 1 - i) : i;
-      const tile = bunkerWallTiles[side][logicalIndex];
-      if (!tile) continue;
-      if (tile.spriteKey === 'wall' || tile.spriteKey === 'wall_ammo') continue;
-      const centerCoord = (tile.min + tile.max) / 2;
-      const type = 'window';
-      slots.push(horizontal
-        ? { side, sideIndex: logicalIndex, tileIndex: logicalIndex, tileSpriteKey: tile.spriteKey, type, x: centerCoord, z: fixedCoord, baseYaw }
-        : { side, sideIndex: logicalIndex, tileIndex: logicalIndex, tileSpriteKey: tile.spriteKey, type, x: fixedCoord, z: centerCoord, baseYaw });
-    }
-  }
-
-  addSideSlots('north', sideCounts.north, 0, WORLD_CENTER_Z - halfD + BUNKER_WALL_INSET, true);
-  addSideSlots('east', sideCounts.east, Math.PI / 2, WORLD_CENTER_X + halfW - BUNKER_WALL_INSET, false);
-  addSideSlots('south', sideCounts.south, Math.PI, WORLD_CENTER_Z + halfD - BUNKER_WALL_INSET, true, true);
-  addSideSlots('west', sideCounts.west, -Math.PI / 2, WORLD_CENTER_X - halfW + BUNKER_WALL_INSET, false, true);
-
-  const crateCount = sideCounts[BUNKER_EMPTY_WALL_SIDE] || 1;
-  const crateCenterIndex = Math.floor((crateCount - 1) / 2);
-  const crateTile = bunkerWallTiles[BUNKER_EMPTY_WALL_SIDE]?.[crateCenterIndex];
-  if (crateTile) {
-    // Bind AMMO art to the exact wall tile behind the crate.
-    crateTile.spriteKey = 'wall_ammo';
-    const centerCoord = (crateTile.min + crateTile.max) / 2;
-    if (BUNKER_EMPTY_WALL_SIDE === 'north' || BUNKER_EMPTY_WALL_SIDE === 'south') {
-      slots.push({
-        side: BUNKER_EMPTY_WALL_SIDE,
-        sideIndex: crateCenterIndex,
-        tileIndex: crateCenterIndex,
-        tileSpriteKey: 'wall',
-        type: 'crate',
-        x: centerCoord,
-        z: BUNKER_EMPTY_WALL_SIDE === 'north' ? WORLD_CENTER_Z - halfD + BUNKER_WALL_INSET : WORLD_CENTER_Z + halfD - BUNKER_WALL_INSET,
-        baseYaw: BUNKER_EMPTY_WALL_SIDE === 'north' ? 0 : Math.PI,
-      });
-    } else {
-      slots.push({
-        side: BUNKER_EMPTY_WALL_SIDE,
-        sideIndex: crateCenterIndex,
-        tileIndex: crateCenterIndex,
-        tileSpriteKey: 'wall',
-        type: 'crate',
-        x: BUNKER_EMPTY_WALL_SIDE === 'west' ? WORLD_CENTER_X - halfW + BUNKER_WALL_INSET : WORLD_CENTER_X + halfW - BUNKER_WALL_INSET,
-        z: centerCoord,
-        baseYaw: BUNKER_EMPTY_WALL_SIDE === 'east' ? Math.PI / 2 : -Math.PI / 2,
-      });
-    }
-  }
-
-  bunker = { halfW, halfD };
+  const xs = corners.map((c) => c.x);
+  const zs = corners.map((c) => c.z);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minZ = Math.min(...zs);
+  const maxZ = Math.max(...zs);
+  bunker = {
+    halfW: (maxX - minX) / 2,
+    halfD: (maxZ - minZ) / 2,
+    minX,
+    maxX,
+    minZ,
+    maxZ,
+    corners,
+  };
   bunkerSlots = slots;
-  activeSlotIndex = Math.max(0, bunkerSlots.findIndex((slot) => slot.type === 'window'));
+  activeSlotIndex = Math.max(0, bunkerSlots.findIndex((slot) => slot.type === 'window' || slot.type === 'crate'));
   setActiveBunkerSlot(activeSlotIndex, true);
   initWindowBoards();
 }
@@ -488,12 +537,15 @@ function getBoardFloorPositions(slot) {
   const key = getSlotKey(slot);
   const seed = (key.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 0)) >>> 0;
   const rng = seeded(seed);
-  const wallCoord = getSideWallCoord(slot.side);
+  const tx = slot.tangent?.x ?? 1;
+  const tz = slot.tangent?.z ?? 0;
+  const wallX = slot.wallX ?? slot.x;
+  const wallZ = slot.wallZ ?? slot.z;
   const positions = [];
   for (let i = 0; i < BOARDS_PER_WINDOW; i++) {
     const jitter = (rng() - 0.5) * 0.08;
-    const x = slot.side === 'north' || slot.side === 'south' ? slot.x + jitter : wallCoord;
-    const z = slot.side === 'north' || slot.side === 'south' ? wallCoord : slot.z + jitter;
+    const x = wallX + tx * jitter;
+    const z = wallZ + tz * jitter;
     const rot = (rng() - 0.5) * 2 * BOARD_TILT_MAX;
     positions.push({ x, y: 0, z, rot, flip: rng() < 0.5 });
   }
@@ -505,7 +557,8 @@ function getBoardWindowPositions(slot) {
   const key = getSlotKey(slot);
   const seed = (key.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 0)) >>> 0;
   const rng = seeded(seed);
-  const wallCoord = getSideWallCoord(slot.side);
+  const wallX = slot.wallX ?? slot.x;
+  const wallZ = slot.wallZ ?? slot.z;
   const positions = [
     { y: BOARD_WINDOW_Y_LOW },
     { y: BOARD_WINDOW_Y_MID },
@@ -515,10 +568,9 @@ function getBoardWindowPositions(slot) {
     const rot = (rng() - 0.5) * 2 * BOARD_TILT_MAX;
     const flip = rng() < 0.5;
     return {
-      x: slot.side === 'north' || slot.side === 'south' ? slot.x : wallCoord,
+      x: wallX,
       y: p.y,
-      z: slot.side === 'north' || slot.side === 'south' ? wallCoord : slot.z,
-      side: slot.side,
+      z: wallZ,
       rot,
       flip,
     };
@@ -531,15 +583,188 @@ function getCurrentBunkerSlot() {
 
 function getSideWallCoord(side) {
   if (!bunker) return 0;
-  if (side === 'north') return WORLD_CENTER_Z - bunker.halfD;
-  if (side === 'south') return WORLD_CENTER_Z + bunker.halfD;
-  if (side === 'east') return WORLD_CENTER_X + bunker.halfW;
-  return WORLD_CENTER_X - bunker.halfW;
+  if (side === 'north') return bunker.minZ;
+  if (side === 'south') return bunker.maxZ;
+  if (side === 'east') return bunker.maxX;
+  return bunker.minX;
 }
 
-function setActiveBunkerSlot(index, snap = false) {
+function appendPathPoint(points, x, z) {
+  const prev = points[points.length - 1];
+  if (!prev || Math.hypot(prev.x - x, prev.z - z) > 1e-4) points.push({ x, z });
+}
+
+function isMovementPathBlocked(ax, az, bx, bz, y = CAMERA_Y) {
+  if (!bunkerWallSegments?.length) return false;
+  const EPS = 1e-5;
+  const cross2 = (ux, uz, vx, vz) => ux * vz - uz * vx;
+  const rX = bx - ax;
+  const rZ = bz - az;
+  const len = Math.hypot(rX, rZ);
+  if (len <= EPS) return false;
+  for (const segment of bunkerWallSegments) {
+    const sX = segment.b.x - segment.a.x;
+    const sZ = segment.b.z - segment.a.z;
+    const rxs = cross2(rX, rZ, sX, sZ);
+    if (Math.abs(rxs) < EPS) continue;
+    const qmpX = segment.a.x - ax;
+    const qmpZ = segment.a.z - az;
+    const t = cross2(qmpX, qmpZ, sX, sZ) / rxs;
+    const u = cross2(qmpX, qmpZ, rX, rZ) / rxs;
+    // Ignore touching near endpoints.
+    if (t <= 0.01 || t >= 0.99 || u < -EPS || u > 1 + EPS) continue;
+    if (y <= 0 || y >= BUNKER_WALL_HEIGHT) continue;
+    const alpha = sampleBunkerWallAlpha(segment, Math.max(0, Math.min(1, u)), y);
+    if (alpha > BUNKER_WALL_ALPHA_PASS_THRESHOLD) return true;
+  }
+  return false;
+}
+
+function buildMovementPathForSlots(startSlot, endSlot, startIndex, endIndex, directionHint = 0) {
+  const points = [];
+  appendPathPoint(points, cameraX, cameraZ);
+  if (!startSlot || !endSlot) {
+    appendPathPoint(points, desiredCameraX, desiredCameraZ);
+    return points;
+  }
+  if (!isMovementPathBlocked(cameraX, cameraZ, desiredCameraX, desiredCameraZ, CAMERA_Y)) {
+    appendPathPoint(points, desiredCameraX, desiredCameraZ);
+    return points;
+  }
+  const n = bunkerSlots.length;
+  if (n <= 1 || startIndex === endIndex) {
+    appendPathPoint(points, desiredCameraX, desiredCameraZ);
+    return points;
+  }
+  const dir = directionHint === 0 ? 1 : (directionHint > 0 ? 1 : -1);
+  const segCount = bunkerWallSegments.length;
+  function addCornersBetweenSegments(fromSeg, toSeg) {
+    if (fromSeg == null || toSeg == null || fromSeg === toSeg || segCount <= 0) return;
+    let s = ((fromSeg % segCount) + segCount) % segCount;
+    const target = ((toSeg % segCount) + segCount) % segCount;
+    for (let safety = 0; safety < segCount + 2 && s !== target; safety++) {
+      const nextSeg = (s + dir + segCount) % segCount;
+      const cornerIndex = dir > 0 ? nextSeg : s;
+      const corner = bunker.corners?.[cornerIndex];
+      if (corner) {
+        const n1 = bunkerWallSegments[s]?.inward ?? { x: 0, z: 0 };
+        const n2 = bunkerWallSegments[nextSeg]?.inward ?? { x: 0, z: 0 };
+        appendPathPoint(points, corner.x + n1.x * BUNKER_WALL_INSET, corner.z + n1.z * BUNKER_WALL_INSET);
+        appendPathPoint(points, corner.x + n2.x * BUNKER_WALL_INSET, corner.z + n2.z * BUNKER_WALL_INSET);
+      }
+      s = nextSeg;
+    }
+  }
+
+  let i = ((startIndex % n) + n) % n;
+  const targetIndex = ((endIndex % n) + n) % n;
+  for (let safety = 0; safety < n + 2 && i !== targetIndex; safety++) {
+    const nextI = (i + dir + n) % n;
+    const from = bunkerSlots[i];
+    const to = bunkerSlots[nextI];
+    const fromX = from?.x ?? cameraX;
+    const fromZ = from?.z ?? cameraZ;
+    const toX = to?.x ?? desiredCameraX;
+    const toZ = to?.z ?? desiredCameraZ;
+    if (isMovementPathBlocked(fromX, fromZ, toX, toZ, CAMERA_Y)) {
+      addCornersBetweenSegments(from?.segmentIndex, to?.segmentIndex);
+    }
+    i = nextI;
+  }
+  appendPathPoint(points, desiredCameraX, desiredCameraZ);
+  return points;
+}
+
+function smoothMovementPath(points) {
+  if (!points || points.length < 3) return points ? points.slice() : [];
+  const smoothed = [{ ...points[0] }];
+  const EPS = 1e-5;
+  const CURVE_RATIO = 0.35;
+  const MAX_CURVE = bunkerTileWorldWidth * 0.45;
+  const CURVE_SAMPLES = 8;
+
+  for (let i = 1; i < points.length - 1; i++) {
+    const p0 = points[i - 1];
+    const p1 = points[i];
+    const p2 = points[i + 1];
+    const inX = p1.x - p0.x;
+    const inZ = p1.z - p0.z;
+    const outX = p2.x - p1.x;
+    const outZ = p2.z - p1.z;
+    const lenIn = Math.hypot(inX, inZ);
+    const lenOut = Math.hypot(outX, outZ);
+    if (lenIn <= EPS || lenOut <= EPS) {
+      appendPathPoint(smoothed, p1.x, p1.z);
+      continue;
+    }
+    const inNx = inX / lenIn;
+    const inNz = inZ / lenIn;
+    const outNx = outX / lenOut;
+    const outNz = outZ / lenOut;
+    const dot = inNx * outNx + inNz * outNz;
+    // Keep straight-ish joints as straight lines.
+    if (dot > 0.985) {
+      appendPathPoint(smoothed, p1.x, p1.z);
+      continue;
+    }
+
+    const offset = Math.max(0.08, Math.min(MAX_CURVE, Math.min(lenIn, lenOut) * CURVE_RATIO));
+    const a = { x: p1.x - inNx * offset, z: p1.z - inNz * offset };
+    const b = { x: p1.x + outNx * offset, z: p1.z + outNz * offset };
+    appendPathPoint(smoothed, a.x, a.z);
+    for (let s = 1; s < CURVE_SAMPLES; s++) {
+      const t = s / CURVE_SAMPLES;
+      const omt = 1 - t;
+      const qx = omt * omt * a.x + 2 * omt * t * p1.x + t * t * b.x;
+      const qz = omt * omt * a.z + 2 * omt * t * p1.z + t * t * b.z;
+      appendPathPoint(smoothed, qx, qz);
+    }
+    appendPathPoint(smoothed, b.x, b.z);
+  }
+
+  appendPathPoint(smoothed, points[points.length - 1].x, points[points.length - 1].z);
+
+  // Safety: if smoothing accidentally intersects opaque wall pixels, fall back to original path.
+  for (let i = 1; i < smoothed.length; i++) {
+    if (isMovementPathBlocked(smoothed[i - 1].x, smoothed[i - 1].z, smoothed[i].x, smoothed[i].z, CAMERA_Y)) {
+      return points.slice();
+    }
+  }
+  return smoothed;
+}
+
+function buildMovementPathData(points) {
+  const path = smoothMovementPath(points);
+  const lengths = [0];
+  let total = 0;
+  for (let i = 1; i < path.length; i++) {
+    total += Math.hypot(path[i].x - path[i - 1].x, path[i].z - path[i - 1].z);
+    lengths.push(total);
+  }
+  return { points: path, lengths, total };
+}
+
+function sampleMovementPath(points, lengths, totalLength, dist) {
+  if (!points.length) return { x: desiredCameraX, z: desiredCameraZ };
+  if (points.length === 1 || totalLength <= 1e-6) return points[points.length - 1];
+  const d = Math.max(0, Math.min(totalLength, dist));
+  for (let i = 1; i < points.length; i++) {
+    if (d <= lengths[i]) {
+      const segLen = Math.max(1e-6, lengths[i] - lengths[i - 1]);
+      const t = (d - lengths[i - 1]) / segLen;
+      return {
+        x: points[i - 1].x + (points[i].x - points[i - 1].x) * t,
+        z: points[i - 1].z + (points[i].z - points[i - 1].z) * t,
+      };
+    }
+  }
+  return points[points.length - 1];
+}
+
+function setActiveBunkerSlot(index, snap = false, directionHint = 0) {
   if (bunkerSlots.length === 0) return;
   const prevIndex = activeSlotIndex;
+  const prevSlot = bunkerSlots[prevIndex] ?? null;
   activeSlotIndex = (index + bunkerSlots.length) % bunkerSlots.length;
   const slot = getCurrentBunkerSlot();
   desiredCameraX = slot.x;
@@ -552,14 +777,29 @@ function setActiveBunkerSlot(index, snap = false) {
     cameraYaw = desiredYaw;
     cameraPitch = 0;
     movementStartTime = null;
+    movementPathPoints = [];
+    movementPathLengths = [];
+    movementPathTotalLength = 0;
     if (assets.runningSound) { assets.runningSound.pause(); assets.runningSound.currentTime = 0; }
   } else {
     if (activeSlotIndex !== prevIndex) {
+      let dir = directionHint === 0 ? 1 : (directionHint > 0 ? 1 : -1);
+      if (directionHint === 0) {
+        const n = bunkerSlots.length;
+        const fw = (activeSlotIndex - prevIndex + n) % n;
+        const bw = (prevIndex - activeSlotIndex + n) % n;
+        dir = fw <= bw ? 1 : -1;
+      }
       movementStartTime = gameTime;
       movementStartX = cameraX;
       movementStartZ = cameraZ;
       movementEndX = desiredCameraX;
       movementEndZ = desiredCameraZ;
+      const pathPoints = buildMovementPathForSlots(prevSlot, slot, prevIndex, activeSlotIndex, dir);
+      const pathData = buildMovementPathData(pathPoints);
+      movementPathPoints = pathData.points;
+      movementPathLengths = pathData.lengths;
+      movementPathTotalLength = pathData.total;
       ironSightsHeld = false;
       if (assets.runningSound) assets.runningSound.play().catch(() => {});
     }
@@ -568,11 +808,12 @@ function setActiveBunkerSlot(index, snap = false) {
 
 function moveBunkerSlot(step) {
   if (bunkerSlots.length === 0) return;
-  setActiveBunkerSlot(activeSlotIndex + step);
+  setActiveBunkerSlot(activeSlotIndex + step, false, step);
 }
 
 function getSlotWallCenter(slot) {
-  return slot.side === 'north' || slot.side === 'south' ? slot.x : slot.z;
+  if (!slot) return 0;
+  return slot.wallX ?? slot.x;
 }
 
 function getPeekOffsetForSlot(slot) {
@@ -587,8 +828,7 @@ function getPeekOffsetForSlot(slot) {
     peekFade = 1 - smooth;
   }
   const yawFromSlot = Math.max(-BUNKER_PEEK_MAX_YAW, Math.min(BUNKER_PEEK_MAX_YAW, rawYawFromSlot));
-  const tile = bunkerWallTiles[slot.side]?.[slot.tileIndex];
-  const tileWidth = tile ? (tile.max - tile.min) : BUNKER_WINDOW_WIDTH;
+  const tileWidth = slot.tileWidth ?? BUNKER_WINDOW_WIDTH;
   const halfOpen = Math.max(0.05, tileWidth / 2 - BUNKER_PEEK_WINDOW_MARGIN);
   // Solve lateral shift so center shot ray intersects near opening center:
   // lateral + inset * tan(yaw) ~= 0  => lateral = -inset * tan(yaw).
@@ -608,15 +848,22 @@ function getPeekOffsetForSlot(slot) {
 }
 
 function getWindowOpeningsForSide(side) {
-  return (bunkerWallTiles[side] ?? [])
-    .filter((tile) => tile.spriteKey !== 'wall' && tile.spriteKey !== 'wall_ammo')
-    .map((tile) => ({
-      min: tile.min,
-      max: tile.max,
+  const sideNormal = side === 'north' ? { x: 0, z: -1 }
+    : side === 'south' ? { x: 0, z: 1 }
+      : side === 'east' ? { x: 1, z: 0 }
+        : { x: -1, z: 0 };
+  return bunkerWallSegments
+    .filter((seg) => seg.inward.x * sideNormal.x + seg.inward.z * sideNormal.z < -0.8)
+    .flatMap((seg) => seg.tiles
+      .filter((tile) => tile.spriteKey !== 'wall' && tile.spriteKey !== 'wall_ammo' && tile.spriteKey !== 'ammo')
+      .map((tile) => ({
+        min: tile.minT,
+        max: tile.maxT,
+        segmentIndex: seg.index,
       bottom: 0,
       top: BUNKER_WALL_HEIGHT,
-    }))
-    .sort((a, b) => a.min - b.min);
+      })))
+    .sort((a, b) => a.segmentIndex - b.segmentIndex || a.min - b.min);
 }
 
 function getWindowSlots() {
@@ -625,11 +872,7 @@ function getWindowSlots() {
 
 function getZombieWindowTarget(slot) {
   if (!slot) return { x: WORLD_CENTER_X, z: WORLD_CENTER_Z };
-  const wall = getSideWallCoord(slot.side);
-  if (slot.side === 'north') return { x: slot.x, z: wall };
-  if (slot.side === 'south') return { x: slot.x, z: wall };
-  if (slot.side === 'east') return { x: wall, z: slot.z };
-  return { x: wall, z: slot.z };
+  return { x: slot.wallX ?? slot.x, z: slot.wallZ ?? slot.z };
 }
 
 function chooseZombieTargetSlot(x, z) {
@@ -652,7 +895,7 @@ function chooseZombieTargetSlot(x, z) {
 
 function getSlotKey(slot) {
   if (!slot) return '';
-  return `${slot.side}-${slot.tileIndex ?? slot.sideIndex ?? 0}`;
+  return `${slot.segmentIndex ?? 0}-${slot.tileIndex ?? 0}-${slot.type ?? 'slot'}`;
 }
 
 function isReticuleOnBoardStack(px, py) {
@@ -856,17 +1099,19 @@ function getBunkerWallImageAndData(spriteKey) {
   return { img: assets.bunkerWall, data: assets.bunkerWallData };
 }
 
-function sampleBunkerWallAlpha(side, coord, y) {
-  const tiles = bunkerWallTiles[side] ?? [];
-  const tile = tiles.find((t) => coord >= t.min && coord <= t.max);
+function sampleBunkerWallAlpha(segment, u, y) {
+  if (!segment?.tiles?.length) return 255;
+  const clampedU = Math.max(0, Math.min(0.999999, u));
+  const tileIdx = Math.min(segment.tiles.length - 1, Math.floor(clampedU * segment.tiles.length));
+  const tile = segment.tiles[tileIdx];
   if (!tile) return 255;
   const { data } = getBunkerWallImageAndData(tile.spriteKey);
   if (!data?.width || !data?.height) {
     return (tile.spriteKey === 'wall' || tile.spriteKey === 'wall_ammo') ? 255 : 0;
   }
-  const u = Math.max(0, Math.min(0.999999, (coord - tile.min) / Math.max(tile.max - tile.min, 1e-6)));
+  const tileU = Math.max(0, Math.min(0.999999, (clampedU - tile.minT) / Math.max(tile.maxT - tile.minT, 1e-6)));
   const v = Math.max(0, Math.min(0.999999, 1 - y / BUNKER_WALL_HEIGHT));
-  const tx = Math.floor(u * data.width);
+  const tx = Math.floor(tileU * data.width);
   const ty = Math.floor(v * data.height);
   return data.data[(ty * data.width + tx) * 4 + 3];
 }
@@ -876,71 +1121,80 @@ function shotLeavesThroughWindow(px, py) {
   const dir = getShotDirection(px, py);
   const origin = { x: cameraX, y: CAMERA_Y, z: cameraZ };
   const EPS = 1e-5;
-  const hits = [];
-
-  if (dir.z < -EPS) hits.push({ side: 'north', t: (getSideWallCoord('north') - origin.z) / dir.z });
-  if (dir.z > EPS) hits.push({ side: 'south', t: (getSideWallCoord('south') - origin.z) / dir.z });
-  if (dir.x > EPS) hits.push({ side: 'east', t: (getSideWallCoord('east') - origin.x) / dir.x });
-  if (dir.x < -EPS) hits.push({ side: 'west', t: (getSideWallCoord('west') - origin.x) / dir.x });
-
-  const first = hits
-    .filter((hit) => hit.t > EPS)
-    .map((hit) => {
-      const x = origin.x + dir.x * hit.t;
-      const y = origin.y + dir.y * hit.t;
-      const z = origin.z + dir.z * hit.t;
-      return { ...hit, x, y, z };
-    })
-    .filter((hit) => {
-      if (hit.side === 'north' || hit.side === 'south') {
-        return hit.x >= WORLD_CENTER_X - bunker.halfW - EPS && hit.x <= WORLD_CENTER_X + bunker.halfW + EPS;
-      }
-      return hit.z >= WORLD_CENTER_Z - bunker.halfD - EPS && hit.z <= WORLD_CENTER_Z + bunker.halfD + EPS;
-    })
-    .sort((a, b) => a.t - b.t)[0];
+  const cross2 = (ax, az, bx, bz) => ax * bz - az * bx;
+  let first = null;
+  for (const segment of bunkerWallSegments) {
+    const rX = dir.x;
+    const rZ = dir.z;
+    const sX = segment.b.x - segment.a.x;
+    const sZ = segment.b.z - segment.a.z;
+    const rxs = cross2(rX, rZ, sX, sZ);
+    if (Math.abs(rxs) < EPS) continue;
+    const qmpX = segment.a.x - origin.x;
+    const qmpZ = segment.a.z - origin.z;
+    const t = cross2(qmpX, qmpZ, sX, sZ) / rxs;
+    const u = cross2(qmpX, qmpZ, rX, rZ) / rxs;
+    if (t <= EPS || u < -EPS || u > 1 + EPS) continue;
+    const hit = {
+      t,
+      u: Math.max(0, Math.min(1, u)),
+      y: origin.y + dir.y * t,
+      segment,
+    };
+    if (!first || hit.t < first.t) first = hit;
+  }
 
   if (!first) return true;
   if (first.y <= 0) return false;
   if (first.y >= BUNKER_WALL_HEIGHT) return true;
-  const coord = first.side === 'north' || first.side === 'south' ? first.x : first.z;
-  const alpha = sampleBunkerWallAlpha(first.side, coord, first.y);
+  const alpha = sampleBunkerWallAlpha(first.segment, first.u, first.y);
   return alpha <= BUNKER_WALL_ALPHA_PASS_THRESHOLD;
+}
+
+/** True when line of sight from camera to world point is not blocked by an opaque wall pixel. */
+function isWorldPointVisibleFromCamera(wx, wy, wz) {
+  if (!bunker || !bunkerWallSegments?.length) return true;
+  const origin = { x: cameraX, y: CAMERA_Y, z: cameraZ };
+  const dir = { x: wx - origin.x, y: wy - origin.y, z: wz - origin.z };
+  const EPS = 1e-5;
+  const cross2 = (ax, az, bx, bz) => ax * bz - az * bx;
+  for (const segment of bunkerWallSegments) {
+    const rX = dir.x;
+    const rZ = dir.z;
+    const sX = segment.b.x - segment.a.x;
+    const sZ = segment.b.z - segment.a.z;
+    const rxs = cross2(rX, rZ, sX, sZ);
+    if (Math.abs(rxs) < EPS) continue;
+    const qmpX = segment.a.x - origin.x;
+    const qmpZ = segment.a.z - origin.z;
+    const t = cross2(qmpX, qmpZ, sX, sZ) / rxs;
+    const u = cross2(qmpX, qmpZ, rX, rZ) / rxs;
+    // Treat hits before the target point only; ignore near-target wall contact.
+    if (t <= EPS || t >= 0.995 || u < -EPS || u > 1 + EPS) continue;
+    const y = origin.y + dir.y * t;
+    if (y <= 0 || y >= BUNKER_WALL_HEIGHT) continue;
+    const alpha = sampleBunkerWallAlpha(segment, Math.max(0, Math.min(1, u)), y);
+    if (alpha > BUNKER_WALL_ALPHA_PASS_THRESHOLD) return false;
+  }
+  return true;
 }
 
 function getCrateAABB() {
   if (!bunker) return null;
   const crateSlot = bunkerSlots.find((slot) => slot.type === 'crate');
   if (!crateSlot) return null;
-  const minX = WORLD_CENTER_X - bunker.halfW;
-  const maxX = WORLD_CENTER_X + bunker.halfW;
-  const minZ = WORLD_CENTER_Z - bunker.halfD;
-  const maxZ = WORLD_CENTER_Z + bunker.halfD;
-  let crateMinX, crateMaxX, crateMinZ, crateMaxZ;
-  if (crateSlot.side === 'north' || crateSlot.side === 'south') {
-    crateMinX = crateSlot.x - BUNKER_CRATE_WIDTH / 2;
-    crateMaxX = crateSlot.x + BUNKER_CRATE_WIDTH / 2;
-    if (crateSlot.side === 'north') {
-      crateMinZ = minZ + 0.08;
-      crateMaxZ = crateMinZ + BUNKER_CRATE_DEPTH;
-    } else {
-      crateMaxZ = maxZ - 0.08;
-      crateMinZ = crateMaxZ - BUNKER_CRATE_DEPTH;
-    }
-  } else {
-    crateMinZ = crateSlot.z - BUNKER_CRATE_WIDTH / 2;
-    crateMaxZ = crateSlot.z + BUNKER_CRATE_WIDTH / 2;
-    if (crateSlot.side === 'west') {
-      crateMinX = minX + 0.08;
-      crateMaxX = crateMinX + BUNKER_CRATE_DEPTH;
-    } else {
-      crateMaxX = maxX - 0.08;
-      crateMinX = crateMaxX - BUNKER_CRATE_DEPTH;
-    }
-  }
+  const n = crateSlot.normal ?? { x: 0, z: 1 };
+  const t = crateSlot.tangent ?? { x: 1, z: 0 };
+  const wallX = crateSlot.wallX ?? crateSlot.x;
+  const wallZ = crateSlot.wallZ ?? crateSlot.z;
+  const centerX = wallX + n.x * (0.08 + BUNKER_CRATE_DEPTH / 2);
+  const centerZ = wallZ + n.z * (0.08 + BUNKER_CRATE_DEPTH / 2);
+  const halfX = Math.abs(t.x) * (BUNKER_CRATE_WIDTH / 2) + Math.abs(n.x) * (BUNKER_CRATE_DEPTH / 2);
+  const halfZ = Math.abs(t.z) * (BUNKER_CRATE_WIDTH / 2) + Math.abs(n.z) * (BUNKER_CRATE_DEPTH / 2);
   return {
-    minX: crateMinX, maxX: crateMaxX,
+    minX: centerX - halfX, maxX: centerX + halfX,
     minY: BUNKER_FLOOR_Y, maxY: BUNKER_FLOOR_Y + BUNKER_CRATE_HEIGHT,
-    minZ: crateMinZ, maxZ: crateMaxZ,
+    minZ: centerZ - halfZ, maxZ: centerZ + halfZ,
   };
 }
 
@@ -2268,9 +2522,8 @@ const BOARD_WINDOW_FRACTIONS = [0.2, 0.35, 0.58];  // from top: top board, middl
 
 function getWindowScreenBounds(slot) {
   if (!slot || slot.type !== 'window' || !bunker) return null;
-  const wallCoord = getSideWallCoord(slot.side);
-  const wx = slot.side === 'north' || slot.side === 'south' ? slot.x : wallCoord;
-  const wz = slot.side === 'north' || slot.side === 'south' ? wallCoord : slot.z;
+  const wx = slot.wallX ?? slot.x;
+  const wz = slot.wallZ ?? slot.z;
   const top = project(wx, BUNKER_WALL_HEIGHT, wz);
   const bottom = project(wx, 0, wz);
   const mid = project(wx, BOARD_WINDOW_Y_MID, wz);
@@ -2292,24 +2545,19 @@ function drawBoardAt(img, iw, ih, worldX, worldY, worldZ, rot, flip) {
   return { depth: proj.depth, sx: proj.sx, sy: proj.sy, w, h, rot, flip };
 }
 
-function getWallRightUp(side) {
-  const right = { x: 0, y: 0, z: 0 };
+function getWallRightUp(slot) {
+  const right = { x: slot?.tangent?.x ?? 1, y: 0, z: slot?.tangent?.z ?? 0 };
   const up = { x: 0, y: 1, z: 0 };
-  if (side === 'north') right.x = 1;
-  else if (side === 'south') right.x = -1;
-  else if (side === 'east') right.z = -1;
-  else if (side === 'west') right.z = 1;
   return { right, up };
 }
 
 function getBoardQuadOnWall(slot, boardIndex, windowPoses, iw, ih) {
   if (!slot || !bunker || boardIndex >= (windowPoses?.length ?? 0)) return null;
-  const wallCoord = getSideWallCoord(slot.side);
   const frac = BOARD_WINDOW_FRACTIONS[boardIndex];
   const boardY = BUNKER_WALL_HEIGHT * (1 - frac);
-  const cx = slot.side === 'north' || slot.side === 'south' ? slot.x : wallCoord;
-  const cz = slot.side === 'north' || slot.side === 'south' ? wallCoord : slot.z;
-  const { right, up } = getWallRightUp(slot.side);
+  const cx = slot.wallX ?? slot.x;
+  const cz = slot.wallZ ?? slot.z;
+  const { right, up } = getWallRightUp(slot);
   const halfH = BOARD_SPRITE_WORLD_SIZE / 2;
   const halfW = (BOARD_SPRITE_WORLD_SIZE * (iw / Math.max(ih, 1))) / 2;
   const p = windowPoses[boardIndex];
@@ -2427,6 +2675,7 @@ function drawBoards() {
     if (isPlacingHere) floorCount = Math.max(0, onFloor - 1);
     for (let i = 0; i < floorCount && i < floorPoses.length; i++) {
       const p = floorPoses[i];
+      if (!isWorldPointVisibleFromCamera(p.x, p.y + 0.04, p.z)) continue;
       const it = drawBoardAt(img, iw, ih, p.x, p.y + 0.04, p.z, p.rot, p.flip);
       if (it) items.push(it);
     }
@@ -2467,6 +2716,7 @@ function drawBoards() {
     } else {
       for (let i = 0; i < onWindow && i < windowPoses.length; i++) {
         const p = windowPoses[i];
+        if (!isWorldPointVisibleFromCamera(p.x, p.y, p.z)) continue;
         const it = drawBoardAt(img, iw, ih, p.x, p.y, p.z, p.rot, p.flip);
         if (it) items.push(it);
       }
@@ -2487,6 +2737,7 @@ function drawBoards() {
       const x = fb.fromPos.x + (fb.toPos.x - fb.fromPos.x) * t;
       const y = fb.fromPos.y + (fb.toPos.y - fb.fromPos.y) * t;
       const z = fb.fromPos.z + (fb.toPos.z - fb.fromPos.z) * t;
+      if (!isWorldPointVisibleFromCamera(x, y + 0.04, z)) continue;
       it = drawBoardAt(img, iw, ih, x, y, z, rot, fb.flip);
     }
     if (it) items.push(it);
@@ -2520,107 +2771,56 @@ function drawBunkerInterior() {
   const crateSide = '#5b3f29';
   const crateTop = '#8e6944';
 
-  const minX = WORLD_CENTER_X - bunker.halfW;
-  const maxX = WORLD_CENTER_X + bunker.halfW;
-  const minZ = WORLD_CENTER_Z - bunker.halfD;
-  const maxZ = WORLD_CENTER_Z + bunker.halfD;
+  // Draw floor/ceiling from actual bunker polygon (not AABB), so concave layouts keep open courtyards.
+  const floorPoly = (bunker.corners ?? []).map((p) => ({ x: p.x, y: BUNKER_FLOOR_Y, z: p.z }));
+  const ceilingPoly = (bunker.corners ?? []).slice().reverse().map((p) => ({ x: p.x, y: BUNKER_WALL_HEIGHT, z: p.z }));
+  if (floorPoly.length >= 3) pushPolygon(backgroundPolys, floorPoly, floorColor);
+  if (ceilingPoly.length >= 3) pushPolygon(backgroundPolys, ceilingPoly, ceilingColor);
 
-  // Draw floor/ceiling in a dedicated pass to avoid painter-order popping against crate faces.
-  pushPolygon(backgroundPolys, [
-    { x: minX, y: BUNKER_FLOOR_Y, z: minZ },
-    { x: maxX, y: BUNKER_FLOOR_Y, z: minZ },
-    { x: maxX, y: BUNKER_FLOOR_Y, z: maxZ },
-    { x: minX, y: BUNKER_FLOOR_Y, z: maxZ },
-  ], floorColor);
-  pushPolygon(backgroundPolys, [
-    { x: minX, y: BUNKER_WALL_HEIGHT, z: maxZ },
-    { x: maxX, y: BUNKER_WALL_HEIGHT, z: maxZ },
-    { x: maxX, y: BUNKER_WALL_HEIGHT, z: minZ },
-    { x: minX, y: BUNKER_WALL_HEIGHT, z: minZ },
-  ], ceilingColor);
-
-  function pushWallTile(side, tile) {
+  function pushWallTile(segment, tile) {
     const { img } = getBunkerWallImageAndData(tile.spriteKey);
     const fill = wallColor;
     const stroke = img ? null : trimColor;
     const slices = img ? BUNKER_WALL_TEXTURE_SLICES : 1;
     const iw = img?.naturalWidth || img?.width || 1;
     const ih = img?.naturalHeight || img?.height || 1;
+    const sx = segment.b.x - segment.a.x;
+    const sz = segment.b.z - segment.a.z;
     for (let i = 0; i < slices; i++) {
       const u0 = i / slices;
       const u1 = (i + 1) / slices;
-      const a = tile.min + (tile.max - tile.min) * u0;
-      const b = tile.min + (tile.max - tile.min) * u1;
+      const ta = tile.minT + (tile.maxT - tile.minT) * u0;
+      const tb = tile.minT + (tile.maxT - tile.minT) * u1;
+      const a = { x: segment.a.x + sx * ta, z: segment.a.z + sz * ta };
+      const b = { x: segment.a.x + sx * tb, z: segment.a.z + sz * tb };
       const tex = img ? { img, sx: u0 * iw, sy: 0, sw: (u1 - u0) * iw, sh: ih } : null;
-      if (side === 'north') {
-        pushPolygon(polys, [
-          { x: a, y: 0, z: minZ },
-          { x: b, y: 0, z: minZ },
-          { x: b, y: BUNKER_WALL_HEIGHT, z: minZ },
-          { x: a, y: BUNKER_WALL_HEIGHT, z: minZ },
-        ], fill, stroke, tex);
-      } else if (side === 'south') {
-        pushPolygon(polys, [
-          { x: a, y: 0, z: maxZ },
-          { x: b, y: 0, z: maxZ },
-          { x: b, y: BUNKER_WALL_HEIGHT, z: maxZ },
-          { x: a, y: BUNKER_WALL_HEIGHT, z: maxZ },
-        ], fill, stroke, tex);
-      } else if (side === 'east') {
-        pushPolygon(polys, [
-          { x: maxX, y: 0, z: a },
-          { x: maxX, y: 0, z: b },
-          { x: maxX, y: BUNKER_WALL_HEIGHT, z: b },
-          { x: maxX, y: BUNKER_WALL_HEIGHT, z: a },
-        ], fill, stroke, tex);
-      } else {
-        pushPolygon(polys, [
-          { x: minX, y: 0, z: a },
-          { x: minX, y: 0, z: b },
-          { x: minX, y: BUNKER_WALL_HEIGHT, z: b },
-          { x: minX, y: BUNKER_WALL_HEIGHT, z: a },
-        ], fill, stroke, tex);
-      }
+      pushPolygon(polys, [
+        { x: a.x, y: 0, z: a.z },
+        { x: b.x, y: 0, z: b.z },
+        { x: b.x, y: BUNKER_WALL_HEIGHT, z: b.z },
+        { x: a.x, y: BUNKER_WALL_HEIGHT, z: a.z },
+      ], fill, stroke, tex);
     }
   }
 
-  function addWallSide(side) {
-    const tiles = bunkerWallTiles[side] ?? [];
-    for (const tile of tiles) pushWallTile(side, tile);
+  function addWallSegments() {
+    for (const segment of bunkerWallSegments) {
+      for (const tile of segment.tiles) {
+        const spriteKey = tile.spriteKey === 'ammo' ? 'wall_ammo' : tile.spriteKey;
+        pushWallTile(segment, { ...tile, spriteKey });
+      }
+    }
   }
-
-  addWallSide('north');
-  addWallSide('east');
-  addWallSide('south');
-  addWallSide('west');
+  addWallSegments();
 
   const crateSlot = bunkerSlots.find((slot) => slot.type === 'crate');
   if (crateSlot) {
-    let crateMinX;
-    let crateMaxX;
-    let crateMinZ;
-    let crateMaxZ;
-    if (crateSlot.side === 'north' || crateSlot.side === 'south') {
-      crateMinX = crateSlot.x - BUNKER_CRATE_WIDTH / 2;
-      crateMaxX = crateSlot.x + BUNKER_CRATE_WIDTH / 2;
-      if (crateSlot.side === 'north') {
-        crateMinZ = minZ + 0.08;
-        crateMaxZ = crateMinZ + BUNKER_CRATE_DEPTH;
-      } else {
-        crateMaxZ = maxZ - 0.08;
-        crateMinZ = crateMaxZ - BUNKER_CRATE_DEPTH;
-      }
-    } else {
-      crateMinZ = crateSlot.z - BUNKER_CRATE_WIDTH / 2;
-      crateMaxZ = crateSlot.z + BUNKER_CRATE_WIDTH / 2;
-      if (crateSlot.side === 'west') {
-        crateMinX = minX + 0.08;
-        crateMaxX = crateMinX + BUNKER_CRATE_DEPTH;
-      } else {
-        crateMaxX = maxX - 0.08;
-        crateMinX = crateMaxX - BUNKER_CRATE_DEPTH;
-      }
-    }
+    const crateBox = getCrateAABB();
+    if (!crateBox) return;
+    const crateMinX = crateBox.minX;
+    const crateMaxX = crateBox.maxX;
+    const crateMinZ = crateBox.minZ;
+    const crateMaxZ = crateBox.maxZ;
     const crateY0 = BUNKER_FLOOR_Y;
     const crateY1 = BUNKER_FLOOR_Y + BUNKER_CRATE_HEIGHT;
     const crateSheet = assets.crateSpriteSheet;
@@ -2866,7 +3066,7 @@ function drawPositionLabel() {
   if (!slot) return;
   ctx.fillStyle = '#aaa';
   ctx.font = `${Math.floor(FONT_SIZE * 0.7)}px ${FONT_FAMILY}`;
-  const label = slot.type === 'crate' ? 'Ammo Crate' : `${slot.side[0].toUpperCase()}${slot.side.slice(1)} Window`;
+  const label = slot.type === 'crate' ? 'Ammo Crate' : (slot.label || `Window ${slot.segmentIndex ?? '?'}-${(slot.tileIndex ?? 0) + 1}`);
   ctx.fillText(label, 12, FONT_SIZE * 2 + 22);
 }
 
@@ -2993,12 +3193,16 @@ function tick(dt) {
   if (movementStartTime != null && gameTime - movementStartTime < BUNKER_MOVE_DURATION) {
     const t = Math.min(1, (gameTime - movementStartTime) / BUNKER_MOVE_DURATION);
     const s = t * t * (3 - 2 * t);
-    cameraX = movementStartX + (movementEndX - movementStartX) * s;
-    cameraZ = movementStartZ + (movementEndZ - movementStartZ) * s;
+    const pos = sampleMovementPath(movementPathPoints, movementPathLengths, movementPathTotalLength, movementPathTotalLength * s);
+    cameraX = pos.x;
+    cameraZ = pos.z;
     if (t >= 1) {
       movementStartTime = null;
       cameraX = movementEndX;
       cameraZ = movementEndZ;
+      movementPathPoints = [];
+      movementPathLengths = [];
+      movementPathTotalLength = 0;
       if (assets.runningSound) { assets.runningSound.pause(); assets.runningSound.currentTime = 0; }
     }
   } else {
@@ -3006,6 +3210,9 @@ function tick(dt) {
       movementStartTime = null;
       cameraX = movementEndX;
       cameraZ = movementEndZ;
+      movementPathPoints = [];
+      movementPathLengths = [];
+      movementPathTotalLength = 0;
       if (assets.runningSound) { assets.runningSound.pause(); assets.runningSound.currentTime = 0; }
     }
     const targetCameraX = desiredCameraX + peek.x;
