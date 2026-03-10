@@ -6,12 +6,14 @@ A retro pixel art multiplayer shooter: defend a bunker against wave after wave o
 
 - **Shooting gallery gameplay** — You defend a series of windows. You can move between windows but don’t have free movement.
 - **Scale** — Up to 64 players in one game, defending 96 windows.
-- **Tech** — Vanilla JS, bundled as a desktop app with Electron. Game servers on AWS ECS. Proximity-based voice chat. Minimal server payload per client to keep costs low.
+- **Tech** — Vanilla JS, bundled as a desktop app with Electron. Game servers on AWS ECS. Proximity-based voice chat (precomputed slot relationships: same = full volume, adjacent/back-to-back = partial, distant = none; see [Proximity voice](docs/PROXIMITY_VOICE.md)). Game sync is lightweight (seed + plan hash + discrete actions); see [Game sync](docs/GAME_SYNC.md). Proximity audio is the main data through the cloud.
 
 ## Project structure
 
 ```
 ├── assets/           # Sprites and art (Lee Enfield, zombies, etc.)
+├── docs/             # Design: AWS setup, proximity voice, game sync, deploy (DEPLOY.md)
+├── server/           # WebSocket game server (run on EC2)
 ├── src/              # Game client (canvas, input, game loop)
 ├── main.js           # Electron main process
 ├── index.html        # Game canvas + entry

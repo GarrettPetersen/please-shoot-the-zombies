@@ -104,6 +104,10 @@ const BUNKER_WINDOW_WIDTH = 1.9;
 const BUNKER_WINDOW_BOTTOM = 0.9;
 const BUNKER_WINDOW_TOP = 2.15;
 const BUNKER_FLOOR_Y = 0.02;
+/** Max distance (world units) between two slots for partial voice volume when no wall blocks. Beyond this = no audio. */
+const VOICE_PARTIAL_MAX_DISTANCE_MULTIPLIER = 2.5;  // in units of bunkerTileWorldWidth
+/** Volumes below this are stored and treated as 0 so we don't send barely audible audio over the network. */
+const VOICE_MIN_VOLUME_THRESHOLD = 0.2;
 const BUNKER_CRATE_WIDTH = 1.9;
 const BUNKER_CRATE_HEIGHT = 1.15;
 const BUNKER_CRATE_DEPTH = 0.95;
@@ -119,6 +123,8 @@ const BOARD_WINDOW_Y_HIGH = 1.9;
 const BOARD_FALL_DURATION = 1.5;      // seconds for board to fall when broken
 let bunker = null;
 let bunkerSlots = [];
+/** Precomputed at game start: slotVoiceVolumeMatrix[i][j] = 1 (same), 0.5 (partial), or 0 (distant/wall between). */
+let slotVoiceVolumeMatrix = null;
 let bunkerWallTiles = { north: [], east: [], south: [], west: [] };
 let bunkerWallSegments = [];
 let bunkerTileWorldWidth = BUNKER_SLOT_SPACING;
@@ -567,6 +573,7 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
   activeSlotIndex = Math.max(0, bunkerSlots.findIndex((slot) => slot.type === 'window' || slot.type === 'crate'));
   setActiveBunkerSlot(activeSlotIndex, true);
   initWindowBoards();
+  precomputeSlotVoiceVolumes();
 }
 
 function getBoardFloorPositions(slot) {
@@ -655,6 +662,49 @@ function isMovementPathBlocked(ax, az, bx, bz, y = CAMERA_Y) {
     if (alpha > BUNKER_WALL_ALPHA_PASS_THRESHOLD) return true;
   }
   return false;
+}
+
+/** Precompute slot-to-slot voice volume (same = 1, adjacent/back-to-back = 0.5, distant or wall between = 0). Call once at game start after bunker and slots exist. */
+function precomputeSlotVoiceVolumes() {
+  if (!bunkerSlots?.length || !bunkerWallSegments?.length) {
+    slotVoiceVolumeMatrix = null;
+    return;
+  }
+  const n = bunkerSlots.length;
+  const maxDist = bunkerTileWorldWidth * VOICE_PARTIAL_MAX_DISTANCE_MULTIPLIER;
+  slotVoiceVolumeMatrix = Array(n)
+    .fill(0)
+    .map(() => Array(n).fill(0));
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      if (i === j) {
+        slotVoiceVolumeMatrix[i][j] = 1;
+        continue;
+      }
+      const a = bunkerSlots[i];
+      const b = bunkerSlots[j];
+      const ax = a.x;
+      const az = a.z;
+      const bx = b.x;
+      const bz = b.z;
+      const dist = Math.hypot(bx - ax, bz - az);
+      const blocked = isMovementPathBlocked(ax, az, bx, bz, CAMERA_Y);
+      if (blocked) slotVoiceVolumeMatrix[i][j] = 0;
+      else if (dist <= maxDist) {
+        const v = 0.5;
+        slotVoiceVolumeMatrix[i][j] = v >= VOICE_MIN_VOLUME_THRESHOLD ? v : 0;
+      } else slotVoiceVolumeMatrix[i][j] = 0;
+    }
+  }
+}
+
+/** Returns voice volume from slot index A to B: 1 (same), 0.5 (partial), or 0. */
+function getSlotVoiceVolume(slotIndexA, slotIndexB) {
+  if (!slotVoiceVolumeMatrix) return 0;
+  const i = Math.max(0, Math.min(slotIndexA, slotVoiceVolumeMatrix.length - 1));
+  const j = Math.max(0, Math.min(slotIndexB, slotVoiceVolumeMatrix[0]?.length - 1 ?? 0));
+  const v = slotVoiceVolumeMatrix[i][j] ?? 0;
+  return v >= VOICE_MIN_VOLUME_THRESHOLD ? v : 0;
 }
 
 function buildMovementPathForSlots(startSlot, endSlot, startIndex, endIndex, directionHint = 0) {

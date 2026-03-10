@@ -1,0 +1,12 @@
+{
+  "name": "please-shoot-the-zombies-server",
+  "version": "0.1.0",
+  "description": "WebSocket game server for Please Shoot the Zombies (run on EC2)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
