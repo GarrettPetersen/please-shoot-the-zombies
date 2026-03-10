@@ -152,6 +152,7 @@ const MAX_CLIPS = 10;
 const IRON_SIGHTS_AIM_X = 166;
 const IRON_SIGHTS_AIM_Y = 198;
 const IRON_SIGHTS_RIGID_RESPONSE = 0.55;
+const IRON_SIGHTS_MAX_OFFSET = 38;   // clamp aim offset so the 4 sprites don't separate visibly
 const IRON_SIGHTS_DEPTH = { front: 0.5, rear: 0.15, barrel: -0.35, stock: -1.25 };
 const IRON_SIGHTS_RECOIL_KICK = 42;
 const IRON_SIGHTS_RECOIL_DECAY = 0.72;
@@ -3024,6 +3025,55 @@ function getWindowScreenBounds(slot) {
   };
 }
 
+const RUN_TARGET_HITBOX_PADDING = 32;  // screen pixels to expand hitbox for easier targeting
+
+/** Screen-space bounds for a slot (window or crate) for run-to-target hitbox. */
+function getSlotScreenBounds(slot) {
+  if (!slot || !bunker) return null;
+  const half = (slot.tileWidth ?? BUNKER_WINDOW_WIDTH) / 2;
+  const tx = slot.tangent?.x ?? 1;
+  const tz = slot.tangent?.z ?? 0;
+  const wx = slot.wallX ?? slot.x;
+  const wz = slot.wallZ ?? slot.z;
+  const leftX = wx - tx * half;
+  const leftZ = wz - tz * half;
+  const rightX = wx + tx * half;
+  const rightZ = wz + tz * half;
+  const corners = [
+    project(leftX, BUNKER_WALL_HEIGHT, leftZ),
+    project(leftX, 0, leftZ),
+    project(rightX, BUNKER_WALL_HEIGHT, rightZ),
+    project(rightX, 0, rightZ),
+  ];
+  if (corners.some((c) => !c || c.depth <= NEAR)) return null;
+  const minSx = Math.min(...corners.map((c) => c.sx));
+  const maxSx = Math.max(...corners.map((c) => c.sx));
+  const syTop = Math.min(...corners.map((c) => c.sy));
+  const syBottom = Math.max(...corners.map((c) => c.sy));
+  const depth = corners.reduce((s, c) => s + c.depth, 0) / 4;
+  return { minSx, maxSx, syTop, syBottom, depth, centerSx: (minSx + maxSx) / 2, centerSy: (syTop + syBottom) / 2 };
+}
+
+/** If the reticule is over a runnable slot and the line from player to it is inside the bunker, return that slot (closest by depth). */
+function getRunTargetAt(px, py) {
+  if (!bunkerSlots.length || movementStartTime != null) return null;
+  const current = getCurrentBunkerSlot();
+  const candidates = [];
+  for (let i = 0; i < bunkerSlots.length; i++) {
+    const slot = bunkerSlots[i];
+    if (slot === current) continue;
+    const bounds = getSlotScreenBounds(slot);
+    if (!bounds) continue;
+    const p = RUN_TARGET_HITBOX_PADDING;
+    if (px < bounds.minSx - p || px > bounds.maxSx + p || py < bounds.syTop - p || py > bounds.syBottom + p) continue;
+    if (isMovementPathBlocked(cameraX, cameraZ, slot.x, slot.z, CAMERA_Y)) continue;
+    candidates.push({ slot, index: i, depth: bounds.depth, bounds });
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => a.depth - b.depth);
+  return candidates[0];
+}
+
 function drawBoardAt(img, iw, ih, worldX, worldY, worldZ, rot, flip) {
   const proj = project(worldX, worldY, worldZ);
   if (!proj || proj.depth <= NEAR) return null;
@@ -3513,8 +3563,15 @@ function drawRifle(dt) {
       IRON_SIGHTS_DEPTH.rear,
       IRON_SIGHTS_DEPTH.front,
     ];
-    const rigidX = ro.x * IRON_SIGHTS_RIGID_RESPONSE;
-    const rigidY = ro.y * IRON_SIGHTS_RIGID_RESPONSE - ironSightsRecoilKick;
+    let rigidX = ro.x * IRON_SIGHTS_RIGID_RESPONSE;
+    let rigidY = ro.y * IRON_SIGHTS_RIGID_RESPONSE;
+    const aimLen = Math.hypot(rigidX, rigidY);
+    if (aimLen > IRON_SIGHTS_MAX_OFFSET) {
+      const s = IRON_SIGHTS_MAX_OFFSET / aimLen;
+      rigidX *= s;
+      rigidY *= s;
+    }
+    rigidY -= ironSightsRecoilKick;
     for (let i = 3; i >= 0; i--) {
       let img = assets.ironSights[i];
       if (!img?.naturalWidth) continue;
@@ -3597,6 +3654,32 @@ function drawReticule() {
   }
 }
 
+function drawRunTargetArrow() {
+  if (!pointerLocked || gameOver || boardPlaceState) return;
+  const ro = getReticuleOffset();
+  const px = W / 2 + ro.x;
+  const py = H / 2 + ro.y;
+  const runTarget = getRunTargetAt(px, py);
+  if (!runTarget) return;
+  const { bounds } = runTarget;
+  const arrowY = bounds.syTop - 22;
+  const cx = Math.round(bounds.centerSx);
+  const size = 10;
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(cx, arrowY + size);
+  ctx.lineTo(cx - size * 0.8, arrowY - size * 0.4);
+  ctx.lineTo(cx, arrowY - size * 0.2);
+  ctx.lineTo(cx + size * 0.8, arrowY - size * 0.4);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
 function drawHint() {
   if (pointerLocked) return;
   ctx.fillStyle = 'rgba(0,0,0,0.7)';
@@ -3607,6 +3690,8 @@ function drawHint() {
   ctx.fillText('Click to lock mouse and play', W / 2, H / 2);
   ctx.font = `${Math.floor(FONT_SIZE * 0.65)}px ${FONT_FAMILY}`;
   ctx.fillText('Move between windows with A/D or Left/Right', W / 2, H / 2 + 26);
+  ctx.font = `${Math.floor(FONT_SIZE * 0.65)}px ${FONT_FAMILY}`;
+  ctx.fillText('Look at a window/crate and click or press W/Up to run there', W / 2, H / 2 + 48);
   ctx.textAlign = 'left';
 }
 
@@ -3674,6 +3759,7 @@ function draw() {
   drawBoards();
   if (!gameOver && !boardPlaceState) drawRifle(1 / 60);
   drawReticule();
+  drawRunTargetArrow();
   if (gameOver) drawGameOver();
   else if (gameWon) drawVictory();
   else if (!pointerLocked) drawHint();
@@ -3802,6 +3888,12 @@ canvas.addEventListener('click', (e) => {
     return;
   }
 
+  const runTarget = getRunTargetAt(px, py);
+  if (runTarget) {
+    setActiveBunkerSlot(runTarget.index);
+    return;
+  }
+
   if (rifleState !== 'idle') {
     playDryFireSound();
     return;
@@ -3891,6 +3983,15 @@ document.addEventListener('keydown', (e) => {
   if (boardPlaceState) return;
   if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
     ironSightsHeld = true;
+  } else if (e.code === 'ArrowUp' || e.code === 'KeyW') {
+    const ro = getReticuleOffset();
+    const px = W / 2 + ro.x;
+    const py = H / 2 + ro.y;
+    const runTarget = getRunTargetAt(px, py);
+    if (runTarget) {
+      e.preventDefault();
+      setActiveBunkerSlot(runTarget.index);
+    }
   } else if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
     e.preventDefault();
     moveBunkerSlot(-1);
