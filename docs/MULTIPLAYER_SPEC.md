@@ -6,18 +6,13 @@ High-level plan for matchmaking, game flow, state sync, voice, and bots.
 
 ## 1. Matchmaking (Steam API)
 
-- Use **Steam** for matchmaking via the **Steam API**: players find or create games via Steam lobbies. Our game calls the API to get lobby members, match state, etc. The **display is in our game**—we draw the lobby list, "players in match", and so on ourselves. So we can show a **unified list**: real Steam accounts (from the API) plus **bot slots** (from our server) in the same UI, with no visual distinction. Bots appear alongside real accounts in the list; we never label them.
-- Flow: player opens game → Steam API → find or create lobby → get lobby members → game client connects to our **game server** for that match, with session/lobby ID. Server knows which slots are humans (Steam) and which are bots (server-filled). Server may receive "start match" from Steam (e.g. lobby full, host pressed start) or our own logic; then it starts the game with parameters and tells clients to begin the handshake.
+- Steam API for lobbies; **we draw the player list in our game** (Steam members + server bot slots in one list, no labels). Client connects to our game server with session/lobby ID. Server knows human vs bot slots. "Start match" from Steam or our logic → server sends parameters, clients begin handshake.
 
 ---
 
 ## 2. Audio (Steam API)
 
-- Use **Steam voice** for in-game chat (Steamworks voice APIs).
-- Our **proximity rules** (same window = full volume, adjacent/back-to-back = partial, distant = none) can be enforced by:
-  - **Option A:** Game client tells Steam which peers are "in range" (from our precomputed `slotVoiceVolumeMatrix`); we only enable/route Steam voice for those peers.
-  - **Option B:** Server subscribes to player slot updates and tells each client "you hear players X, Y, Z at gains Gx, Gy, Gz" and the client uses Steam voice with volume/gain per peer.
-- Bots (see below) do not send or receive voice.
+- Steam voice for chat. Proximity from `slotVoiceVolumeMatrix` (same = full, adjacent/back-to-back = partial, distant = none); client or server tells who is in range and at what gain. Bots excluded from voice.
 
 ---
 
@@ -61,23 +56,21 @@ High-level plan for matchmaking, game flow, state sync, voice, and bots.
   - **Game history:** matches played, result (win/loss, score), duration, who else was in the match.
   - **Stats:** kills, deaths (if applicable), shots hit, boards placed, etc.
   - **Aggregates:** total games, win rate, favorite slots, etc.
-- Storage can be DB (e.g. RDS, DynamoDB) or simple logs later processed. Needs to be designed so it doesn’t block the game loop (e.g. write async after match end).
+- Storage can be DB (e.g. RDS, DynamoDB) or simple logs later processed. Needs to be designed so it does not block the game loop (e.g. write async after match end).
 - Used for: leaderboards, profile, anti-cheat signals, and "recent games" / history views.
 
 ---
 
 ## 7. Bots on the server
 
-- **Server-side bots** that behave like players but don’t use voice:
-  - Occupy slots, move between windows, shoot zombies (using the same deterministic sim and event format).
-  - Server generates **bot actions** (move, shoot) and broadcasts them like player events so all clients see the same bot behavior.
-  - Bots do **not** send or receive voice; they’re excluded from Steam voice and from any proximity voice list.
-- **Purpose:** Fill lobbies when there aren’t many humans online so the match feels populated.
-- **Implementation:** Server has a "bot controller" that, each tick or on a timer, decides bot moves and shots (e.g. simple AI: target nearest zombie, move toward busy windows) and emits the same message types as players. Clients treat bot events like player events for rendering and sim.
+- Server-side bots: same event types as players (move, shot, boards), no voice. Server runs a bot controller, broadcasts bot actions like player actions. Clients treat them identically; **no `isBot` flag or label**—player list is our UI (Steam members + server slots merged), bots get plausible names from a pool.
+- **Trickle in:** Bots join open matches gradually (not all at once) so lobbies fill. When a human joins, a bot can leave to free the slot; humans have priority.
 
-**Unlabeled so the game feels lively:** Bots are not in Steam (only humans use Steam matchmaking). The **player list is rendered by our game** from Steam API (real accounts) + server (all slots, including bots); we merge them into one list so bots appear with real accounts and nobody is labeled. The server never sends an `isBot` flag; bots use the same message types and slot representation as humans. Only the server knows which slots are bots (no handshake from them, excluded from Steam voice, server generates their actions). Assign bot slots plausible names from a pool (no "Bot_1" or "CPU").
+---
 
-**Trickle in (and make room for humans):** Bots **gradually join** open matches over time—they don't all appear at once. So players waiting in a lobby see the list fill up (some real joins, some bot joins), and nobody sits in an empty or near-empty match for long. When a **human joins** via Steam matchmaking, the server can have a bot **leave** (free that slot for the human) so the match doesn't overfill and it looks natural: someone left, someone new joined. Priority: humans get slots; bots fill gaps and trickle in when there's room, and yield when a human is available to take the slot.
+## 8. Server architecture
+
+- One EC2 can run matchmaking + game server(s). Add more EC2s (or Lambda for matchmaking) when scaling.
 
 ---
 
@@ -85,13 +78,13 @@ High-level plan for matchmaking, game flow, state sync, voice, and bots.
 
 | Area | Approach |
 |------|----------|
-| Matchmaking | Steam API; display in our game (merge Steam members + bot slots in one list) |
-| Audio | Steam voice + our proximity rules (slot matrix) |
+| Matchmaking | Steam API; we draw list (Steam + bot slots merged) |
+| Audio | Steam voice + proximity (slot matrix); bots excluded |
 | Game start | Parameters (seed, plan id/hash) from server |
-| Handshake | All clients + server generate state, hash it, agree on hash before play |
-| In-game sync | Relayed messages (move, shot, boards, etc.); deterministic sim on all clients |
-| Player records | Server (or backend) records game history, stats per player/match |
-| Bots | Server-run; trickle into open matches over time; yield slot when human joins; same events as players, no voice; never labeled; plausible names; list merged with real accounts in our UI |
+| Handshake | All generate state, hash, agree before play |
+| In-game sync | Relayed messages (move, shot, boards); deterministic sim |
+| Player records | Server records history/stats per player and match |
+| Bots | Server-run; same events, no voice; unlabeled; trickle in; yield to humans |
 
 ---
 
