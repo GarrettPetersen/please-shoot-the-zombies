@@ -2346,7 +2346,7 @@ function damageZombie(idx, hitPx, hitPy) {
     spawnHoleParticles(z, info, hitPx, hitPy, jaggedRadii);
     spawnDeathParticles(z, info);
     zombies.splice(idx, 1);
-    score += 1;
+  score += 1;
   } else {
     if (!z.holes) z.holes = [];
     z.holes.push({ tx: hitTx, ty: hitTy, jaggedRadii });
@@ -2756,7 +2756,7 @@ function drawGround() {
   const state = getHorizonForestDrawState();
   const floorHorizon = Math.floor(state ? state.horizonY : H / 2);
   const groundH = Math.max(0, H - floorHorizon);
-  ctx.fillStyle = GROUND_COLOR;
+    ctx.fillStyle = GROUND_COLOR;
   ctx.fillRect(0, floorHorizon, W, groundH);
   if (!state || groundH <= 0) return;
   const pattern = ctx.createPattern(horizonForestTexture, 'repeat-x');
@@ -2780,7 +2780,7 @@ function drawGround() {
     ctx.fillRect(0, floorHorizon, W, fadeEnd - floorHorizon);
   }
   if (fadeEnd < H) {
-    ctx.fillStyle = GROUND_COLOR;
+  ctx.fillStyle = GROUND_COLOR;
     ctx.fillRect(0, fadeEnd, W, H - fadeEnd);
   }
 }
@@ -3539,7 +3539,7 @@ function drawRifle(dt) {
       const nextFrame = rifleFrame + 1;
       const frozen = nextFrame > RELOAD_FREEZE_FRAME && clipsCarried === 0;
       if (!frozen) {
-        rifleFrameTime -= frameDuration;
+      rifleFrameTime -= frameDuration;
         rifleFrame = nextFrame;
         if (!boltOpenSoundPlayed && rifleFrame >= RELOAD_BOLT_OPEN_FRAME) {
           playBoltOpenSound();
@@ -3553,11 +3553,11 @@ function drawRifle(dt) {
           playReloadSound();
           reloadSoundPlayed = true;
         }
-        if (rifleFrame >= RIFLE_RELOAD_FRAME_COUNT) {
-          rifleFrame = 0;
-          shotsInClip = RIFLE_CLIP_SIZE;
+      if (rifleFrame >= RIFLE_RELOAD_FRAME_COUNT) {
+        rifleFrame = 0;
+        shotsInClip = RIFLE_CLIP_SIZE;
           if (clipsCarried > 0) clipsCarried -= 1;
-          rifleState = 'idle';
+        rifleState = 'idle';
         }
       }
     }
