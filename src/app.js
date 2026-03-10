@@ -1609,7 +1609,7 @@ function hitTestZombies(px, py) {
     const key = `${img?.src ?? ''}-${w}-${h}`;
     if (!spriteToData.has(key)) {
       ensureZombieSampleCanvas(w, h);
-      zombieSampleCtx.clearRect(0, 0, w, h);
+      zombieSampleCtx.clearRect(0, 0, zombieSampleCanvas.width, zombieSampleCanvas.height);
       zombieSampleCtx.drawImage(img, 0, 0, w, h, 0, 0, w, h);
       spriteToData.set(key, zombieSampleCtx.getImageData(0, 0, w, h));
     }
