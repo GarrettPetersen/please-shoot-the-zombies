@@ -1,6 +1,6 @@
 # Game server
 
-Minimal WebSocket server for **Please Shoot the Zombies** multiplayer. Run this on an EC2 instance (see [AWS setup](../docs/AWS_MULTIPLAYER_SETUP.md)).
+Matchmaking + roomed WebSocket server for **Please Shoot the Zombies** multiplayer. Run this on EC2 (see [AWS setup](../docs/AWS_MULTIPLAYER_SETUP.md)).
 
 ## Run locally
 
@@ -10,11 +10,31 @@ npm install
 npm start
 ```
 
-Listens on `ws://localhost:3000` (or `PORT` env var).
+Listens on `http://localhost:3000` (or `PORT` env var).
 
-## Protocol (minimal)
+## Matchmaking API
 
-- **Server → client:** `{ type: 'welcome', serverTime }` on connect; `{ type: 'pong', ts }` in response to ping.
-- **Client → server:** Any JSON. `{ type: 'ping' }` gets a pong; other messages are broadcast to all other connected clients.
+- `GET /api/health` -> basic health info
+- `GET /api/sessions/public` -> list open public sessions
+- `POST /api/sessions/create` -> create session
+  - body: `{ privacy, maxPlayers, botsFill, difficulty, playerName }`
+  - returns: `{ sessionId, joinCode, playerId, wsUrl, ... }`
+- `POST /api/sessions/join` -> join by `sessionId` or `joinCode`
+  - body: `{ sessionId?, joinCode?, playerName }`
+  - returns: `{ sessionId, joinCode, playerId, wsUrl, ... }`
 
-Game-specific messages (join, state, actions) can be added later; the client will need to connect to `ws://<EC2_PUBLIC_IP>:3000` (or `wss://...` with TLS).
+## Built-in bots
+
+- In open lobbies with `botsFill: true`, bots trickle in over time to keep rooms lively.
+- If a human joins and the lobby is full, a bot leaves to make room.
+- During matches, bots send normal player-style actions (`player_move`, `player_shot`, `player_board_*`, `player_ammo_pickup`) with realistic delays/reload rules.
+
+## WebSocket protocol
+
+- Connect to `ws://<host>:3000/ws?sessionId=<id>&playerId=<id>`.
+- Server sends `welcome` on connect and `pong` for `{ type: 'ping' }`.
+- Other messages are relayed to other players in the same session as:
+  - `{ type: 'relay', sessionId, fromPlayerId, payload, ts }`
+- Server also emits `player_joined`, `player_left`, and `host_changed` events.
+
+Set `PUBLIC_HTTP_URL` / `PUBLIC_WS_URL` env vars if you need to override returned public URLs.

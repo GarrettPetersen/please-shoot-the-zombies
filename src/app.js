@@ -15,6 +15,9 @@ canvas.height = H;
 // Pixel art: nearest-neighbor scaling, no anti-aliasing on sprites
 ctx.imageSmoothingEnabled = false;
 
+// Steam (matchmaking, voice) — App ID for Please Shoot the Zombies
+const STEAM_APP_ID = 4516500;
+
 // 3D: bunker at world center; camera moves between discrete slots around it.
 const WORLD_CENTER_X = 0;
 const WORLD_CENTER_Z = 0;
@@ -190,6 +193,7 @@ const ZOMBIE_DIR_CHANGE_DIST = 2.5;   // world units walked before maybe changin
 const ZOMBIE_DIR_CHANGE_CHANCE = 0.35; // probability to flip direction when threshold reached
 const GAME_OVER_FLASH_DURATION = 0.6;
 const GAME_OVER_FACE_DURATION = 2;  // seconds of zombie face + red tint before showing "game over" text
+const GAME_OVER_MENU_DELAY = 5;     // seconds before input can return to menu
 const ZOMBIE_SOUND_INTERVAL = 4;      // seconds between groans; deterministic from spawnIndex/spawnTime
 const GAME_PARAM_SEED = 13371337;
 const GAME_PARAM_WAVE_COUNT = 6;
@@ -228,6 +232,147 @@ let gameParamsHash = '';
 let tallyWallTileRef = null; // { segmentIndex, tileIndex }
 let tallyWallLastKilled = -1;
 let tallyWallLastRemaining = -1;
+let appMode = 'menu'; // 'menu' | 'game'
+
+const MENU_BUTTON_W = 290;
+const MENU_BUTTON_H = 24;
+const MENU_BUTTON_GAP = 7;
+const MENU_PAN_SPEED = 6; // px/sec at base resolution
+const MENU_LANGUAGES = {
+  en: {
+    titleMain: 'Please Shoot the Z0mbies',
+    subtitleMain: 'Defend the bunker',
+    startLocal: 'Start Local Game',
+    playOnline: 'Multiplayer',
+    options: 'Options',
+    back: 'Back',
+    hostPublic: 'Host Public Match',
+    hostPrivate: 'Host Private Match',
+    joinPublic: 'Join Public Match',
+    joinPrivate: 'Join Private Match (Code)',
+    language: 'Language',
+    settingsTitle: 'Match Settings',
+    privacy: 'Privacy',
+    maxPlayers: 'Max Players',
+    difficulty: 'Difficulty',
+    createMatch: 'Create Match',
+    lobbyTitle: 'Match Lobby',
+    lobbyWaiting: 'Waiting for players',
+    lobbyStart: 'Start Match',
+    lobbyLeave: 'Leave Lobby',
+    lobbyJoinCode: 'Join Code',
+    lobbyPlayers: 'Players',
+    lobbyHostOnly: 'Only host can start',
+    publicLabel: 'Public',
+    privateLabel: 'Private',
+    onLabel: 'On',
+    offLabel: 'Off',
+    diffNormal: 'Normal',
+    diffHard: 'Hard',
+    diffNightmare: 'Nightmare',
+    statusMpSoon: 'Multiplayer setup in progress',
+    statusStartingLocal: 'Starting local game',
+    statusHostSoon: 'Hosting flow coming next',
+    statusJoinSoon: 'Join flow coming next',
+    statusConnecting: 'Connecting to server',
+    statusConnected: 'Connected',
+    statusHosted: 'Match hosted',
+    statusJoined: 'Joined match',
+    statusMatchCreating: 'Creating match',
+    statusMatchStarting: 'Starting match',
+    statusWaitingInLobby: 'Waiting in lobby',
+    statusLeftLobby: 'Left lobby',
+    statusHostFailed: 'Could not host match',
+    statusJoinFailed: 'Could not join match',
+    statusNoPublic: 'No public matches available',
+    statusNeedCode: 'Join code required',
+    statusSocketClosed: 'Disconnected from match server',
+  },
+  es: {
+    titleMain: 'Please Shoot the Z0mbies',
+    subtitleMain: 'Defiende el bunker',
+    startLocal: 'Iniciar partida local',
+    playOnline: 'Multijugador',
+    options: 'Opciones',
+    back: 'Atras',
+    hostPublic: 'Crear partida publica',
+    hostPrivate: 'Crear partida privada',
+    joinPublic: 'Unirse publica',
+    joinPrivate: 'Unirse privada (codigo)',
+    language: 'Idioma',
+    settingsTitle: 'Configuracion de partida',
+    privacy: 'Privacidad',
+    maxPlayers: 'Max jugadores',
+    difficulty: 'Dificultad',
+    createMatch: 'Crear partida',
+    lobbyTitle: 'Sala de partida',
+    lobbyWaiting: 'Esperando jugadores',
+    lobbyStart: 'Iniciar partida',
+    lobbyLeave: 'Salir de la sala',
+    lobbyJoinCode: 'Codigo',
+    lobbyPlayers: 'Jugadores',
+    lobbyHostOnly: 'Solo el host puede iniciar',
+    publicLabel: 'Publica',
+    privateLabel: 'Privada',
+    onLabel: 'Si',
+    offLabel: 'No',
+    diffNormal: 'Normal',
+    diffHard: 'Dificil',
+    diffNightmare: 'Pesadilla',
+    statusMpSoon: 'Multijugador en progreso',
+    statusStartingLocal: 'Iniciando partida local',
+    statusHostSoon: 'Crear partida pronto',
+    statusJoinSoon: 'Unirse pronto',
+    statusConnecting: 'Conectando al servidor',
+    statusConnected: 'Conectado',
+    statusHosted: 'Partida creada',
+    statusJoined: 'Unido a la partida',
+    statusMatchCreating: 'Creando partida',
+    statusMatchStarting: 'Iniciando partida',
+    statusWaitingInLobby: 'Esperando en sala',
+    statusLeftLobby: 'Saliste de la sala',
+    statusHostFailed: 'No se pudo crear la partida',
+    statusJoinFailed: 'No se pudo unir',
+    statusNoPublic: 'No hay partidas publicas',
+    statusNeedCode: 'Se requiere codigo',
+    statusSocketClosed: 'Desconectado del servidor',
+  },
+};
+let menuLanguage = 'en';
+let menuPage = 'main';
+let menuSelectedIndex = 0;
+let menuHoverIndex = -1;
+let menuPanX = 0;
+let menuButtons = [];
+let menuToast = '';
+let menuToastUntil = 0;
+let confirmMainMenuOpen = false;
+const confirmMainMenuButtons = []; // updated when dialog draws
+const menuState = {
+  matchSettings: {
+    privacy: 'private',
+    maxPlayers: 8,
+    difficulty: 'normal',
+  },
+};
+const DEFAULT_MULTIPLAYER_HTTP_BASE = 'http://100.52.203.69:3000';
+let multiplayerHttpBase = DEFAULT_MULTIPLAYER_HTTP_BASE;
+let multiplayerWs = null;
+let multiplayerSession = null; // { sessionId, playerId, joinCode, privacy, maxPlayers }
+let multiplayerLobbyPlayers = []; // [{playerId,name,isHost,slotIndex}]
+let multiplayerConnected = false;
+let multiplayerAgreedHash = '';
+let multiplayerGameSeed = GAME_PARAM_SEED;
+let multiplayerWaveCount = GAME_PARAM_WAVE_COUNT;
+let multiplayerStartAt = 0;
+let pendingLossProposalId = '';
+let multiplayerDisconnecting = false;
+let multiplayerPlayers = new Map(); // playerId -> state
+let multiplayerArrivalCounter = 1;
+const MP_MOVE_DURATION = BUNKER_MOVE_DURATION;
+const MP_BOB_SPEED = 8;
+const MP_SPRITE_HEIGHT = 1.72;
+const MP_QUEUE_SPACING = 0.38;
 
 // Aiming: desired direction (reticule leads), camera chases with delay — turn any direction
 let desiredYaw = 0;
@@ -257,6 +402,793 @@ function getReticuleOffset() {
     x: Math.max(-RETICULE_CLAMP_X, Math.min(RETICULE_CLAMP_X, dx)),
     y: Math.max(-RETICULE_CLAMP_Y, Math.min(RETICULE_CLAMP_Y, dy)),
   };
+}
+
+function t(key) {
+  const table = MENU_LANGUAGES[menuLanguage] || MENU_LANGUAGES.en;
+  return table[key] ?? MENU_LANGUAGES.en[key] ?? key;
+}
+
+try {
+  const saved = window.localStorage?.getItem('multiplayerHttpBase');
+  if (saved && /^https?:\/\//i.test(saved)) multiplayerHttpBase = saved.replace(/\/+$/, '');
+} catch {
+  // ignore storage errors
+}
+
+function getCanvasPointerPos(evt) {
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return { x: W / 2, y: H / 2 };
+  return {
+    x: (evt.clientX - rect.left) * (W / rect.width),
+    y: (evt.clientY - rect.top) * (H / rect.height),
+  };
+}
+
+function showMenuToast(text, duration = 1.5) {
+  menuToast = text || '';
+  menuToastUntil = performance.now() / 1000 + duration;
+}
+
+function cycleValue(options, current, dir = 1) {
+  const idx = Math.max(0, options.indexOf(current));
+  return options[(idx + dir + options.length) % options.length];
+}
+
+function setMenuPage(pageId) {
+  menuPage = pageId;
+  menuSelectedIndex = 0;
+  menuHoverIndex = -1;
+}
+
+function startLocalGame(opts = {}) {
+  const seed = Number.isFinite(opts.seed) ? opts.seed : GAME_PARAM_SEED;
+  const waveCount = Number.isFinite(opts.waveCount) ? opts.waveCount : GAME_PARAM_WAVE_COUNT;
+  const agreedHash = typeof opts.agreedHash === 'string' ? opts.agreedHash : '';
+  gameTime = 0;
+  score = 0;
+  rifleFrame = 0;
+  rifleState = 'idle';
+  rifleFrameTime = 0;
+  shotsInClip = RIFLE_CLIP_SIZE;
+  clipsCarried = MAX_CLIPS;
+  outOfAmmoMessageTime = 0;
+  reloadSoundPlayed = false;
+  boltOpenSoundPlayed = false;
+  boltCloseSoundPlayed = false;
+  ironSightsHeld = false;
+  ironSightsRecoilKick = 0;
+  zombies = [];
+  particles = [];
+  hitFeedbackTime = 0;
+  nextZombiePlanIndex = 0;
+  spawnCounter = 0;
+  gameOver = false;
+  gameOverZombie = null;
+  gameOverFlashStart = 0;
+  gameWon = false;
+  gameWonAt = 0;
+  boardPlaceState = null;
+  fallingBoards = [];
+  movementStartTime = null;
+  movementPathPoints = [];
+  movementPathLengths = [];
+  movementPathTotalLength = 0;
+  pendingLossProposalId = '';
+  if (assets.runningSound) { assets.runningSound.pause(); assets.runningSound.currentTime = 0; }
+
+  const planned = generateGameParameters(seed, waveCount);
+  gameParams = planned.params;
+  gameParamsHash = planned.hash;
+  if (agreedHash && gameParamsHash !== agreedHash) {
+    showMenuToast(`State hash mismatch (${gameParamsHash} != ${agreedHash})`, 2.2);
+    appMode = 'menu';
+    return false;
+  }
+  zombieSpawnPlan = gameParams.zombies ?? [];
+  window.__gameParameters = gameParams;
+  window.__gameParametersHash = gameParamsHash;
+  generateTrees();
+  initWindowBoards();
+  tallyWallLastKilled = -1;
+  tallyWallLastRemaining = -1;
+  updateTallyWallTextures();
+
+  activeSlotIndex = Math.max(0, bunkerSlots.findIndex((slot) => slot.type === 'window' || slot.type === 'crate'));
+  setActiveBunkerSlot(activeSlotIndex, true);
+  const localId = multiplayerSession?.playerId || '__local__';
+  const me = ensureMpPlayer(localId, 'You');
+  me.isLocal = true;
+  me.slotIndex = activeSlotIndex;
+  me.moveFromIndex = activeSlotIndex;
+  me.moveToIndex = activeSlotIndex;
+  me.moving = false;
+  me.arrivalOrder = multiplayerArrivalCounter++;
+  desiredPitch = 0;
+  cameraPitch = 0;
+  appMode = 'game';
+  return true;
+}
+
+function getPlayerNameForMatchmaking() {
+  try {
+    let name = window.localStorage?.getItem('playerDisplayName') || '';
+    if (!name) {
+      name = `Survivor-${Math.floor(1000 + Math.random() * 9000)}`;
+      window.localStorage?.setItem('playerDisplayName', name);
+    }
+    return name;
+  } catch {
+    return `Survivor-${Math.floor(1000 + Math.random() * 9000)}`;
+  }
+}
+
+function wsBaseFromHttp(httpUrl) {
+  return String(httpUrl || '')
+    .replace(/^http:\/\//i, 'ws://')
+    .replace(/^https:\/\//i, 'wss://')
+    .replace(/\/+$/, '');
+}
+
+async function apiJson(path, method = 'GET', body = undefined) {
+  const url = `${multiplayerHttpBase.replace(/\/+$/, '')}${path}`;
+  const init = {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+  };
+  if (body !== undefined) init.body = JSON.stringify(body);
+  const res = await fetch(url, init);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.ok === false) {
+    throw new Error(data?.error || `HTTP ${res.status}`);
+  }
+  return data;
+}
+
+function closeMultiplayerSocket() {
+  multiplayerDisconnecting = true;
+  if (multiplayerWs && multiplayerWs.readyState === WebSocket.OPEN) {
+    try { multiplayerWs.send(JSON.stringify({ type: 'disconnect', at: Date.now() })); } catch {}
+  }
+  if (multiplayerWs) {
+    try { multiplayerWs.close(1000, 'Client disconnect'); } catch {}
+  }
+  multiplayerWs = null;
+  multiplayerConnected = false;
+  multiplayerPlayers.clear();
+  multiplayerLobbyPlayers = [];
+  if (assets.runningSound) {
+    try { assets.runningSound.pause(); assets.runningSound.currentTime = 0; } catch {}
+  }
+}
+
+function sendMultiplayerPayload(type, payload = {}) {
+  if (!multiplayerWs || multiplayerWs.readyState !== WebSocket.OPEN) return;
+  if (!multiplayerSession?.sessionId || !multiplayerSession?.playerId) return;
+  multiplayerWs.send(JSON.stringify({ type, ...payload }));
+}
+
+function setLobbyPlayers(players = []) {
+  multiplayerLobbyPlayers = (players || []).map((p) => ({
+    playerId: p.playerId,
+    name: p.name || 'Player',
+    isHost: !!p.isHost,
+    slotIndex: Number.isFinite(p.slotIndex) ? Math.floor(p.slotIndex) : 0,
+  }));
+}
+
+function upsertLobbyPlayer(player) {
+  if (!player?.playerId) return;
+  const idx = multiplayerLobbyPlayers.findIndex((p) => p.playerId === player.playerId);
+  const value = {
+    playerId: player.playerId,
+    name: player.name || 'Player',
+    isHost: !!player.isHost,
+    slotIndex: Number.isFinite(player.slotIndex) ? Math.floor(player.slotIndex) : 0,
+  };
+  if (idx >= 0) multiplayerLobbyPlayers[idx] = value;
+  else multiplayerLobbyPlayers.push(value);
+}
+
+function removeLobbyPlayer(playerId) {
+  multiplayerLobbyPlayers = multiplayerLobbyPlayers.filter((p) => p.playerId !== playerId);
+}
+
+function isLobbyHost() {
+  if (!multiplayerSession?.playerId) return false;
+  const me = multiplayerLobbyPlayers.find((p) => p.playerId === multiplayerSession.playerId);
+  return !!me?.isHost;
+}
+
+function startMatchFromLobby() {
+  if (!multiplayerSession || !multiplayerConnected) return;
+  if (!isLobbyHost()) {
+    showMenuToast(t('lobbyHostOnly'), 1.4);
+    return;
+  }
+  showMenuToast(t('statusMatchStarting'), 1.5);
+  sendMultiplayerPayload('start_match', { at: Date.now() });
+}
+
+function leaveLobby() {
+  closeMultiplayerSocket();
+  multiplayerSession = null;
+  multiplayerConnected = false;
+  multiplayerAgreedHash = '';
+  multiplayerStartAt = 0;
+  showMenuToast(t('statusLeftLobby'), 1.2);
+  setMenuPage('online');
+}
+
+function getSlotByIndex(idx) {
+  if (!bunkerSlots.length) return null;
+  const i = Math.max(0, Math.min(bunkerSlots.length - 1, Math.floor(idx)));
+  return bunkerSlots[i] ?? null;
+}
+
+function ensureMpPlayer(playerId, name = '') {
+  let p = multiplayerPlayers.get(playerId);
+  if (!p) {
+    p = {
+      playerId,
+      name: name || `Player-${playerId.slice(-4)}`,
+      slotIndex: activeSlotIndex,
+      arrivalOrder: multiplayerArrivalCounter++,
+      moving: false,
+      moveStartAt: 0,
+      moveFromIndex: activeSlotIndex,
+      moveToIndex: activeSlotIndex,
+      bobPhase: Math.random() * Math.PI * 2,
+      isLocal: playerId === multiplayerSession?.playerId,
+    };
+    multiplayerPlayers.set(playerId, p);
+  } else if (name) {
+    p.name = name;
+  }
+  return p;
+}
+
+function setMpPlayerSlot(playerId, slotIndex, nowMs = Date.now()) {
+  const p = ensureMpPlayer(playerId);
+  const toIdx = Math.max(0, Math.min(bunkerSlots.length - 1, Math.floor(slotIndex)));
+  if (p.slotIndex === toIdx && !p.moving) return p;
+  p.moveFromIndex = p.slotIndex;
+  p.moveToIndex = toIdx;
+  p.moveStartAt = nowMs;
+  p.moving = true;
+  p.slotIndex = toIdx;
+  p.arrivalOrder = multiplayerArrivalCounter++;
+  return p;
+}
+
+function removeMpPlayer(playerId) {
+  multiplayerPlayers.delete(playerId);
+}
+
+function getMpPlayerWorldPos(p, nowMs = Date.now()) {
+  const toSlot = getSlotByIndex(p.moveToIndex ?? p.slotIndex);
+  const fromSlot = getSlotByIndex(p.moveFromIndex ?? p.slotIndex) || toSlot;
+  if (!toSlot || !fromSlot) return { x: cameraX, y: 0, z: cameraZ, moving: false };
+  let t = 1;
+  if (p.moving) {
+    t = Math.max(0, Math.min(1, (nowMs - p.moveStartAt) / (MP_MOVE_DURATION * 1000)));
+    if (t >= 1) p.moving = false;
+  }
+  const s = t * t * (3 - 2 * t);
+  const x = fromSlot.x + (toSlot.x - fromSlot.x) * s;
+  const z = fromSlot.z + (toSlot.z - fromSlot.z) * s;
+  const bob = p.moving ? Math.sin((nowMs / 1000) * MP_BOB_SPEED + p.bobPhase) * 0.03 : 0;
+  return { x, y: bob, z, moving: p.moving, slot: toSlot };
+}
+
+function getSlotQueueMap() {
+  const bySlot = new Map();
+  const localId = multiplayerSession?.playerId || '__local__';
+  const localEntry = ensureMpPlayer(localId, 'You');
+  localEntry.isLocal = true;
+  localEntry.slotIndex = activeSlotIndex;
+  if (!bySlot.has(localEntry.slotIndex)) bySlot.set(localEntry.slotIndex, []);
+  bySlot.get(localEntry.slotIndex).push(localEntry);
+  multiplayerPlayers.forEach((p) => {
+    if (p.playerId === localId) return;
+    if (!bySlot.has(p.slotIndex)) bySlot.set(p.slotIndex, []);
+    bySlot.get(p.slotIndex).push(p);
+  });
+  bySlot.forEach((arr) => arr.sort((a, b) => {
+    if (a.isLocal && !b.isLocal) return -1;
+    if (!a.isLocal && b.isLocal) return 1;
+    return String(a.playerId).localeCompare(String(b.playerId));
+  }));
+  return bySlot;
+}
+
+function playPositionalClip(audioTemplate, worldX, worldZ, gainMul = 1, decayMs = 0) {
+  if (!audioTemplate) return;
+  const ctx = getAudioContext();
+  if (!ctx) return;
+  const { gain, pan } = getPositionalGainPan(worldX, worldZ);
+  const audio = audioTemplate.cloneNode(true);
+  audio.preload = 'auto';
+  const source = ctx.createMediaElementSource(audio);
+  const gainNode = ctx.createGain();
+  const panner = ctx.createStereoPanner();
+  const startGain = Math.max(0.001, gain * gainMul);
+  gainNode.gain.value = startGain;
+  panner.pan.value = pan;
+  source.connect(gainNode);
+  gainNode.connect(panner);
+  panner.connect(ctx.destination);
+  if (decayMs > 0) {
+    gainNode.gain.setValueAtTime(startGain, ctx.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + decayMs / 1000);
+  }
+  audio.play().catch(() => {});
+}
+
+function isLossConditionMet() {
+  if (gameOver || gameWon) return false;
+  for (const z of zombies) {
+    const targetX = z.targetWindowX ?? WORLD_CENTER_X;
+    const targetZ = z.targetWindowZ ?? WORLD_CENTER_Z;
+    const dx = targetX - z.x;
+    const dz = targetZ - z.z;
+    const d = Math.sqrt(dx * dx + dz * dz) || 0.001;
+    if (d >= BOARD_AT_WINDOW_DIST) continue;
+    const slotKey = z.targetSlot ? getSlotKey(z.targetSlot) : '';
+    const boardsAtWindow = slotKey ? (windowBoards[slotKey] ?? 0) : 0;
+    if (boardsAtWindow > 0) continue;
+    const started = z.breachStartTime != null;
+    if (started && (gameTime - z.breachStartTime) >= BOARD_BREACH_DELAY) return true;
+  }
+  return false;
+}
+
+function proposeGameOver(z) {
+  if (!multiplayerSession || !multiplayerConnected) return;
+  if (pendingLossProposalId) return;
+  pendingLossProposalId = `local_${Date.now()}`;
+  sendMultiplayerPayload('game_over_proposal', {
+    reason: 'window_breach',
+    meta: {
+      zombieSpawnIndex: z?.spawnIndex ?? null,
+      targetSlotKey: z?.targetSlot ? getSlotKey(z.targetSlot) : '',
+    },
+  });
+}
+
+function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
+  closeMultiplayerSocket();
+  const wsBase = wsUrlFromServer || `${wsBaseFromHttp(multiplayerHttpBase)}/ws`;
+  const sep = wsBase.includes('?') ? '&' : '?';
+  const wsUrl = `${wsBase}${sep}sessionId=${encodeURIComponent(sessionId)}&playerId=${encodeURIComponent(playerId)}`;
+  multiplayerWs = new WebSocket(wsUrl);
+  multiplayerWs.addEventListener('open', () => {
+    multiplayerDisconnecting = false;
+    multiplayerConnected = true;
+    showMenuToast(t('statusConnected'), 1.2);
+  });
+  multiplayerWs.addEventListener('message', (ev) => {
+    if (multiplayerDisconnecting) return;
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'welcome' && msg.session) {
+        multiplayerSession = {
+          sessionId: msg.session.sessionId,
+          joinCode: msg.session.joinCode,
+          privacy: msg.session.privacy,
+          maxPlayers: msg.session.maxPlayers,
+          playerId,
+        };
+        multiplayerPlayers.clear();
+        setLobbyPlayers(msg.session.players || []);
+        if (appMode === 'menu') setMenuPage('lobby');
+        if (Array.isArray(msg.session.players)) {
+          for (const pl of msg.session.players) {
+            const ps = ensureMpPlayer(pl.playerId, pl.name || '');
+            ps.isLocal = pl.playerId === playerId;
+            const idx = Number.isFinite(pl.slotIndex) ? pl.slotIndex : activeSlotIndex;
+            ps.slotIndex = Math.max(0, Math.min(Math.max(0, bunkerSlots.length - 1), Math.floor(idx)));
+            ps.moveFromIndex = ps.slotIndex;
+            ps.moveToIndex = ps.slotIndex;
+          }
+        }
+        multiplayerGameSeed = Number(msg.session.gameSeed || GAME_PARAM_SEED);
+        multiplayerWaveCount = Number(msg.session.waveCount || GAME_PARAM_WAVE_COUNT);
+        if (msg.session.agreedHash) {
+          multiplayerAgreedHash = msg.session.agreedHash;
+          multiplayerStartAt = Number(msg.session.startedAt || 0);
+        }
+        showMenuToast(t('statusWaitingInLobby'), 1.3);
+        return;
+      }
+      if (msg.type === 'handshake_request') {
+        multiplayerGameSeed = Number(msg.seed || GAME_PARAM_SEED);
+        multiplayerWaveCount = Number(msg.waveCount || GAME_PARAM_WAVE_COUNT);
+        const planned = generateGameParameters(multiplayerGameSeed, multiplayerWaveCount);
+        sendMultiplayerPayload('state_hash', {
+          hash: planned.hash,
+          clientVersion: 'prototype',
+        });
+        return;
+      }
+      if (msg.type === 'start_game') {
+        multiplayerGameSeed = Number(msg.seed || GAME_PARAM_SEED);
+        multiplayerWaveCount = Number(msg.waveCount || GAME_PARAM_WAVE_COUNT);
+        multiplayerAgreedHash = String(msg.agreedHash || '');
+        multiplayerStartAt = Number(msg.startAt || 0);
+        if (startLocalGame({
+          seed: multiplayerGameSeed,
+          waveCount: multiplayerWaveCount,
+          agreedHash: multiplayerAgreedHash,
+        })) {
+          showMenuToast(`${t('statusJoined')} (${multiplayerSession?.joinCode || ''})`, 1.8);
+          canvas.requestPointerLock();
+        }
+        return;
+      }
+      if (msg.type === 'player_joined' && msg.player) {
+        upsertLobbyPlayer(msg.player);
+        const ps = ensureMpPlayer(msg.player.playerId, msg.player.name || '');
+        ps.isLocal = msg.player.playerId === multiplayerSession?.playerId;
+        if (Number.isFinite(msg.player.slotIndex)) {
+          ps.slotIndex = Math.floor(msg.player.slotIndex);
+          ps.moveFromIndex = ps.slotIndex;
+          ps.moveToIndex = ps.slotIndex;
+        }
+        ps.arrivalOrder = multiplayerArrivalCounter++;
+        return;
+      }
+      if (msg.type === 'player_left') {
+        removeLobbyPlayer(msg.playerId);
+        removeMpPlayer(msg.playerId);
+        return;
+      }
+      if (msg.type === 'host_changed') {
+        if (msg.playerId) {
+          multiplayerLobbyPlayers = multiplayerLobbyPlayers.map((p) => ({ ...p, isHost: p.playerId === msg.playerId }));
+        }
+        return;
+      }
+      if (msg.type === 'hash_mismatch') {
+        showMenuToast(`Hash mismatch: ${msg.yourHash} vs ${msg.agreedHash}`, 2.8);
+        closeMultiplayerSocket();
+        multiplayerSession = null;
+        appMode = 'menu';
+        setMenuPage('main');
+        return;
+      }
+      if (msg.type === 'game_over_vote_request') {
+        pendingLossProposalId = String(msg.proposalId || '');
+        const agree = isLossConditionMet();
+        sendMultiplayerPayload('game_over_vote', { proposalId: pendingLossProposalId, agree });
+        return;
+      }
+      if (msg.type === 'game_over_confirm') {
+        pendingLossProposalId = '';
+        const zombieSpawnIndex = msg?.meta?.zombieSpawnIndex;
+        if (zombieSpawnIndex != null) {
+          gameOverZombie = zombies.find((z) => z.spawnIndex === zombieSpawnIndex) || gameOverZombie;
+        }
+        gameOver = true;
+        gameOverFlashStart = performance.now() / 1000;
+        return;
+      }
+      if (msg.type === 'game_over_canceled') {
+        pendingLossProposalId = '';
+        return;
+      }
+      if (msg.type === 'relay') {
+        if (appMode !== 'game' || gameOver || gameWon) return;
+        const from = String(msg.fromPlayerId || '');
+        const payload = msg.payload || {};
+        const remote = ensureMpPlayer(from);
+        const nowMs = Date.now();
+        if (payload.type === 'player_move') {
+          const to = Number(payload.toSlotIndex);
+          if (Number.isFinite(to)) {
+            setMpPlayerSlot(from, to, nowMs);
+            const pos = getMpPlayerWorldPos(remote, nowMs);
+            if (assets.runningSound) playPositionalClip(assets.runningSound, pos.x, pos.z, 0.35, 1300);
+          }
+        } else if (payload.type === 'player_shot') {
+          if (Number.isFinite(payload.slotIndex)) setMpPlayerSlot(from, Number(payload.slotIndex), nowMs);
+          const pos = getMpPlayerWorldPos(remote, nowMs);
+          const shotList = assets.shotSounds || [];
+          if (shotList.length > 0) {
+            const sfx = shotList[Math.floor(Math.random() * shotList.length)];
+            playPositionalClip(sfx, pos.x, pos.z, 0.85, 280);
+          }
+          if (assets.ejectCasing) playPositionalClip(assets.ejectCasing, pos.x, pos.z, 0.7, 220);
+          applyRemoteZombieHit(payload, remote);
+        } else if (payload.type === 'player_board_start') {
+          const pos = getMpPlayerWorldPos(remote, nowMs);
+          if (Number.isFinite(payload.slotIndex)) setMpPlayerSlot(from, Number(payload.slotIndex), nowMs);
+          if (assets.hammerSound) playPositionalClip(assets.hammerSound, pos.x, pos.z, 0.75, 900);
+        } else if (payload.type === 'player_board_complete') {
+          const pos = getMpPlayerWorldPos(remote, nowMs);
+          if (assets.hammerSound) playPositionalClip(assets.hammerSound, pos.x, pos.z, 0.7, 500);
+        } else if (payload.type === 'player_ammo_pickup') {
+          const pos = getMpPlayerWorldPos(remote, nowMs);
+          if (Number.isFinite(payload.slotIndex)) setMpPlayerSlot(from, Number(payload.slotIndex), nowMs);
+          if (assets.pickUp) playPositionalClip(assets.pickUp, pos.x, pos.z, 0.8, 700);
+          if (assets.reloadSound) playPositionalClip(assets.reloadSound, pos.x, pos.z, 0.65, 1200);
+        } else if (payload.type === 'player_reload_start') {
+          const pos = getMpPlayerWorldPos(remote, nowMs);
+          if (Number.isFinite(payload.slotIndex)) setMpPlayerSlot(from, Number(payload.slotIndex), nowMs);
+          if (assets.reloadSound) playPositionalClip(assets.reloadSound, pos.x, pos.z, 0.7, 1200);
+        }
+        return;
+      }
+    } catch {
+      // ignore non-json
+    }
+  });
+  multiplayerWs.addEventListener('close', () => {
+    multiplayerWs = null;
+    multiplayerConnected = false;
+    if (appMode === 'game' && multiplayerSession) showMenuToast(t('statusSocketClosed'), 1.4);
+    if (appMode === 'menu' && menuPage === 'lobby') setMenuPage('online');
+  });
+}
+
+async function hostMatchFromSettings() {
+  showMenuToast(t('statusMatchCreating'), 2);
+  const s = menuState.matchSettings;
+  const name = getPlayerNameForMatchmaking();
+  const created = await apiJson('/api/sessions/create', 'POST', {
+    privacy: s.privacy,
+    maxPlayers: s.maxPlayers,
+    botsFill: true,
+    difficulty: s.difficulty,
+    playerName: name,
+  });
+  multiplayerSession = {
+    sessionId: created.sessionId,
+    playerId: created.playerId,
+    joinCode: created.joinCode,
+    privacy: created.privacy,
+    maxPlayers: created.maxPlayers,
+  };
+  multiplayerAgreedHash = '';
+  multiplayerStartAt = 0;
+  connectMultiplayerSocket(created.sessionId, created.playerId, created.wsUrl);
+  showMenuToast(`${t('statusHosted')} (${created.joinCode})`, 2.2);
+  setMenuPage('lobby');
+}
+
+async function joinPublicMatch() {
+  showMenuToast(t('statusConnecting'), 2);
+  const list = await apiJson('/api/sessions/public');
+  const sessions = Array.isArray(list.sessions) ? list.sessions : [];
+  if (sessions.length === 0) {
+    showMenuToast(t('statusNoPublic'), 1.8);
+    return;
+  }
+  const pick = sessions.sort((a, b) => b.playerCount - a.playerCount)[0];
+  const joined = await apiJson('/api/sessions/join', 'POST', {
+    sessionId: pick.sessionId,
+    playerName: getPlayerNameForMatchmaking(),
+  });
+  multiplayerSession = {
+    sessionId: joined.sessionId,
+    playerId: joined.playerId,
+    joinCode: joined.joinCode,
+    privacy: joined.privacy,
+    maxPlayers: joined.maxPlayers,
+  };
+  multiplayerAgreedHash = '';
+  multiplayerStartAt = 0;
+  connectMultiplayerSocket(joined.sessionId, joined.playerId, joined.wsUrl);
+  showMenuToast(t('statusWaitingInLobby'), 1.8);
+  setMenuPage('lobby');
+}
+
+async function joinPrivateMatch() {
+  const code = (window.prompt('Enter private match code') || '').trim().toUpperCase();
+  if (!code) {
+    showMenuToast(t('statusNeedCode'), 1.5);
+    return;
+  }
+  showMenuToast(t('statusConnecting'), 2);
+  const joined = await apiJson('/api/sessions/join', 'POST', {
+    joinCode: code,
+    playerName: getPlayerNameForMatchmaking(),
+  });
+  multiplayerSession = {
+    sessionId: joined.sessionId,
+    playerId: joined.playerId,
+    joinCode: joined.joinCode,
+    privacy: joined.privacy,
+    maxPlayers: joined.maxPlayers,
+  };
+  multiplayerAgreedHash = '';
+  multiplayerStartAt = 0;
+  connectMultiplayerSocket(joined.sessionId, joined.playerId, joined.wsUrl);
+  showMenuToast(t('statusWaitingInLobby'), 1.8);
+  setMenuPage('lobby');
+}
+
+function getMenuPageDefinition() {
+  const settings = menuState.matchSettings;
+  const privLabel = settings.privacy === 'public' ? t('publicLabel') : t('privateLabel');
+  const diffLabel = settings.difficulty === 'hard'
+    ? t('diffHard')
+    : settings.difficulty === 'nightmare' ? t('diffNightmare') : t('diffNormal');
+  const langOptions = Object.keys(MENU_LANGUAGES);
+  const languageName = menuLanguage.toUpperCase();
+
+  if (menuPage === 'online') {
+    return {
+      title: t('playOnline'),
+      subtitle: t('subtitleMain'),
+      items: [
+        { label: t('joinPublic'), onSelect: async () => joinPublicMatch() },
+        { label: t('joinPrivate'), onSelect: async () => joinPrivateMatch() },
+        {
+          label: t('hostPublic'),
+          onSelect: () => {
+            settings.privacy = 'public';
+            setMenuPage('match_settings');
+          },
+        },
+        {
+          label: t('hostPrivate'),
+          onSelect: () => {
+            settings.privacy = 'private';
+            setMenuPage('match_settings');
+          },
+        },
+        { label: t('back'), onSelect: () => setMenuPage('main') },
+      ],
+    };
+  }
+
+  if (menuPage === 'options') {
+    return {
+      title: t('options'),
+      subtitle: t('subtitleMain'),
+      items: [
+        {
+          label: `${t('language')}: ${languageName}`,
+          onSelect: () => {
+            menuLanguage = cycleValue(langOptions, menuLanguage, 1);
+          },
+        },
+        {
+          label: `Server: ${multiplayerHttpBase.replace(/^https?:\/\//, '')}`,
+          onSelect: () => {
+            const next = (window.prompt('Multiplayer server URL', multiplayerHttpBase) || '').trim();
+            if (!next) return;
+            if (!/^https?:\/\//i.test(next)) {
+              showMenuToast('Use http:// or https://', 1.5);
+              return;
+            }
+            multiplayerHttpBase = next.replace(/\/+$/, '');
+            try { window.localStorage?.setItem('multiplayerHttpBase', multiplayerHttpBase); } catch {}
+          },
+        },
+        { label: t('back'), onSelect: () => setMenuPage('main') },
+      ],
+    };
+  }
+
+  if (menuPage === 'match_settings') {
+    return {
+      title: t('settingsTitle'),
+      subtitle: t('playOnline'),
+      items: [
+        {
+          label: `${t('privacy')}: ${privLabel}`,
+          onSelect: () => {
+            settings.privacy = settings.privacy === 'public' ? 'private' : 'public';
+          },
+        },
+        {
+          label: `${t('maxPlayers')}: ${settings.maxPlayers}`,
+          onSelect: () => {
+            settings.maxPlayers = cycleValue([4, 8, 12, 16, 24, 32, 48, 64], settings.maxPlayers, 1);
+          },
+        },
+        {
+          label: `${t('difficulty')}: ${diffLabel}`,
+          onSelect: () => {
+            settings.difficulty = cycleValue(['normal', 'hard', 'nightmare'], settings.difficulty, 1);
+          },
+        },
+        { label: t('createMatch'), onSelect: async () => hostMatchFromSettings() },
+        { label: t('back'), onSelect: () => setMenuPage('online') },
+      ],
+    };
+  }
+
+  if (menuPage === 'lobby') {
+    return {
+      title: t('lobbyTitle'),
+      subtitle: t('lobbyWaiting'),
+      items: [
+        ...(isLobbyHost() ? [{ label: t('lobbyStart'), onSelect: () => startMatchFromLobby() }] : []),
+        { label: t('lobbyLeave'), onSelect: () => leaveLobby() },
+      ],
+    };
+  }
+
+  return {
+    title: t('titleMain'),
+    subtitle: t('subtitleMain'),
+    items: [
+      {
+        label: t('startLocal'),
+        onSelect: () => {
+          showMenuToast(t('statusStartingLocal'), 0.8);
+          startLocalGame();
+          canvas.requestPointerLock();
+        },
+      },
+      { label: t('playOnline'), onSelect: () => setMenuPage('online') },
+      { label: t('options'), onSelect: () => setMenuPage('options') },
+    ],
+  };
+}
+
+function selectMenuItem(index) {
+  const def = getMenuPageDefinition();
+  const item = def.items[index];
+  if (!item || typeof item.onSelect !== 'function') return;
+  try {
+    const maybe = item.onSelect();
+    if (maybe && typeof maybe.then === 'function') {
+      maybe.catch((err) => {
+        console.error(err);
+        showMenuToast(t('statusJoinFailed'), 2);
+      });
+    }
+  } catch (err) {
+    console.error(err);
+    showMenuToast(t('statusJoinFailed'), 2);
+  }
+}
+
+function handleMenuKeydown(e) {
+  const def = getMenuPageDefinition();
+  const count = def.items.length;
+  if (e.code === 'ArrowUp' || e.code === 'KeyW') {
+    e.preventDefault();
+    menuSelectedIndex = (menuSelectedIndex - 1 + count) % count;
+  } else if (e.code === 'ArrowDown' || e.code === 'KeyS') {
+    e.preventDefault();
+    menuSelectedIndex = (menuSelectedIndex + 1) % count;
+  } else if (e.code === 'Enter' || e.code === 'Space') {
+    e.preventDefault();
+    selectMenuItem(menuSelectedIndex);
+  } else if (e.code === 'Escape' || e.code === 'Backspace') {
+    if (menuPage !== 'main') {
+      e.preventDefault();
+      if (menuPage === 'lobby') {
+        leaveLobby();
+        return;
+      }
+      if (menuPage === 'match_settings') setMenuPage('online');
+      else setMenuPage('main');
+    }
+  }
+}
+
+function updateMenuHover(mx, my) {
+  menuHoverIndex = -1;
+  for (let i = 0; i < menuButtons.length; i++) {
+    const b = menuButtons[i];
+    if (mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h) {
+      menuHoverIndex = i;
+      menuSelectedIndex = i;
+      return;
+    }
+  }
+}
+
+function handleMenuClick(e) {
+  const { x, y } = getCanvasPointerPos(e);
+  updateMenuHover(x, y);
+  if (menuHoverIndex >= 0) selectMenuItem(menuHoverIndex);
 }
 
 // ---- 3D projection ----
@@ -889,8 +1821,20 @@ function setActiveBunkerSlot(index, snap = false, directionHint = 0) {
       movementPathTotalLength = pathData.total;
       ironSightsHeld = false;
       if (assets.runningSound) assets.runningSound.play().catch(() => {});
+      sendMultiplayerPayload('player_move', {
+        fromSlotIndex: prevIndex,
+        toSlotIndex: activeSlotIndex,
+        at: Date.now(),
+      });
     }
   }
+  const localId = multiplayerSession?.playerId || '__local__';
+  const me = ensureMpPlayer(localId, 'You');
+  me.isLocal = true;
+  me.slotIndex = activeSlotIndex;
+  me.moveFromIndex = activeSlotIndex;
+  me.moveToIndex = activeSlotIndex;
+  if (snap) me.moving = false;
 }
 
 function moveBunkerSlot(step) {
@@ -1665,7 +2609,7 @@ function shotLeavesThroughWindow(px, py) {
 }
 
 /** True when line of sight from camera to world point is not blocked by an opaque wall pixel. */
-function isWorldPointVisibleFromCamera(wx, wy, wz) {
+function isWorldPointVisibleFromCamera(wx, wy, wz, nearTargetCutoff = 0.995) {
   if (!bunker || !bunkerWallSegments?.length) return true;
   const origin = { x: cameraX, y: CAMERA_Y, z: cameraZ };
   const dir = { x: wx - origin.x, y: wy - origin.y, z: wz - origin.z };
@@ -1683,7 +2627,7 @@ function isWorldPointVisibleFromCamera(wx, wy, wz) {
     const t = cross2(qmpX, qmpZ, sX, sZ) / rxs;
     const u = cross2(qmpX, qmpZ, rX, rZ) / rxs;
     // Treat hits before the target point only; ignore near-target wall contact.
-    if (t <= EPS || t >= 0.995 || u < -EPS || u > 1 + EPS) continue;
+    if (t <= EPS || t >= nearTargetCutoff || u < -EPS || u > 1 + EPS) continue;
     const y = origin.y + dir.y * t;
     if (y <= 0 || y >= BUNKER_WALL_HEIGHT) continue;
     const alpha = sampleBunkerWallAlpha(segment, Math.max(0, Math.min(1, u)), y);
@@ -1758,6 +2702,9 @@ function getTreeGridCell(spriteIndex) {
 
 async function loadAssets() {
   const base = 'assets';
+  assets.menuBackground = await loadImage(`${base}/backgrounds/spooky_forest.png`);
+  assets.playerSpriteSide = await loadImage(`${base}/soldier_side.png`);
+  assets.playerSpriteBack = await loadImage(`${base}/soldier_back.png`);
   assets.rifleFire = await loadImage(`${base}/lee_enfield-Sheet.png`);
   assets.rifleReload = await loadImage(`${base}/lee_enfield_reload-Sheet.png`);
   assets.zombie = await loadImage(`${base}/german_zombie.png`);
@@ -2074,16 +3021,20 @@ function updateZombies(dt) {
       } else {
         if (z.breachStartTime == null) z.breachStartTime = gameTime;
         if (gameTime - z.breachStartTime >= BOARD_BREACH_DELAY) {
-          gameOverZombie = z;
-          gameOver = true;
-          gameOverFlashStart = performance.now() / 1000;
-          const paths = z.useFemaleSounds ? assets.zombieFemaleSoundPaths : assets.zombieSoundPaths;
-          const numPaths = paths?.length ?? 0;
-          if (numPaths > 0) {
-            const url = paths[z.spawnIndex % numPaths];
-            const audio = new Audio(url);
-            audio.volume = 1;
-            audio.play().catch(() => {});
+          if (multiplayerSession && multiplayerConnected) {
+            proposeGameOver(z);
+          } else {
+            gameOverZombie = z;
+            gameOver = true;
+            gameOverFlashStart = performance.now() / 1000;
+            const paths = z.useFemaleSounds ? assets.zombieFemaleSoundPaths : assets.zombieSoundPaths;
+            const numPaths = paths?.length ?? 0;
+            if (numPaths > 0) {
+              const url = paths[z.spawnIndex % numPaths];
+              const audio = new Audio(url);
+              audio.volume = 1;
+              audio.play().catch(() => {});
+            }
           }
           return;
         }
@@ -2352,6 +3303,44 @@ function damageZombie(idx, hitPx, hitPy) {
     z.holes.push({ tx: hitTx, ty: hitTy, jaggedRadii });
     spawnHoleParticles(z, info, hitPx, hitPy, jaggedRadii);
   }
+}
+
+function applyRemoteZombieHit(payload, remotePlayer) {
+  const hit = payload?.hit;
+  if (!hit || hit.type !== 'zombie' || zombies.length === 0) return;
+  let zombieIdx = -1;
+  const remoteId = Number(hit.zombieId);
+  if (Number.isFinite(remoteId)) {
+    zombieIdx = zombies.findIndex((z) => z.spawnIndex === remoteId);
+    if (zombieIdx < 0) zombieIdx = zombies.findIndex((z) => z.spawnIndex === (remoteId - 1));
+  }
+  if (zombieIdx < 0 && Number.isFinite(payload?.targetSlotIndex)) {
+    const targetIdx = Number(payload.targetSlotIndex);
+    zombieIdx = zombies.findIndex((z) => z.targetSlot && bunkerSlots.indexOf(z.targetSlot) === targetIdx);
+  }
+  if (zombieIdx < 0) {
+    const shooterPos = getMpPlayerWorldPos(remotePlayer, Date.now());
+    let bestDist2 = Infinity;
+    for (let i = 0; i < zombies.length; i++) {
+      const z = zombies[i];
+      const dx = z.x - shooterPos.x;
+      const dz = z.z - shooterPos.z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < bestDist2) {
+        bestDist2 = d2;
+        zombieIdx = i;
+      }
+    }
+  }
+  if (zombieIdx < 0) return;
+  const z = zombies[zombieIdx];
+  const damage = hit.killed ? Math.max(1, z.hp) : (hit.headshot ? ZOMBIE_DAMAGE_HEAD : ZOMBIE_DAMAGE_BODY);
+  z.hp -= damage;
+  if (z.hp > 0) return;
+  const info = getZombieDrawInfo(z);
+  if (info) spawnDeathParticles(z, info);
+  zombies.splice(zombieIdx, 1);
+  score += 1;
 }
 
 // Zombie sprite: flip from walk direction. Uses per-zombie sprite dimensions for aspect.
@@ -3041,6 +4030,97 @@ function drawZombies() {
   for (const { z, info } of withInfo) drawZombieInfo(z, info);
 }
 
+function getMultiplayerDrawInfo(p, queueIndex, nowMs = Date.now()) {
+  const toSlot = getSlotByIndex(p.moveToIndex ?? p.slotIndex);
+  const fromSlot = getSlotByIndex(p.moveFromIndex ?? p.slotIndex) || toSlot;
+  if (!toSlot || !fromSlot) return null;
+  let t = 1;
+  if (p.moving) {
+    t = Math.max(0, Math.min(1, (nowMs - p.moveStartAt) / (MP_MOVE_DURATION * 1000)));
+    if (t >= 1) p.moving = false;
+  }
+  const s = t * t * (3 - 2 * t);
+  const toInwardRawX = (toSlot.x ?? 0) - (toSlot.wallX ?? toSlot.x ?? 0);
+  const toInwardRawZ = (toSlot.z ?? 0) - (toSlot.wallZ ?? toSlot.z ?? 0);
+  const toInwardMag = Math.hypot(toInwardRawX, toInwardRawZ) || 1;
+  const toInward = { x: toInwardRawX / toInwardMag, z: toInwardRawZ / toInwardMag };
+  const fromInwardRawX = (fromSlot.x ?? 0) - (fromSlot.wallX ?? fromSlot.x ?? 0);
+  const fromInwardRawZ = (fromSlot.z ?? 0) - (fromSlot.wallZ ?? fromSlot.z ?? 0);
+  const fromInwardMag = Math.hypot(fromInwardRawX, fromInwardRawZ) || 1;
+  const fromInward = { x: fromInwardRawX / fromInwardMag, z: fromInwardRawZ / fromInwardMag };
+  const normal = toSlot.normal || toInward || { x: 0, z: 1 };
+  const tx = toSlot.tangent?.x ?? 1;
+  const tz = toSlot.tangent?.z ?? 0;
+  const q = Math.max(0, queueIndex);
+  const queueBack = q * MP_QUEUE_SPACING;
+  const queueInward = queueBack;
+  const lane = Math.ceil(q / 2);
+  const lateral = q === 0 ? 0 : (q % 2 === 1 ? -1 : 1) * lane * 0.08;
+  const fromX = fromSlot.x + fromInward.x * queueInward;
+  const fromZ = fromSlot.z + fromInward.z * queueInward;
+  const toX = toSlot.x + toInward.x * queueInward;
+  const toZ = toSlot.z + toInward.z * queueInward;
+  let wx = fromX + (toX - fromX) * s + tx * lateral;
+  let wz = fromZ + (toZ - fromZ) * s + tz * lateral;
+  if (bunker?.corners?.length >= 3 && !isPointInsidePolygon(wx, wz, bunker.corners)) {
+    const centerX = (bunker.minX + bunker.maxX) * 0.5;
+    const centerZ = (bunker.minZ + bunker.maxZ) * 0.5;
+    for (let i = 0; i < 6 && !isPointInsidePolygon(wx, wz, bunker.corners); i++) {
+      wx += (centerX - wx) * 0.35;
+      wz += (centerZ - wz) * 0.35;
+    }
+  }
+  const bob = p.moving ? Math.sin((nowMs / 1000) * MP_BOB_SPEED + p.bobPhase) * 0.03 : 0;
+  const feetY = bob;
+  const headY = feetY + MP_SPRITE_HEIGHT;
+  const eyeY = feetY + MP_SPRITE_HEIGHT * 0.55;
+  if (!isWorldPointVisibleFromCamera(wx, eyeY, wz, 0.9999)) return null;
+  const headProj = project(wx, headY, wz);
+  const feetProj = project(wx, feetY, wz);
+  if (!headProj || !feetProj || headProj.depth <= NEAR) return null;
+  const imgBack = assets.playerSpriteBack;
+  const imgSide = assets.playerSpriteSide;
+  const useBack = (() => {
+    const forward = {
+      x: Math.sin(toSlot.baseYaw),
+      z: -Math.cos(toSlot.baseYaw),
+    };
+    const toCamX = cameraX - wx;
+    const toCamZ = cameraZ - wz;
+    const mag = Math.hypot(toCamX, toCamZ) || 1;
+    const dot = (forward.x * (toCamX / mag) + forward.z * (toCamZ / mag));
+    return dot < -0.45;
+  })();
+  const img = useBack ? imgBack : imgSide;
+  if (!img) return null;
+  const rawScreenH = feetProj.sy - headProj.sy;
+  if (rawScreenH <= 2) return null;
+  const screenH = Math.min(rawScreenH, H * 0.55);
+  const spriteW = img.naturalWidth || img.width || 64;
+  const spriteH = img.naturalHeight || img.height || 64;
+  const screenW = Math.max(8, screenH * (spriteW / spriteH));
+  return {
+    p,
+    depth: headProj.depth,
+    img,
+    sx: headProj.sx - screenW / 2,
+    sy: headProj.sy,
+    sw: screenW,
+    sh: screenH,
+    wx,
+    wz,
+  };
+}
+
+function drawMultiplayerPlayer(info) {
+  if (!info?.img) return;
+  const fogF = getFogFactor(info.depth);
+  ctx.save();
+  ctx.globalAlpha = Math.max(0.35, 1 - fogF * 0.55);
+  ctx.drawImage(info.img, 0, 0, info.img.naturalWidth || info.img.width, info.img.naturalHeight || info.img.height, info.sx, info.sy, info.sw, info.sh);
+  ctx.restore();
+}
+
 function drawCharactersDepthSorted() {
   const drawItems = [];
   for (const t of getVisibleTrees()) drawItems.push({ type: 'tree', depth: t.depth, t });
@@ -3054,6 +4134,21 @@ function drawCharactersDepthSorted() {
     if (item.type === 'tree') drawTreeInfo(item.t);
     else drawZombieInfo(item.z, item.info);
   }
+}
+
+function drawMultiplayerPlayersDepthSorted() {
+  if (!multiplayerPlayers.size) return;
+  const drawItems = [];
+  const queueMap = getSlotQueueMap();
+  multiplayerPlayers.forEach((p) => {
+    if (p.isLocal) return;
+    const queue = queueMap.get(p.slotIndex) || [p];
+    const queueIdx = Math.max(0, queue.findIndex((q) => q.playerId === p.playerId));
+    const mp = getMultiplayerDrawInfo(p, queueIdx);
+    if (mp) drawItems.push(mp);
+  });
+  drawItems.sort((a, b) => b.depth - a.depth);
+  for (const mp of drawItems) drawMultiplayerPlayer(mp);
 }
 
 const BOARD_SPRITE_WORLD_SIZE = 0.95;
@@ -3730,6 +4825,107 @@ function drawRunTargetArrow() {
   ctx.restore();
 }
 
+function drawMenuBackground() {
+  const img = assets.menuBackground || assets.horizonBackground;
+  if (img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0) {
+    const scale = H / img.naturalHeight;
+    const tileW = Math.max(1, Math.round(img.naturalWidth * scale));
+    let x = -((Math.floor(menuPanX) % tileW + tileW) % tileW);
+    while (x < W) {
+      ctx.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight, x, 0, tileW, H);
+      x += tileW;
+    }
+  } else {
+    ctx.fillStyle = '#1a1f23';
+    ctx.fillRect(0, 0, W, H);
+  }
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.52)';
+  ctx.fillRect(0, 0, W, H);
+}
+
+function drawMenu() {
+  drawMenuBackground();
+  const def = getMenuPageDefinition();
+  const items = def.items || [];
+
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  const titleFont = menuPage === 'main' ? 'Gogozombie' : FONT_FAMILY;
+  ctx.font = `${Math.floor(FONT_SIZE * 1.2)}px ${titleFont}`;
+  ctx.fillText(def.title, W / 2, 36);
+  ctx.font = `${Math.floor(FONT_SIZE * 0.55)}px ${FONT_FAMILY}`;
+  ctx.fillStyle = 'rgba(255,255,255,0.86)';
+  ctx.fillText(def.subtitle || '', W / 2, 52);
+
+  const panelH = items.length * MENU_BUTTON_H + Math.max(0, items.length - 1) * MENU_BUTTON_GAP + 16;
+  const lobbyExtraH = menuPage === 'lobby' ? 90 : 0;
+  const panelX = Math.floor((W - (MENU_BUTTON_W + 20)) / 2);
+  const panelY = Math.floor((H - (panelH + lobbyExtraH)) / 2 + 16);
+  const panelW = MENU_BUTTON_W + 20;
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+  ctx.fillRect(panelX, panelY, panelW, panelH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.28)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(panelX + 0.5, panelY + 0.5, panelW - 1, panelH - 1);
+
+  menuButtons = [];
+  const startY = panelY + 8;
+  for (let i = 0; i < items.length; i++) {
+    const y = startY + i * (MENU_BUTTON_H + MENU_BUTTON_GAP);
+    const x = Math.floor((W - MENU_BUTTON_W) / 2);
+    const selected = i === menuSelectedIndex;
+    const hovered = i === menuHoverIndex;
+    const lit = selected || hovered;
+    ctx.fillStyle = lit ? 'rgba(255,255,255,0.24)' : 'rgba(255,255,255,0.1)';
+    ctx.fillRect(x, y, MENU_BUTTON_W, MENU_BUTTON_H);
+    ctx.strokeStyle = lit ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.35)';
+    ctx.strokeRect(x + 0.5, y + 0.5, MENU_BUTTON_W - 1, MENU_BUTTON_H - 1);
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.floor(FONT_SIZE * 0.6)}px ${FONT_FAMILY}`;
+    ctx.textBaseline = 'middle';
+    ctx.fillText(items[i].label, x + MENU_BUTTON_W / 2, y + MENU_BUTTON_H / 2 + 1);
+    menuButtons.push({ x, y, w: MENU_BUTTON_W, h: MENU_BUTTON_H });
+  }
+
+  if (menuPage === 'lobby') {
+    const players = multiplayerLobbyPlayers.slice(0, 8);
+    const startY = panelY + panelH + 8;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(panelX, startY, panelW, lobbyExtraH);
+    ctx.strokeStyle = 'rgba(255,255,255,0.28)';
+    ctx.strokeRect(panelX + 0.5, startY + 0.5, panelW - 1, lobbyExtraH - 1);
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'left';
+    ctx.font = `${Math.floor(FONT_SIZE * 0.48)}px ${FONT_FAMILY}`;
+    const code = multiplayerSession?.joinCode || '----';
+    ctx.fillText(`${t('lobbyJoinCode')}: ${code}`, panelX + 8, startY + 14);
+    ctx.fillText(`${t('lobbyPlayers')}: ${players.length}`, panelX + 8, startY + 28);
+    ctx.font = `${Math.floor(FONT_SIZE * 0.42)}px ${FONT_FAMILY}`;
+    for (let i = 0; i < players.length; i++) {
+      const p = players[i];
+      const tag = p.isHost ? ' (H)' : '';
+      ctx.fillText(`${i + 1}. ${p.name}${tag}`, panelX + 8, startY + 42 + i * 10);
+    }
+    ctx.textAlign = 'center';
+    if (!isLobbyHost()) {
+      ctx.fillStyle = 'rgba(255,255,255,0.8)';
+      ctx.fillText(t('lobbyHostOnly'), W / 2, startY + lobbyExtraH - 6);
+    }
+  }
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+
+  if (menuToast && performance.now() / 1000 < menuToastUntil) {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
+    ctx.fillRect(24, H - 30, W - 48, 18);
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.floor(FONT_SIZE * 0.5)}px ${FONT_FAMILY}`;
+    ctx.textAlign = 'center';
+    ctx.fillText(menuToast, W / 2, H - 17);
+    ctx.textAlign = 'left';
+  }
+}
+
 function drawHint() {
   if (pointerLocked) return;
   ctx.fillStyle = 'rgba(0,0,0,0.7)';
@@ -3773,6 +4969,10 @@ function drawGameOver() {
       ctx.fillText('BUNKER OVERRUN', W / 2, H / 2 - 6);
       ctx.font = `${Math.floor(FONT_SIZE * 0.65)}px ${FONT_FAMILY}`;
       ctx.fillText('A zombie got through a window', W / 2, H / 2 + 18);
+      if (elapsed >= GAME_OVER_MENU_DELAY) {
+        ctx.font = `${Math.floor(FONT_SIZE * 0.55)}px ${FONT_FAMILY}`;
+        ctx.fillText('Press any key or click to return to menu', W / 2, H / 2 + 38);
+      }
       ctx.textAlign = 'left';
     }
   } catch (e) {
@@ -3782,6 +4982,107 @@ function drawGameOver() {
     ctx.fillText('BUNKER OVERRUN', W / 2, H / 2);
     ctx.textAlign = 'left';
   }
+}
+
+function canReturnToMenuFromGameOver() {
+  if (appMode !== 'game') return false;
+  if (!gameOver) return false;
+  const elapsed = performance.now() / 1000 - gameOverFlashStart;
+  return elapsed >= GAME_OVER_MENU_DELAY;
+}
+
+function returnToMainMenu() {
+  if (document.pointerLockElement === canvas) document.exitPointerLock();
+  closeMultiplayerSocket();
+  multiplayerSession = null;
+  multiplayerAgreedHash = '';
+  multiplayerGameSeed = GAME_PARAM_SEED;
+  multiplayerWaveCount = GAME_PARAM_WAVE_COUNT;
+  multiplayerStartAt = 0;
+  pendingLossProposalId = '';
+  gameOver = false;
+  gameWon = false;
+  gameOverZombie = null;
+  gameOverFlashStart = 0;
+  appMode = 'menu';
+  confirmMainMenuOpen = false;
+  setMenuPage('main');
+}
+
+function openMainMenuConfirm() {
+  confirmMainMenuOpen = true;
+}
+
+function closeMainMenuConfirm() {
+  confirmMainMenuOpen = false;
+}
+
+function drawMainMenuConfirmDialog() {
+  confirmMainMenuButtons.length = 0;
+  const panelW = 330;
+  const panelH = 92;
+  const x = Math.floor((W - panelW) / 2);
+  const y = Math.floor((H - panelH) / 2);
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.72)';
+  ctx.fillRect(x, y, panelW, panelH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, y + 0.5, panelW - 1, panelH - 1);
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  ctx.font = `${Math.floor(FONT_SIZE * 0.6)}px ${FONT_FAMILY}`;
+  ctx.fillText('Return to main menu?', x + panelW / 2, y + 27);
+  ctx.font = `${Math.floor(FONT_SIZE * 0.45)}px ${FONT_FAMILY}`;
+  ctx.fillText('This ends your current run.', x + panelW / 2, y + 43);
+
+  const btnW = 118;
+  const btnH = 22;
+  const gap = 18;
+  const yesX = Math.floor(x + panelW / 2 - gap / 2 - btnW);
+  const noX = Math.floor(x + panelW / 2 + gap / 2);
+  const btnY = y + 58;
+  const drawBtn = (bx, label) => {
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.fillRect(bx, btnY, btnW, btnH);
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+    ctx.strokeRect(bx + 0.5, btnY + 0.5, btnW - 1, btnH - 1);
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.floor(FONT_SIZE * 0.55)}px ${FONT_FAMILY}`;
+    ctx.fillText(label, bx + btnW / 2, btnY + 15);
+  };
+  drawBtn(yesX, 'Yes');
+  drawBtn(noX, 'No');
+  confirmMainMenuButtons.push({ x: yesX, y: btnY, w: btnW, h: btnH, action: 'yes' });
+  confirmMainMenuButtons.push({ x: noX, y: btnY, w: btnW, h: btnH, action: 'no' });
+  ctx.textAlign = 'left';
+}
+
+function handleMainMenuConfirmKeydown(e) {
+  if (!confirmMainMenuOpen) return false;
+  if (e.code === 'KeyY' || e.code === 'Enter' || e.code === 'Space') {
+    e.preventDefault();
+    returnToMainMenu();
+    return true;
+  }
+  if (e.code === 'KeyN' || e.code === 'Escape' || e.code === 'Backspace') {
+    e.preventDefault();
+    closeMainMenuConfirm();
+    return true;
+  }
+  return true;
+}
+
+function handleMainMenuConfirmClick(e) {
+  if (!confirmMainMenuOpen) return false;
+  const p = getCanvasPointerPos(e);
+  for (const b of confirmMainMenuButtons) {
+    if (p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h) {
+      if (b.action === 'yes') returnToMainMenu();
+      else closeMainMenuConfirm();
+      return true;
+    }
+  }
+  return true;
 }
 
 function drawVictory() {
@@ -3799,6 +5100,10 @@ function drawVictory() {
 }
 
 function draw() {
+  if (appMode === 'menu') {
+    drawMenu();
+    return;
+  }
   drawSky();
   drawHorizonForest();
   drawGround();
@@ -3806,6 +5111,7 @@ function draw() {
   drawCharactersDepthSorted();
   drawParticles();
   drawBunkerInterior();
+  drawMultiplayerPlayersDepthSorted();
   drawBoards();
   if (!gameOver && !boardPlaceState) drawRifle(1 / 60);
   drawReticule();
@@ -3813,9 +5119,16 @@ function draw() {
   if (gameOver) drawGameOver();
   else if (gameWon) drawVictory();
   else if (!pointerLocked) drawHint();
+  if (confirmMainMenuOpen) drawMainMenuConfirmDialog();
 }
 
 function tick(dt) {
+  if (appMode === 'menu') {
+    menuPanX += MENU_PAN_SPEED * dt;
+    if (performance.now() / 1000 >= menuToastUntil) menuToast = '';
+    draw();
+    return;
+  }
   gameTime += dt;
   hitFeedbackTime = Math.max(0, hitFeedbackTime - dt);
   outOfAmmoMessageTime = Math.max(0, outOfAmmoMessageTime - dt);
@@ -3823,6 +5136,12 @@ function tick(dt) {
   if (boardPlaceState && gameTime >= boardPlaceState.endTime) {
     const key = boardPlaceState.slotKey;
     windowBoards[key] = Math.min(BOARDS_PER_WINDOW, (windowBoards[key] ?? 0) + 1);
+    sendMultiplayerPayload('player_board_complete', {
+      slotIndex: activeSlotIndex,
+      slotKey: key,
+      boardsNow: windowBoards[key] ?? 0,
+      at: Date.now(),
+    });
     boardPlaceState = null;
   }
   fallingBoards = fallingBoards.filter((fb) => gameTime < fb.endTime);
@@ -3909,6 +5228,15 @@ function playBoardBreakSound() {
 }
 
 canvas.addEventListener('click', (e) => {
+  if (canReturnToMenuFromGameOver()) {
+    returnToMainMenu();
+    return;
+  }
+  if (handleMainMenuConfirmClick(e)) return;
+  if (appMode === 'menu') {
+    handleMenuClick(e);
+    return;
+  }
   if (gameOver || gameWon) return;
   if (boardPlaceState) return;
   if (!pointerLocked) {
@@ -3928,6 +5256,12 @@ canvas.addEventListener('click', (e) => {
     if (onFloor > 0) {
       boardPlaceState = { slotKey: key, startTime: gameTime, endTime: gameTime + BOARD_PLACE_DURATION };
       playHammerSound();
+      sendMultiplayerPayload('player_board_start', {
+        slotIndex: activeSlotIndex,
+        slotKey: key,
+        boardsOnFloor: onFloor,
+        at: Date.now(),
+      });
     }
     return;
   }
@@ -3935,6 +5269,12 @@ canvas.addEventListener('click', (e) => {
   if (pointingAtCrate) {
     playPickUpSound();
     clipsCarried = MAX_CLIPS;
+    sendMultiplayerPayload('player_ammo_pickup', {
+      slotIndex: activeSlotIndex,
+      slotKey: slot ? getSlotKey(slot) : '',
+      clipsCarried,
+      at: Date.now(),
+    });
     return;
   }
 
@@ -3957,6 +5297,7 @@ canvas.addEventListener('click', (e) => {
     reloadSoundPlayed = false;
     boltOpenSoundPlayed = false;
     boltCloseSoundPlayed = false;
+    sendMultiplayerPayload('player_reload_start', { slotIndex: activeSlotIndex, at: Date.now() });
     return;
   }
 
@@ -3967,10 +5308,24 @@ canvas.addEventListener('click', (e) => {
     reloadSoundPlayed = false;
     boltOpenSoundPlayed = false;
     boltCloseSoundPlayed = false;
+    sendMultiplayerPayload('player_reload_start', { slotIndex: activeSlotIndex, at: Date.now() });
     return;
   }
 
   const canSeeOutside = shotLeavesThroughWindow(px, py);
+  const shotDir = getShotDirection(px, py);
+  const makeShotEvent = (hit) => ({
+    at: Date.now(),
+    px: Math.round(px),
+    py: Math.round(py),
+    dir: { x: Number(shotDir.x.toFixed(5)), y: Number(shotDir.y.toFixed(5)), z: Number(shotDir.z.toFixed(5)) },
+    canSeeOutside: !!canSeeOutside,
+    hit: hit ? {
+      type: hit.type,
+      index: hit.index,
+    } : null,
+    shotsInClip,
+  });
 
   if (shotsInClip > 1) {
     rifleState = 'firing';
@@ -3986,6 +5341,7 @@ canvas.addEventListener('click', (e) => {
       if (hit.type === 'zombie') damageZombie(hit.index, px, py);
       else damageTree(hit.index, px, py);
     }
+    sendMultiplayerPayload('player_shot', makeShotEvent(hit));
   } else if (shotsInClip === 1) {
     rifleState = 'reloading';
     rifleFrame = 0;
@@ -3993,6 +5349,7 @@ canvas.addEventListener('click', (e) => {
     reloadSoundPlayed = false;
     boltOpenSoundPlayed = false;
     boltCloseSoundPlayed = false;
+    sendMultiplayerPayload('player_reload_start', { slotIndex: activeSlotIndex, at: Date.now() });
     if (ironSightsHeld) ironSightsRecoilKick = IRON_SIGHTS_RECOIL_KICK;
     playShotSound();
     playEjectCasingSound();
@@ -4001,11 +5358,13 @@ canvas.addEventListener('click', (e) => {
       if (hit.type === 'zombie') damageZombie(hit.index, px, py);
       else damageTree(hit.index, px, py);
     }
+    sendMultiplayerPayload('player_shot', makeShotEvent(hit));
   }
 });
 
 document.addEventListener('pointerlockchange', () => {
   pointerLocked = document.pointerLockElement === canvas;
+  if (appMode !== 'game') return;
   if (!pointerLocked) {
     const slot = getCurrentBunkerSlot();
     desiredPitch = 0;
@@ -4021,6 +5380,11 @@ document.addEventListener('pointerlockchange', () => {
 });
 
 canvas.addEventListener('mousemove', (e) => {
+  if (appMode === 'menu') {
+    const p = getCanvasPointerPos(e);
+    updateMenuHover(p.x, p.y);
+    return;
+  }
   if (!pointerLocked) return;
   const sens = isIronSightsActive() ? IRON_SIGHTS_SENS : 1;
   desiredYaw += e.movementX * MOUSE_SENS * sens;
@@ -4029,6 +5393,19 @@ canvas.addEventListener('mousemove', (e) => {
 });
 
 document.addEventListener('keydown', (e) => {
+  if (canReturnToMenuFromGameOver()) {
+    returnToMainMenu();
+    return;
+  }
+  if (handleMainMenuConfirmKeydown(e)) return;
+  if (appMode === 'menu') {
+    handleMenuKeydown(e);
+    return;
+  }
+  if (e.code === 'Escape' && !pointerLocked) {
+    openMainMenuConfirm();
+    return;
+  }
   if (gameOver || gameWon) return;
   if (boardPlaceState) return;
   if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
