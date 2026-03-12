@@ -204,6 +204,7 @@ function sessionSnapshot(session, req) {
     wsUrl: `${publicWsBase(req)}/ws`,
     gameSeed: session.game.seed,
     waveCount: session.game.waveCount,
+    playerCount: connectedPlayersForSession(sessionId).length,
     agreedHash: session.game.agreedHash || '',
     startedAt: session.game.startedAt || 0,
   };
@@ -683,6 +684,7 @@ function finalizeHandshake(sessionId) {
     sessionId,
     seed: session.game.seed,
     waveCount: session.game.waveCount,
+    playerCount: connectedPlayersForSession(sessionId).length,
     agreedHash: session.game.agreedHash,
     startAt: session.game.startedAt,
   });
@@ -741,7 +743,7 @@ function createSession(data = {}) {
     players: new Map([[hostPlayerId, { playerId: hostPlayerId, name: hostName, isHost: true, isBot: false }]]),
     game: {
       seed: (crypto.randomBytes(4).readUInt32BE(0) & 0x7fffffff) || 1,
-      waveCount: 6,
+      waveCount: 9,
       agreedHash: '',
       startedAt: 0,
     },
@@ -890,7 +892,8 @@ wss.on('connection', (ws, req) => {
       difficulty: session.difficulty,
       gameSeed: session.game.seed,
       waveCount: session.game.waveCount,
-      agreedHash: session.game.agreedHash || '',
+    playerCount: connectedPlayersForSession(sessionId).length,
+    agreedHash: session.game.agreedHash || '',
       startedAt: session.game.startedAt || 0,
       players: Array.from(session.players.values()).map((p) => ({
         playerId: p.playerId,
@@ -942,6 +945,7 @@ wss.on('connection', (ws, req) => {
           sessionId,
           seed: session.game.seed,
           waveCount: session.game.waveCount,
+          playerCount: connectedPlayersForSession(sessionId).length,
           at: Date.now(),
         });
         return;

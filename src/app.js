@@ -191,8 +191,8 @@ const ZOMBIE_DAMAGE_BODY = 1;
 const ZOMBIE_DAMAGE_HEAD = 3;
 
 // Spawn: start far away; they walk toward player
-const SPAWN_MIN_DIST = 38;
-const SPAWN_MAX_DIST = 70;
+const SPAWN_MIN_DIST = 58;
+const SPAWN_MAX_DIST = 112;
 const MAX_ZOMBIES = 20;
 const ZOMBIE_SPEED = 0.35;       // world units/sec (average); each zombie has speedMult for variation
 const ZOMBIE_ZIGZAG = 0.5;      // lateral sway (world units)
@@ -207,12 +207,15 @@ const GAME_OVER_FACE_DURATION = 2;  // seconds of zombie face + red tint before 
 const GAME_OVER_MENU_DELAY = 5;     // seconds before input can return to menu
 const ZOMBIE_SOUND_INTERVAL = 4;      // seconds between groans; deterministic from spawnIndex/spawnTime
 const GAME_PARAM_SEED = 13371337;
-const GAME_PARAM_WAVE_COUNT = 6;
+const GAME_PARAM_WAVE_COUNT = 9;
 const WAVE_TRIANGLE_CONSTANT = 3;
 const WAVE_TRIANGLE_OFFSET = 1; // waveSize = constant + T(waveIndex1Based + offset)
-const WAVE_SPAWN_INTERVAL = 1.35;
-const WAVE_GAP_SECONDS = 4.2;
-const ZOMBIE_MIN_PATH_LENGTH = 34;
+const WAVE_SPAWN_INTERVAL = 1.3;
+const WAVE_GAP_BASE_SECONDS = 5.6;
+const WAVE_GAP_WAVE_STEP_SECONDS = 0.7;
+const WAVE_HOT_WINDOW_WEIGHT = 0.72;
+const WAVE_HOT_SEGMENT_WEIGHT = 0.16;
+const ZOMBIE_MIN_PATH_LENGTH = 46;
 const TREE_BLOCK_RADIUS = 0.9;
 
 let assets = {};
@@ -455,6 +458,9 @@ function setMenuPage(pageId) {
 function startLocalGame(opts = {}) {
   const seed = Number.isFinite(opts.seed) ? opts.seed : GAME_PARAM_SEED;
   const waveCount = Number.isFinite(opts.waveCount) ? opts.waveCount : GAME_PARAM_WAVE_COUNT;
+  const playerCount = Math.max(1, Number.isFinite(opts.playerCount)
+    ? Math.floor(opts.playerCount)
+    : (multiplayerLobbyPlayers.length || 1));
   const agreedHash = typeof opts.agreedHash === 'string' ? opts.agreedHash : '';
   gameTime = 0;
   score = 0;
@@ -488,7 +494,7 @@ function startLocalGame(opts = {}) {
   pendingLossProposalId = '';
   if (assets.runningSound) { assets.runningSound.pause(); assets.runningSound.currentTime = 0; }
 
-  const planned = generateGameParameters(seed, waveCount);
+  const planned = generateGameParameters(seed, waveCount, playerCount);
   gameParams = planned.params;
   gameParamsHash = planned.hash;
   if (agreedHash && gameParamsHash !== agreedHash) {
@@ -834,7 +840,8 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
       if (msg.type === 'handshake_request') {
         multiplayerGameSeed = Number(msg.seed || GAME_PARAM_SEED);
         multiplayerWaveCount = Number(msg.waveCount || GAME_PARAM_WAVE_COUNT);
-        const planned = generateGameParameters(multiplayerGameSeed, multiplayerWaveCount);
+        const multiplayerPlayerCount = Math.max(1, Number(msg.playerCount || multiplayerLobbyPlayers.length || 1));
+        const planned = generateGameParameters(multiplayerGameSeed, multiplayerWaveCount, multiplayerPlayerCount);
         sendMultiplayerPayload('state_hash', {
           hash: planned.hash,
           clientVersion: 'prototype',
@@ -844,11 +851,13 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
       if (msg.type === 'start_game') {
         multiplayerGameSeed = Number(msg.seed || GAME_PARAM_SEED);
         multiplayerWaveCount = Number(msg.waveCount || GAME_PARAM_WAVE_COUNT);
+        const multiplayerPlayerCount = Math.max(1, Number(msg.playerCount || multiplayerLobbyPlayers.length || 1));
         multiplayerAgreedHash = String(msg.agreedHash || '');
         multiplayerStartAt = Number(msg.startAt || 0);
         if (startLocalGame({
           seed: multiplayerGameSeed,
           waveCount: multiplayerWaveCount,
+          playerCount: multiplayerPlayerCount,
           agreedHash: multiplayerAgreedHash,
         })) {
           showMenuToast(`${t('statusJoined')} (${multiplayerSession?.joinCode || ''})`, 1.8);
@@ -2330,12 +2339,14 @@ function choosePathForZombie(start, target, rng, treeList) {
   return choices[Math.floor(rng() * choices.length)];
 }
 
-function generateGameParameters(seed = GAME_PARAM_SEED, waveCount = GAME_PARAM_WAVE_COUNT) {
+function generateGameParameters(seed = GAME_PARAM_SEED, waveCount = GAME_PARAM_WAVE_COUNT, playerCount = 1) {
   const rng = createSeededRng(seed);
+  const effectivePlayers = Math.max(1, Math.floor(Number(playerCount) || 1));
   const params = {
     version: 1,
     seed,
     waveCount,
+    playerCount: effectivePlayers,
     bunker: {
       corners: (bunker.corners ?? []).map((c) => ({ x: +c.x.toFixed(3), z: +c.z.toFixed(3) })),
       segments: bunkerWallSegments.map((s) => ({
@@ -2369,9 +2380,25 @@ function generateGameParameters(seed = GAME_PARAM_SEED, waveCount = GAME_PARAM_W
   const triangular = (n) => (n * (n + 1)) / 2;
   for (let wave = 0; wave < waveCount; wave++) {
     const w1 = wave + 1;
-    const waveSize = WAVE_TRIANGLE_CONSTANT + triangular(w1 + WAVE_TRIANGLE_OFFSET);
+    const baseWaveSize = WAVE_TRIANGLE_CONSTANT + triangular(w1 + WAVE_TRIANGLE_OFFSET);
+    const waveSize = baseWaveSize * effectivePlayers;
+    const hotWindowSlot = windowSlots.length ? windowSlots[Math.floor(rng() * windowSlots.length)] : null;
+    const hotSegmentSlots = hotWindowSlot
+      ? windowSlots.filter((s) => s.segmentIndex === hotWindowSlot.segmentIndex)
+      : [];
     for (let n = 0; n < waveSize; n++) {
       let targetSlot = windowSlots.length ? windowSlots[(spawnIdx + n) % windowSlots.length] : null;
+      if (windowSlots.length && hotWindowSlot) {
+        const r = rng();
+        if (r < WAVE_HOT_WINDOW_WEIGHT) {
+          targetSlot = hotWindowSlot;
+        } else if (r < WAVE_HOT_WINDOW_WEIGHT + WAVE_HOT_SEGMENT_WEIGHT && hotSegmentSlots.length) {
+          targetSlot = hotSegmentSlots[Math.floor(rng() * hotSegmentSlots.length)];
+        } else {
+          const coolSlots = windowSlots.filter((s) => s !== hotWindowSlot);
+          if (coolSlots.length) targetSlot = coolSlots[Math.floor(rng() * coolSlots.length)];
+        }
+      }
       if (!targetSlot) continue;
       const target = getZombieWindowTarget(targetSlot);
       const targetNormal = targetSlot.normal ?? { x: 0, z: 1 }; // inward
@@ -2444,7 +2471,7 @@ function generateGameParameters(seed = GAME_PARAM_SEED, waveCount = GAME_PARAM_W
       tSpawn += WAVE_SPAWN_INTERVAL;
       spawnIdx++;
     }
-    tSpawn += WAVE_GAP_SECONDS;
+    tSpawn += WAVE_GAP_BASE_SECONDS + wave * WAVE_GAP_WAVE_STEP_SECONDS;
   }
 
   params.zombieCount = params.zombies.length;
@@ -3017,7 +3044,7 @@ async function loadAssets() {
   assets.zombieSoundPaths = ZOMBIE_SOUND_NAMES.map((n) => `${base}/sfx/clean/${n}.ogg`);
   assets.zombieFemaleSoundPaths = ZOMBIE_FEMALE_SOUND_NAMES.map((n) => `${base}/sfx/clean/${n}.ogg`);
   generateFogWisps();
-  const planned = generateGameParameters(GAME_PARAM_SEED, GAME_PARAM_WAVE_COUNT);
+  const planned = generateGameParameters(GAME_PARAM_SEED, GAME_PARAM_WAVE_COUNT, 1);
   gameParams = planned.params;
   gameParamsHash = planned.hash;
   zombieSpawnPlan = gameParams.zombies ?? [];
