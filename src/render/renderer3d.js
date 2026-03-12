@@ -25,10 +25,14 @@
       this.treeTextureCache = new Map();
       this.zombieTextureCache = new Map();
       this.playerTextureCache = new Map();
+      this.dynamicMaterialCache = new Map();
+      this.planeGeometryCache = new Map();
       this.boardTexture = null;
       this.slotColliderByIndex = new Map();
       this.raycastStatic = [];
       this.raycastDynamic = [];
+      this._raycaster = null;
+      this._rayNdc = null;
 
       if (!this.THREE || !canvas) {
         throw new Error('WebGL: THREE or canvas not available');
@@ -70,7 +74,14 @@
       if (!this.ready || !state) return;
       const THREE = this.THREE;
       this.scene.background = null;
-      this.scene.fog = new THREE.FogExp2(state.FOG_COLOR || 0x3a4555, state.FOG_DENSITY ?? 0.028);
+      const fogColor = state.FOG_COLOR || 0x3a4555;
+      const fogDensity = state.FOG_DENSITY ?? 0.028;
+      if (!this.scene.fog) {
+        this.scene.fog = new THREE.FogExp2(fogColor, fogDensity);
+      } else {
+        this.scene.fog.color.setHex(fogColor);
+        this.scene.fog.density = fogDensity;
+      }
     }
 
     resize(width, height) {
@@ -271,14 +282,25 @@
     _addBillboard(width, height, x, y, z, texture, userData = null) {
       const THREE = this.THREE;
       if (!texture) return null;
-      const mat = new THREE.MeshBasicMaterial({
-        map: texture,
-        transparent: true,
-        alphaTest: 0.3,
-        depthWrite: true,
-        side: THREE.DoubleSide,
-      });
-      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(width, height), mat);
+      const matKey = `${texture.uuid}|bb`;
+      let mat = this.dynamicMaterialCache.get(matKey);
+      if (!mat) {
+        mat = new THREE.MeshBasicMaterial({
+          map: texture,
+          transparent: true,
+          alphaTest: 0.3,
+          depthWrite: true,
+          side: THREE.DoubleSide,
+        });
+        this.dynamicMaterialCache.set(matKey, mat);
+      }
+      const gKey = `${width.toFixed(4)}x${height.toFixed(4)}`;
+      let geom = this.planeGeometryCache.get(gKey);
+      if (!geom) {
+        geom = new THREE.PlaneGeometry(width, height);
+        this.planeGeometryCache.set(gKey, geom);
+      }
+      const mesh = new THREE.Mesh(geom, mat);
       mesh.position.set(x, y, z);
       this._lookAtCamera(mesh);
       if (userData) mesh.userData = userData;
@@ -320,19 +342,27 @@
         const tex = this.boardTexture || this._makeTexture(boardImg);
         this.boardTexture = tex;
         const THREE = this.THREE;
+        const boardMatKey = `${tex.uuid}|board`;
+        let boardMat = this.dynamicMaterialCache.get(boardMatKey);
+        if (!boardMat) {
+          boardMat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, alphaTest: 0.2, depthWrite: true, side: THREE.DoubleSide });
+          this.dynamicMaterialCache.set(boardMatKey, boardMat);
+        }
         for (const b of this.state.getBoardInstances()) {
+          const gKey = `${b.w.toFixed(4)}x${b.h.toFixed(4)}`;
+          let geom = this.planeGeometryCache.get(gKey);
+          if (!geom) {
+            geom = new THREE.PlaneGeometry(b.w, b.h);
+            this.planeGeometryCache.set(gKey, geom);
+          }
           if (b.type === 'wall') {
-            const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, alphaTest: 0.2, depthWrite: true, side: THREE.DoubleSide });
-            const geom = new THREE.PlaneGeometry(b.w, b.h);
-            const mesh = new THREE.Mesh(geom, mat);
+            const mesh = new THREE.Mesh(geom, boardMat);
             mesh.position.set(b.x, b.y, b.z);
             mesh.rotation.y = -(b.segmentYaw ?? -b.yaw - Math.PI / 2);
             mesh.rotation.z = b.rot || 0;
             this.dynamicGroup.add(mesh);
           } else if (b.type === 'floor') {
-            const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, alphaTest: 0.2, depthWrite: true, side: THREE.DoubleSide });
-            const geom = new THREE.PlaneGeometry(b.w, b.h);
-            const mesh = new THREE.Mesh(geom, mat);
+            const mesh = new THREE.Mesh(geom, boardMat);
             mesh.position.set(b.x, b.y, b.z);
             mesh.rotation.x = 0;
             mesh.rotation.y = -(b.slotYaw ?? 0);
@@ -343,9 +373,7 @@
             const x = b.fromX + (b.toX - b.fromX) * t;
             const y = b.fromY + (b.toY - b.fromY) * t;
             const z = b.fromZ + (b.toZ - b.fromZ) * t;
-            const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, alphaTest: 0.2, depthWrite: true, side: THREE.DoubleSide });
-            const geom = new THREE.PlaneGeometry(b.w, b.h);
-            const mesh = new THREE.Mesh(geom, mat);
+            const mesh = new THREE.Mesh(geom, boardMat);
             mesh.position.set(x, y, z);
             mesh.rotation.x = 0;
             mesh.rotation.y = -(b.slotYaw ?? 0);
@@ -378,11 +406,12 @@
       if (!this.ready) return [];
       if (this.state) this._setCameraFromState();
       const THREE = this.THREE;
-      const ndc = new THREE.Vector2((px / this.width) * 2 - 1, -((py / this.height) * 2 - 1));
-      const raycaster = new THREE.Raycaster();
-      raycaster.setFromCamera(ndc, this.camera);
+      this._rayNdc = this._rayNdc || new THREE.Vector2();
+      this._raycaster = this._raycaster || new THREE.Raycaster();
+      this._rayNdc.set((px / this.width) * 2 - 1, -((py / this.height) * 2 - 1));
+      this._raycaster.setFromCamera(this._rayNdc, this.camera);
       const objs = this.raycastStatic.concat(this.raycastDynamic);
-      return raycaster.intersectObjects(objs, false);
+      return this._raycaster.intersectObjects(objs, false);
     }
 
     pickFirst(px, py, kinds) {

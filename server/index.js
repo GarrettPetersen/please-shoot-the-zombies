@@ -11,6 +11,10 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const PUBLIC_HTTP_URL = process.env.PUBLIC_HTTP_URL || ''; // optional override
 const PUBLIC_WS_URL = process.env.PUBLIC_WS_URL || ''; // optional override
+const MAX_ACTIVE_GAMES = Math.max(1, Number(process.env.MAX_ACTIVE_GAMES || 24));
+const MAX_CONNECTED_PLAYERS = Math.max(1, Number(process.env.MAX_CONNECTED_PLAYERS || 120));
+const SESSION_IDLE_TIMEOUT_MS = Math.max(30_000, Number(process.env.SESSION_IDLE_TIMEOUT_MS || 10 * 60 * 1000));
+const SESSION_ENDED_GRACE_MS = Math.max(2_000, Number(process.env.SESSION_ENDED_GRACE_MS || 15_000));
 
 const sessions = new Map(); // sessionId -> session
 const wsBySession = new Map(); // sessionId -> Set<ws>
@@ -35,6 +39,10 @@ const BOT_CLIP_SIZE = 5;
 const BOT_SLOT_COUNT = 13; // 12 windows + 1 crate slot
 const BOT_CRATE_SLOT = 12;
 const BOT_WINDOW_SLOTS = Array.from({ length: 12 }, (_, i) => i);
+
+function overloadError() {
+  return 'Server is overloaded right now. Please wait a minute and try again.';
+}
 
 function randomId(prefix = '') {
   return `${prefix}${crypto.randomBytes(6).toString('hex')}`;
@@ -158,6 +166,7 @@ function makeBotRuntimePlayer(slotIndex = 0) {
     ejectUntil: 0,
     moveCooldownUntil: 0,
     holdSlotUntil: 0,
+    recentSlots: [slotIndex],
   };
 }
 
@@ -172,12 +181,20 @@ function slotOccupancyCounts(session) {
   return counts;
 }
 
-function chooseUnoccupiedBiasedSlot(candidates, occupancy, rng = Math.random) {
+function chooseUnoccupiedBiasedSlot(candidates, occupancy, recentSlots = [], rng = Math.random) {
   if (!candidates || candidates.length === 0) return BOT_WINDOW_SLOTS[0] || 0;
+  const rec = Array.isArray(recentSlots) ? recentSlots : [];
   const weights = candidates.map((slot) => {
     const occ = occupancy.get(slot) || 0;
     // Slight but meaningful bias away from crowded windows.
-    return 1 / (1 + occ * 0.9);
+    let w = 1 / (1 + occ * 0.9);
+    const idx = rec.lastIndexOf(slot);
+    if (idx >= 0) {
+      const age = rec.length - 1 - idx; // older visit -> less penalty
+      const freshnessPenalty = Math.max(0.15, 0.45 + age * 0.12);
+      w *= freshnessPenalty;
+    }
+    return w;
   });
   const idx = chooseWeighted(weights, rng);
   return candidates[Math.max(0, Math.min(candidates.length - 1, idx))];
@@ -185,6 +202,7 @@ function chooseUnoccupiedBiasedSlot(candidates, occupancy, rng = Math.random) {
 
 function sessionSnapshot(session, req) {
   const rt = ensureRuntime(session);
+  const connectedCount = connectedPlayersForSession(session.sessionId).length;
   return {
     sessionId: session.sessionId,
     joinCode: session.joinCode,
@@ -200,11 +218,10 @@ function sessionSnapshot(session, req) {
       isHost: !!p.isHost,
       slotIndex: rt.playerState.get(p.playerId)?.slotIndex ?? 0,
     })),
-    playerCount: session.players.size,
+    playerCount: connectedCount,
     wsUrl: `${publicWsBase(req)}/ws`,
     gameSeed: session.game.seed,
     waveCount: session.game.waveCount,
-    playerCount: connectedPlayersForSession(sessionId).length,
     agreedHash: session.game.agreedHash || '',
     startedAt: session.game.startedAt || 0,
   };
@@ -213,6 +230,8 @@ function sessionSnapshot(session, req) {
 function broadcastToSession(sessionId, payload, exceptWs = null) {
   const room = wsBySession.get(sessionId);
   if (!room || room.size === 0) return;
+  const session = sessions.get(sessionId);
+  if (session) session.lastActivityAt = Date.now();
   const raw = JSON.stringify(payload);
   room.forEach((ws) => {
     if (ws === exceptWs) return;
@@ -441,6 +460,7 @@ function tickBotGameplay(session, nowMs) {
     state.moveCooldownUntil = nowMs + randInt(BOT_MOVE_COOLDOWN_MIN_MS, BOT_MOVE_COOLDOWN_MAX_MS);
     state.holdSlotUntil = nowMs + BOT_POST_MOVE_HOLD_MS + randInt(0, 350);
     state.actionUntil = nowMs + randInt(700, 1500);
+    state.recentSlots = (state.recentSlots || []).concat([next]).slice(-8);
     return true;
   };
 
@@ -497,6 +517,31 @@ function tickBotGameplay(session, nowMs) {
       continue;
     }
 
+    const threatened = rt.zombies.find((z) => z.alive && !z.dead && slotDistance(state.slotIndex, z.targetSlot) <= 2 && (rt.boards.get(z.targetSlot) || 0) < 3);
+    if (threatened && !state.boardUntil) {
+      if (state.slotIndex !== threatened.targetSlot) {
+        if (!canMove(state)) {
+          state.actionUntil = nowMs + randInt(220, 420);
+          continue;
+        }
+        const nearby = BOT_WINDOW_SLOTS.filter((s) => slotDistance(s, threatened.targetSlot) <= 1);
+        const targetSlot = chooseUnoccupiedBiasedSlot(nearby.length ? nearby : [threatened.targetSlot], occupancy, state.recentSlots);
+        applyMove(bot, state, targetSlot);
+        continue;
+      }
+      emitBotAction(session, bot, {
+        type: 'player_board_start',
+        slotIndex: state.slotIndex,
+        slotKey: `bot-slot-${state.slotIndex}`,
+        boardsOnFloor: Math.max(0, 3 - (rt.boards.get(state.slotIndex) || 0)),
+        at: nowMs,
+      });
+      state.boardTargetSlot = state.slotIndex;
+      state.boardUntil = nowMs + BOT_BOARD_MS;
+      state.actionUntil = state.boardUntil;
+      continue;
+    }
+
     if (visibleZombies.length > 0 && state.shotsInClip > 0 && !state.reloadUntil) {
       const target = visibleZombies[Math.floor(Math.random() * visibleZombies.length)];
       const roll = Math.random();
@@ -545,31 +590,6 @@ function tickBotGameplay(session, nowMs) {
       continue;
     }
 
-    const threatened = rt.zombies.find((z) => z.alive && !z.dead && slotDistance(state.slotIndex, z.targetSlot) <= 2 && (rt.boards.get(z.targetSlot) || 0) < 3);
-    if (threatened && !state.boardUntil) {
-      if (state.slotIndex !== threatened.targetSlot) {
-        if (!canMove(state)) {
-          state.actionUntil = nowMs + randInt(220, 420);
-          continue;
-        }
-        const nearby = BOT_WINDOW_SLOTS.filter((s) => slotDistance(s, threatened.targetSlot) <= 1);
-        const targetSlot = chooseUnoccupiedBiasedSlot(nearby.length ? nearby : [threatened.targetSlot], occupancy);
-        applyMove(bot, state, targetSlot);
-        continue;
-      }
-      emitBotAction(session, bot, {
-        type: 'player_board_start',
-        slotIndex: state.slotIndex,
-        slotKey: `bot-slot-${state.slotIndex}`,
-        boardsOnFloor: Math.max(0, 3 - (rt.boards.get(state.slotIndex) || 0)),
-        at: nowMs,
-      });
-      state.boardTargetSlot = state.slotIndex;
-      state.boardUntil = nowMs + BOT_BOARD_MS;
-      state.actionUntil = state.boardUntil;
-      continue;
-    }
-
     if (state.shotsInClip <= 0 && state.clipsCarried <= 0) {
       if (state.slotIndex !== BOT_CRATE_SLOT) {
         if (!canMove(state)) {
@@ -613,7 +633,7 @@ function tickBotGameplay(session, nowMs) {
       state.actionUntil = nowMs + randInt(260, 520);
       continue;
     }
-    const targetSlot = chooseUnoccupiedBiasedSlot(BOT_WINDOW_SLOTS, occupancy);
+    const targetSlot = chooseUnoccupiedBiasedSlot(BOT_WINDOW_SLOTS, occupancy, state.recentSlots);
     if (!applyMove(bot, state, targetSlot)) {
       state.actionUntil = nowMs + randInt(900, 1700);
     }
@@ -628,6 +648,35 @@ function connectedPlayersForSession(sessionId) {
     if (ws.readyState === ws.OPEN && ws.playerId) ids.push(ws.playerId);
   });
   return ids;
+}
+
+function totalConnectedPlayers() {
+  let total = 0;
+  for (const sessionId of wsBySession.keys()) total += connectedPlayersForSession(sessionId).length;
+  return total;
+}
+
+function activeGameCount() {
+  let n = 0;
+  for (const s of sessions.values()) {
+    if (s.status === 'starting' || s.status === 'in_progress') n++;
+  }
+  return n;
+}
+
+function isOverloadedForNewGame() {
+  return activeGameCount() >= MAX_ACTIVE_GAMES || totalConnectedPlayers() >= MAX_CONNECTED_PLAYERS;
+}
+
+function closeAndRemoveSession(sessionId, reason = 'Session closed') {
+  const room = wsBySession.get(sessionId);
+  if (room) {
+    room.forEach((ws) => {
+      try { ws.close(1000, reason); } catch {}
+    });
+  }
+  wsBySession.delete(sessionId);
+  sessions.delete(sessionId);
 }
 
 function finalizeHandshake(sessionId) {
@@ -701,6 +750,7 @@ function finalizeLossVote(sessionId, proposalId, byTimeout = false) {
 
   if (allAgree) {
     session.status = 'ended';
+    session.endedAt = Date.now();
     broadcastToSession(sessionId, {
       type: 'game_over_confirm',
       sessionId,
@@ -740,6 +790,8 @@ function createSession(data = {}) {
     difficulty,
     status: 'open',
     createdAt: Date.now(),
+    lastActivityAt: Date.now(),
+    endedAt: 0,
     players: new Map([[hostPlayerId, { playerId: hostPlayerId, name: hostName, isHost: true, isBot: false }]]),
     game: {
       seed: (crypto.randomBytes(4).readUInt32BE(0) & 0x7fffffff) || 1,
@@ -790,6 +842,10 @@ async function handleApi(req, res, urlObj) {
   }
 
   if (req.method === 'POST' && urlObj.pathname === '/api/sessions/create') {
+    if (isOverloadedForNewGame()) {
+      sendJson(res, 503, { ok: false, error: overloadError() });
+      return true;
+    }
     const body = await readJsonBody(req);
     const { session, hostPlayerId } = createSession(body || {});
     ensureRuntime(session);
@@ -802,6 +858,10 @@ async function handleApi(req, res, urlObj) {
   }
 
   if (req.method === 'POST' && urlObj.pathname === '/api/sessions/join') {
+    if (isOverloadedForNewGame()) {
+      sendJson(res, 503, { ok: false, error: overloadError() });
+      return true;
+    }
     const body = await readJsonBody(req);
     const sessionId = String(body.sessionId || '').trim();
     const joinCode = String(body.joinCode || '').trim().toUpperCase();
@@ -892,8 +952,8 @@ wss.on('connection', (ws, req) => {
       difficulty: session.difficulty,
       gameSeed: session.game.seed,
       waveCount: session.game.waveCount,
-    playerCount: connectedPlayersForSession(sessionId).length,
-    agreedHash: session.game.agreedHash || '',
+      playerCount: connectedPlayersForSession(sessionId).length,
+      agreedHash: session.game.agreedHash || '',
       startedAt: session.game.startedAt || 0,
       players: Array.from(session.players.values()).map((p) => ({
         playerId: p.playerId,
@@ -908,6 +968,7 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
+      session.lastActivityAt = Date.now();
       if (msg.type === 'ping') {
         ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
         return;
@@ -916,6 +977,7 @@ wss.on('connection', (ws, req) => {
         ws.close(1000, 'Client disconnect');
         return;
       }
+      if (session.status === 'ended') return;
       if (msg.type === 'state_hash') {
         if (session.status !== 'starting') return;
         const hash = String(msg.hash || '').trim();
@@ -932,6 +994,10 @@ wss.on('connection', (ws, req) => {
       if (msg.type === 'start_match') {
         if (!player.isHost) return;
         if (session.status !== 'open') return;
+        if (isOverloadedForNewGame()) {
+          ws.send(JSON.stringify({ type: 'server_overloaded', error: overloadError(), at: Date.now() }));
+          return;
+        }
         session.status = 'starting';
         session.handshake.votes.clear();
         if (session.handshake.timer) {
@@ -1018,8 +1084,7 @@ wss.on('connection', (ws, req) => {
       finalizeLossVote(sessionId, s.lossVote.proposalId, false);
     }
     if (s.players.size === 0 || countHumans(s) === 0) {
-      sessions.delete(sessionId);
-      wsBySession.delete(sessionId);
+      closeAndRemoveSession(sessionId, 'No players');
       return;
     }
     const hasHost = Array.from(s.players.values()).some((p) => p.isHost);
@@ -1047,7 +1112,17 @@ wss.on('connection', (ws, req) => {
 
 setInterval(() => {
   const nowMs = Date.now();
-  for (const session of sessions.values()) {
+  for (const [sessionId, session] of sessions.entries()) {
+    const idleForMs = nowMs - (session.lastActivityAt || session.createdAt || nowMs);
+    if (session.status === 'ended' && session.endedAt > 0 && (nowMs - session.endedAt) > SESSION_ENDED_GRACE_MS) {
+      closeAndRemoveSession(sessionId, 'Game ended');
+      continue;
+    }
+    if (idleForMs > SESSION_IDLE_TIMEOUT_MS) {
+      closeAndRemoveSession(sessionId, 'Session timeout');
+      continue;
+    }
+    if (session.status === 'ended') continue;
     maybeTrickleBots(session, nowMs);
     tickBotGameplay(session, nowMs);
   }

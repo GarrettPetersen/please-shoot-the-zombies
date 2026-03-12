@@ -477,6 +477,7 @@ function startLocalGame(opts = {}) {
   ironSightsRecoilKick = 0;
   zombies = [];
   particles = [];
+  tracers = [];
   hitFeedbackTime = 0;
   nextZombiePlanIndex = 0;
   spawnCounter = 0;
@@ -888,6 +889,10 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
         }
         return;
       }
+      if (msg.type === 'server_overloaded') {
+        showMenuToast(String(msg.error || t('statusJoinFailed')), 2.8);
+        return;
+      }
       if (msg.type === 'hash_mismatch') {
         showMenuToast(`Hash mismatch: ${msg.yourHash} vs ${msg.agreedHash}`, 2.8);
         closeMultiplayerSocket();
@@ -932,6 +937,12 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
         } else if (payload.type === 'player_shot') {
           if (Number.isFinite(payload.slotIndex)) setMpPlayerSlot(from, Number(payload.slotIndex), nowMs);
           const pos = getMpPlayerWorldPos(remote, nowMs);
+          if (payload?.dir && Number.isFinite(payload.dir.x) && Number.isFinite(payload.dir.y) && Number.isFinite(payload.dir.z)) {
+            addTracer(
+              { x: pos.x, y: (pos.y ?? BUNKER_FLOOR_Y) + MP_SPRITE_HEIGHT * 0.62, z: pos.z },
+              { x: payload.dir.x, y: payload.dir.y, z: payload.dir.z },
+            );
+          }
           const shotList = assets.shotSounds || [];
           if (shotList.length > 0) {
             const sfx = shotList[Math.floor(Math.random() * shotList.length)];
@@ -1171,6 +1182,14 @@ function getMenuPageDefinition() {
 }
 
 function selectMenuItem(index) {
+  const toastFromMenuError = (err) => {
+    const text = String(err?.message || '').trim();
+    if (text && !/^HTTP\s+\d+/i.test(text)) {
+      showMenuToast(text.slice(0, 120), 2.6);
+      return;
+    }
+    showMenuToast(t('statusJoinFailed'), 2);
+  };
   const def = getMenuPageDefinition();
   const item = def.items[index];
   if (!item || typeof item.onSelect !== 'function') return;
@@ -1179,12 +1198,12 @@ function selectMenuItem(index) {
     if (maybe && typeof maybe.then === 'function') {
       maybe.catch((err) => {
         console.error(err);
-        showMenuToast(t('statusJoinFailed'), 2);
+        toastFromMenuError(err);
       });
     }
   } catch (err) {
     console.error(err);
-    showMenuToast(t('statusJoinFailed'), 2);
+    toastFromMenuError(err);
   }
 }
 
@@ -1234,8 +1253,11 @@ function handleMenuClick(e) {
 // ---- 3D projection ----
 
 function getViewVectors() {
-  // Use negated pitch so positive cameraPitch (mouse down) = look down in 3D view
   const pitch = -cameraPitch;
+  if (getViewVectors.cache && getViewVectors.cacheYaw === cameraYaw && getViewVectors.cachePitch === pitch) {
+    return getViewVectors.cache;
+  }
+  // Use negated pitch so positive cameraPitch (mouse down) = look down in 3D view
   const cp = Math.cos(pitch);
   const sp = Math.sin(pitch);
   const cy = Math.cos(cameraYaw);
@@ -1255,7 +1277,10 @@ function getViewVectors() {
     y: cp,   // keep up right-side up when pitch is negated
     z: cy * sp,
   };
-  return { forward, right, up };
+  getViewVectors.cacheYaw = cameraYaw;
+  getViewVectors.cachePitch = pitch;
+  getViewVectors.cache = { forward, right, up };
+  return getViewVectors.cache;
 }
 
 function getFOV() {
@@ -1288,9 +1313,10 @@ function getRemotePlayersForRenderer() {
   const items = [];
   if (!multiplayerPlayers.size) return items;
   const localId = multiplayerSession?.playerId || '__local__';
+  const nowMs = Date.now();
   multiplayerPlayers.forEach((p) => {
     if (p.playerId === localId || p.isLocal) return;
-    const pos = getMpPlayerWorldPos(p, Date.now());
+    const pos = getMpPlayerWorldPos(p, nowMs);
     const slot = pos.slot || getSlotByIndex(p.slotIndex);
     const imgBack = assets.playerSpriteBack;
     const imgSide = assets.playerSpriteSide;
@@ -1443,7 +1469,13 @@ function project(wx, wy, wz) {
   if (depth <= NEAR) return null;
   const viewX = dx * right.x + dy * right.y + dz * right.z;
   const viewY = dx * up.x + dy * up.y + dz * up.z;
-  const scale = (H / 2) / (Math.tan(getFOV() / 2) * depth);
+  const fov = getFOV();
+  if (project.cacheFov !== fov || project.cacheH !== H) {
+    project.cacheFov = fov;
+    project.cacheH = H;
+    project.cacheProjFactor = (H / 2) / Math.tan(fov / 2);
+  }
+  const scale = project.cacheProjFactor / depth;
   const sx = W / 2 + viewX * scale;
   const sy = H / 2 - viewY * scale;
   return { sx, sy, depth };
@@ -2236,7 +2268,7 @@ function isPointInsidePolygon(x, z, corners) {
   return inside;
 }
 
-function isPathSegmentBlocked(ax, az, bx, bz, y, treeList, allowTouchAtEnd = false) {
+function isPathSegmentBlocked(ax, az, bx, bz, y, treeList, allowTouchAtEnd = false, allowNonOpaqueCrossing = false) {
   if (isPointInsidePolygon(ax, az, bunker.corners) || isPointInsidePolygon(bx, bz, bunker.corners)) return true;
   const segLen = Math.hypot(bx - ax, bz - az);
   if (segLen <= 1e-6) return false;
@@ -2263,6 +2295,8 @@ function isPathSegmentBlocked(ax, az, bx, bz, y, treeList, allowTouchAtEnd = fal
     if (y <= 0 || y >= BUNKER_WALL_HEIGHT) continue;
     const alpha = sampleBunkerWallAlpha(segment, Math.max(0, Math.min(1, u)), y);
     if (alpha > BUNKER_WALL_ALPHA_PASS_THRESHOLD) return true;
+    // During route planning, prevent cutting through any wall opening except explicit final approach.
+    if (!allowNonOpaqueCrossing) return true;
   }
   return false;
 }
@@ -2277,7 +2311,7 @@ function choosePathForZombie(start, target, rng, treeList) {
   const targetPt = { x: target.x, z: target.z };
   const direct = [start, targetPt];
   const choices = [];
-  if (!isPathSegmentBlocked(start.x, start.z, targetPt.x, targetPt.z, CAMERA_Y, treeList, true)) {
+  if (!isPathSegmentBlocked(start.x, start.z, targetPt.x, targetPt.z, CAMERA_Y, treeList, true, false)) {
     choices.push({ style: 'direct', points: direct });
   }
 
@@ -2309,7 +2343,7 @@ function choosePathForZombie(start, target, rng, treeList) {
     pts.push(targetPt);
     let ok = true;
     for (let p = 1; p < pts.length; p++) {
-      if (isPathSegmentBlocked(pts[p - 1].x, pts[p - 1].z, pts[p].x, pts[p].z, CAMERA_Y, treeList, p === pts.length - 1)) {
+      if (isPathSegmentBlocked(pts[p - 1].x, pts[p - 1].z, pts[p].x, pts[p].z, CAMERA_Y, treeList, p === pts.length - 1, false)) {
         ok = false;
         break;
       }
@@ -2330,8 +2364,8 @@ function choosePathForZombie(start, target, rng, treeList) {
     const bend = (rng() < 0.5 ? -1 : 1) * (2.5 + rng() * 4.0);
     const mid = { x: start.x + dx * midT + px * bend, z: start.z + dz * midT + pz * bend };
     const zz = [start, mid, targetPt];
-    let ok = !isPathSegmentBlocked(start.x, start.z, mid.x, mid.z, CAMERA_Y, treeList, false)
-      && !isPathSegmentBlocked(mid.x, mid.z, targetPt.x, targetPt.z, CAMERA_Y, treeList, true);
+    let ok = !isPathSegmentBlocked(start.x, start.z, mid.x, mid.z, CAMERA_Y, treeList, false, false)
+      && !isPathSegmentBlocked(mid.x, mid.z, targetPt.x, targetPt.z, CAMERA_Y, treeList, true, false);
     if (ok) choices.push({ style: 'zigzag', points: zz });
   }
 
@@ -2424,6 +2458,7 @@ function generateGameParameters(seed = GAME_PARAM_SEED, waveCount = GAME_PARAM_W
           CAMERA_Y,
           treeList,
           true,
+          true,
         )) continue;
         const plen = pathLength(pathWithFinal.points);
         if (plen < ZOMBIE_MIN_PATH_LENGTH) continue;
@@ -2440,7 +2475,7 @@ function generateGameParameters(seed = GAME_PARAM_SEED, waveCount = GAME_PARAM_W
           if (isPathSegmentBlocked(
             fallback[pIdx - 1].x, fallback[pIdx - 1].z,
             fallback[pIdx].x, fallback[pIdx].z,
-            CAMERA_Y, treeList, pIdx === fallback.length - 1,
+            CAMERA_Y, treeList, pIdx === fallback.length - 1, pIdx === fallback.length - 1,
           )) {
             ok = false;
             break;
@@ -2815,7 +2850,14 @@ function sampleBunkerWallAlpha(segment, u, y) {
 }
 
 function shotLeavesThroughWindow(px, py) {
-  if (worldRenderer?.isReady()) return worldRenderer.canShotLeaveWindow(px, py);
+  const current = getCurrentBunkerSlot();
+  if (current?.type === 'window') {
+    const b = getSlotScreenBounds(current);
+    if (b) {
+      const pad = 4;
+      return px >= (b.minSx - pad) && px <= (b.maxSx + pad) && py >= (b.syTop - pad) && py <= (b.syBottom + pad);
+    }
+  }
   if (!bunker) return true;
   const dir = getShotDirection(px, py);
   const origin = { x: cameraX, y: CAMERA_Y, z: cameraZ };
@@ -3345,9 +3387,13 @@ const PARTICLE_REST_VY = 0.5;
 const PARTICLE_REST_VXZ = 0.5;
 
 let particles = [];
+let tracers = []; // short-lived bullet streaks
 let zombieSampleCanvas, zombieSampleCtx;
 let holeCanvas, holeCtx;  // offscreen buffer for zombie-with-holes (true transparency)
 let treeHoleCanvas, treeHoleCtx;  // 256x256 buffer for tree-with-holes
+const TRACER_LIFE = 0.065; // seconds (~1-2 frames)
+const TRACER_LENGTH = 90; // world units
+const TRACER_WIDTH = 1.4; // screen px
 function ensureZombieSampleCanvas(w = ZOMBIE_SPRITE_W, h = ZOMBIE_SPRITE_H) {
   const needW = Math.max(w, 256);
   const needH = Math.max(h, 256);
@@ -3488,6 +3534,50 @@ function updateParticles(dt) {
       }
     }
   }
+}
+
+function addTracer(from, dir, color = 'rgba(255,244,200,0.95)') {
+  const len = Math.hypot(dir.x, dir.y, dir.z) || 1;
+  const ux = dir.x / len;
+  const uy = dir.y / len;
+  const uz = dir.z / len;
+  tracers.push({
+    fromX: from.x,
+    fromY: from.y,
+    fromZ: from.z,
+    toX: from.x + ux * TRACER_LENGTH,
+    toY: from.y + uy * TRACER_LENGTH,
+    toZ: from.z + uz * TRACER_LENGTH,
+    life: TRACER_LIFE,
+    maxLife: TRACER_LIFE,
+    color,
+  });
+}
+
+function updateTracers(dt) {
+  for (let i = tracers.length - 1; i >= 0; i--) {
+    tracers[i].life -= dt;
+    if (tracers[i].life <= 0) tracers.splice(i, 1);
+  }
+}
+
+function drawTracers() {
+  if (!tracers.length) return;
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineWidth = TRACER_WIDTH;
+  for (const t of tracers) {
+    const a = project(t.fromX, t.fromY, t.fromZ);
+    const b = project(t.toX, t.toY, t.toZ);
+    if (!a || !b || a.depth <= NEAR || b.depth <= NEAR) continue;
+    const alpha = Math.max(0, t.life / t.maxLife);
+    ctx.strokeStyle = `rgba(255,244,200,${alpha})`;
+    ctx.beginPath();
+    ctx.moveTo(a.sx, a.sy);
+    ctx.lineTo(b.sx, b.sy);
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 function drawParticles() {
@@ -5457,6 +5547,7 @@ function draw() {
     ctx.textAlign = 'left';
   }
   drawParticles();
+  drawTracers();
   if (!gameOver && !boardPlaceState) drawRifle(1 / 60);
   drawReticule();
   drawRunTargetArrow();
@@ -5491,6 +5582,7 @@ function tick(dt) {
   }
   fallingBoards = fallingBoards.filter((fb) => gameTime < fb.endTime);
   updateParticles(dt);
+  updateTracers(dt);
   if (!gameOver && !gameWon) {
     while (nextZombiePlanIndex < zombieSpawnPlan.length) {
       const nextPlan = zombieSpawnPlan[nextZombiePlanIndex];
@@ -5659,6 +5751,7 @@ canvas.addEventListener('click', (e) => {
 
   const canSeeOutside = shotLeavesThroughWindow(px, py);
   const shotDir = getShotDirection(px, py);
+  addTracer({ x: cameraX, y: CAMERA_Y - 0.05, z: cameraZ }, shotDir);
   const makeShotEvent = (hit) => ({
     at: Date.now(),
     px: Math.round(px),
