@@ -326,7 +326,7 @@
             const geom = new THREE.PlaneGeometry(b.w, b.h);
             const mesh = new THREE.Mesh(geom, mat);
             mesh.position.set(b.x, b.y, b.z);
-            mesh.rotation.y = -b.yaw - Math.PI / 2;
+            mesh.rotation.y = -(b.segmentYaw ?? -b.yaw - Math.PI / 2);
             mesh.rotation.z = b.rot || 0;
             this.dynamicGroup.add(mesh);
           } else if (b.type === 'floor') {
@@ -334,8 +334,9 @@
             const geom = new THREE.PlaneGeometry(b.w, b.h);
             const mesh = new THREE.Mesh(geom, mat);
             mesh.position.set(b.x, b.y, b.z);
-            mesh.rotation.x = -Math.PI / 2;
-            mesh.rotation.y = (b.slotYaw ?? 0) + (b.rot || 0);
+            mesh.rotation.x = 0;
+            mesh.rotation.y = -(b.slotYaw ?? 0);
+            mesh.rotation.z = b.rot || 0;
             this.dynamicGroup.add(mesh);
           } else if (b.type === 'placing') {
             const t = b.t;
@@ -346,9 +347,9 @@
             const geom = new THREE.PlaneGeometry(b.w, b.h);
             const mesh = new THREE.Mesh(geom, mat);
             mesh.position.set(x, y, z);
-            mesh.rotation.x = -Math.PI / 2 + t * (Math.PI / 2);
-            mesh.rotation.y = (b.fromRot || 0) + t * (-b.slotYaw - Math.PI / 2 - (b.fromRot || 0));
-            mesh.rotation.z = t * (b.toRot || 0);
+            mesh.rotation.x = 0;
+            mesh.rotation.y = -(b.slotYaw ?? 0);
+            mesh.rotation.z = (b.fromRot || 0) + ((b.toRot || 0) - (b.fromRot || 0)) * t;
             this.dynamicGroup.add(mesh);
           }
         }

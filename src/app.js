@@ -518,7 +518,26 @@ function startLocalGame(opts = {}) {
   desiredPitch = 0;
   cameraPitch = 0;
   appMode = 'game';
+  logBoardOrientations();
   return true;
+}
+
+function logBoardOrientations() {
+  if (!bunkerSlots?.length) return;
+  const rad2deg = (r) => (r * 180 / Math.PI).toFixed(1);
+  console.log('[Board orientations] All wall boards should be up-and-down (vertical). rotation.y = -segmentYaw.');
+  for (let i = 0; i < bunkerSlots.length; i++) {
+    const slot = bunkerSlots[i];
+    if (slot.type !== 'window') continue;
+    const tx = slot.tangent?.x ?? 0;
+    const tz = slot.tangent?.z ?? 0;
+    const segmentYaw = Math.atan2(tz, tx);
+    const rotationY = -segmentYaw;
+    console.log(
+      `  slot ${i} segment ${slot.segmentIndex}: tangent(${tx.toFixed(3)}, ${tz.toFixed(3)}) ` +
+      `segmentYaw=${rad2deg(segmentYaw)}° rotation.y=${rad2deg(rotationY)}°`
+    );
+  }
 }
 
 function getPlayerNameForMatchmaking() {
@@ -1308,9 +1327,15 @@ function getBoardInstancesForRenderer() {
     if (isPlacingHere) floorCount = Math.max(0, onFloor - 1);
     const floorY = BUNKER_FLOOR_Y + halfH;
     const slotYaw = Math.atan2(slot.tangent?.z ?? 0, slot.tangent?.x ?? 1);
+    const n = slot.normal ?? { x: 0, z: 1 };
+    const sign = slot.segmentIndex % 2 === 0 ? 1 : -1;
+    const rightX = sign * n.z;
+    const rightZ = -sign * n.x;
     for (let i = 0; i < floorCount && i < floorPoses.length; i++) {
       const p = floorPoses[i];
-      out.push({ type: 'floor', x: p.x, y: floorY, z: p.z, w: halfW * 2, h: halfH * 2, rot: p.rot, slotYaw });
+      const stackX = p.x + rightX * BOARD_STACK_OFFSET_RIGHT;
+      const stackZ = p.z + rightZ * BOARD_STACK_OFFSET_RIGHT;
+      out.push({ type: 'floor', x: stackX, y: floorY, z: stackZ, w: halfW * 2, h: halfH * 2, rot: p.rot + BOARD_STACK_ROLL, slotYaw });
     }
     if (isPlacingHere && boardPlaceState && onFloor > 0 && onWindow < windowPoses.length) {
       const startTime = boardPlaceState.startTime;
@@ -1320,27 +1345,28 @@ function getBoardInstancesForRenderer() {
       const toP = windowPoses[onWindow];
       const fromY = (fromP.y ?? 0) + halfH;
       const toY = BUNKER_WALL_HEIGHT * (1 - BOARD_WINDOW_FRACTIONS[onWindow]);
-      const slotYaw = Math.atan2(slot.tangent?.z ?? 0, slot.tangent?.x ?? 1) - Math.PI / 2;
+      const slotYaw = Math.atan2(slot.tangent?.z ?? 0, slot.tangent?.x ?? 1);
       out.push({
         type: 'placing',
         t,
-        fromX: fromP.x, fromY, fromZ: fromP.z,
+        fromX: fromP.x + rightX * BOARD_STACK_OFFSET_RIGHT,
+        fromY,
+        fromZ: fromP.z + rightZ * BOARD_STACK_OFFSET_RIGHT,
         toX: toP.x, toY, toZ: toP.z,
-        fromRot: fromP.rot, toRot: toP.rot,
+        fromRot: fromP.rot + BOARD_STACK_ROLL,
+        toRot: toP.rot,
         slotYaw,
         w: halfW * 2, h: halfH * 2,
       });
     }
-    const tx = slot.tangent?.x ?? 1;
-    const tz = slot.tangent?.z ?? 0;
+    const segmentYaw = Math.atan2(slot.tangent?.z ?? 0, slot.tangent?.x ?? 1);
     for (let i = 0; i < onWindow && i < windowPoses.length; i++) {
       const p = windowPoses[i];
       const frac = BOARD_WINDOW_FRACTIONS[i];
-      const y = BUNKER_WALL_HEIGHT * (1 - frac) - BOARD_WALL_OFFSET_DOWN;
-      const x = p.x + tx * BOARD_WALL_OFFSET_RIGHT;
-      const z = p.z + tz * BOARD_WALL_OFFSET_RIGHT;
-      const yaw = Math.atan2(slot.tangent?.z ?? 0, slot.tangent?.x ?? 1) - Math.PI / 2;
-      out.push({ type: 'wall', x, y, z, w: halfW * 2, h: halfH * 2, yaw, rot: p.rot });
+      const y = BUNKER_WALL_HEIGHT * (1 - frac);
+      const x = p.x;
+      const z = p.z;
+      out.push({ type: 'wall', x, y, z, w: halfW * 2, h: halfH * 2, segmentYaw, rot: p.rot });
     }
   }
 
@@ -1353,7 +1379,7 @@ function getBoardInstancesForRenderer() {
     const rot = fb.fromPos.rot + (fb.toPos.rot - fb.fromPos.rot) * t;
     const slot = bunkerSlots.find((s) => getSlotKey(s) === fb.slotKey);
     const slotYaw = slot ? Math.atan2(slot.tangent?.z ?? 0, slot.tangent?.x ?? 1) : 0;
-    out.push({ type: 'floor', x, y, z, w: halfW * 2, h: halfH * 2, rot, slotYaw });
+    out.push({ type: 'floor', x, y, z, w: halfW * 2, h: halfH * 2, rot: rot + BOARD_STACK_ROLL, slotYaw });
   }
   return out;
 }
@@ -4370,8 +4396,8 @@ function drawMultiplayerPlayersDepthSorted(outItems = null) {
 
 const BOARD_SPRITE_WORLD_SIZE = 0.95;
 const BOARD_WALL_INSET = 0.035; // slight inward offset so boarded windows sit in front of wall
-const BOARD_WALL_OFFSET_RIGHT = 1.05; // world units along wall tangent so boards sit clearly to the side of the window
-const BOARD_WALL_OFFSET_DOWN = 0.22; // world units so boards sit below window, reducing hammer overlap
+const BOARD_STACK_OFFSET_RIGHT = 1.0; // world units; leaned stack is well to the right of the window so hammer doesn't trigger when aiming out
+const BOARD_STACK_ROLL = -Math.PI / 2; // fixed in-plane roll so stacked boards are upright on every wall orientation
 const BOARD_WINDOW_FRACTIONS = [0.2, 0.35, 0.58];  // from top: top board, middle above rifle, bottom inside window
 
 function getWindowScreenBounds(slot) {
@@ -5427,6 +5453,7 @@ function tick(dt) {
   if (boardPlaceState && gameTime >= boardPlaceState.endTime) {
     const key = boardPlaceState.slotKey;
     windowBoards[key] = Math.min(BOARDS_PER_WINDOW, (windowBoards[key] ?? 0) + 1);
+    console.log('[Board nailed up] slotKey=', key, 'slotIndex=', activeSlotIndex, 'boardsOnWindow=', windowBoards[key]);
     sendMultiplayerPayload('player_board_complete', {
       slotIndex: activeSlotIndex,
       slotKey: key,
