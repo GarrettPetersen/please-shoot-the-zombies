@@ -3,17 +3,24 @@
  * Player at fixed position, pivot with mouse (FPS-style). Zombies at 3D positions, scaled by distance.
  */
 
+const worldCanvas = document.getElementById('world3d');
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 
 // Resolution
 const W = 455;
 const H = 256;
+if (worldCanvas) {
+  worldCanvas.width = W;
+  worldCanvas.height = H;
+}
 canvas.width = W;
 canvas.height = H;
 
 // Pixel art: nearest-neighbor scaling, no anti-aliasing on sprites
 ctx.imageSmoothingEnabled = false;
+let worldRenderer = null;
+let worldStaticDirty = true;
 
 // Steam (matchmaking, voice) — App ID for Please Shoot the Zombies
 const STEAM_APP_ID = 4516500;
@@ -371,7 +378,7 @@ let multiplayerPlayers = new Map(); // playerId -> state
 let multiplayerArrivalCounter = 1;
 const MP_MOVE_DURATION = BUNKER_MOVE_DURATION;
 const MP_BOB_SPEED = 8;
-const MP_SPRITE_HEIGHT = 1.72;
+const MP_SPRITE_HEIGHT = 1.82;
 const MP_QUEUE_SPACING = 0.38;
 
 // Aiming: desired direction (reticule leads), camera chases with delay — turn any direction
@@ -702,11 +709,11 @@ function getSlotQueueMap() {
   return bySlot;
 }
 
-function playPositionalClip(audioTemplate, worldX, worldZ, gainMul = 1, decayMs = 0) {
+function playPositionalClip(audioTemplate, worldX, worldZ, gainMul = 1, decayMs = 0, refDist = POSITIONAL_REF_DIST) {
   if (!audioTemplate) return;
   const ctx = getAudioContext();
   if (!ctx) return;
-  const { gain, pan } = getPositionalGainPan(worldX, worldZ);
+  const { gain, pan } = getPositionalGainPan(worldX, worldZ, refDist);
   const audio = audioTemplate.cloneNode(true);
   audio.preload = 'auto';
   const source = ctx.createMediaElementSource(audio);
@@ -896,9 +903,10 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
           const shotList = assets.shotSounds || [];
           if (shotList.length > 0) {
             const sfx = shotList[Math.floor(Math.random() * shotList.length)];
-            playPositionalClip(sfx, pos.x, pos.z, 0.85, 280);
+            // Gunshots carry further than other SFX; keep them loud at distance.
+            playPositionalClip(sfx, pos.x, pos.z, 1.0, 420, POSITIONAL_REF_DIST * 3.2);
           }
-          if (assets.ejectCasing) playPositionalClip(assets.ejectCasing, pos.x, pos.z, 0.7, 220);
+          if (assets.ejectCasing) playPositionalClip(assets.ejectCasing, pos.x, pos.z, 0.7, 220, POSITIONAL_REF_DIST * 1.4);
           applyRemoteZombieHit(payload, remote);
         } else if (payload.type === 'player_board_start') {
           const pos = getMpPlayerWorldPos(remote, nowMs);
@@ -1227,6 +1235,125 @@ function isIronSightsActive() {
   return ironSightsHeld && rifleState !== 'reloading' && !isRunning;
 }
 
+function initWorldRendererIfAvailable() {
+  if (worldRenderer || !window.WorldRenderer3D || !worldCanvas) return;
+  try {
+    worldRenderer = new window.WorldRenderer3D(worldCanvas, W, H);
+    worldStaticDirty = true;
+  } catch (err) {
+    console.error('WorldRenderer3D init failed:', err);
+    worldRenderer = null;
+  }
+}
+
+function getRemotePlayersForRenderer() {
+  const items = [];
+  if (!multiplayerPlayers.size) return items;
+  const localId = multiplayerSession?.playerId || '__local__';
+  multiplayerPlayers.forEach((p) => {
+    if (p.playerId === localId || p.isLocal) return;
+    const pos = getMpPlayerWorldPos(p, Date.now());
+    const slot = pos.slot || getSlotByIndex(p.slotIndex);
+    const imgBack = assets.playerSpriteBack;
+    const imgSide = assets.playerSpriteSide;
+    let img = imgSide;
+    if (slot) {
+      const forward = { x: Math.sin(slot.baseYaw), z: -Math.cos(slot.baseYaw) };
+      const toCamX = cameraX - pos.x;
+      const toCamZ = cameraZ - pos.z;
+      const mag = Math.hypot(toCamX, toCamZ) || 1;
+      const dot = forward.x * (toCamX / mag) + forward.z * (toCamZ / mag);
+      if (dot < -0.45) img = imgBack || imgSide;
+    }
+    items.push({
+      playerId: p.playerId,
+      x: pos.x,
+      y: BUNKER_FLOOR_Y + (pos.y || 0),
+      z: pos.z,
+      img: img || imgSide || imgBack,
+    });
+  });
+  return items;
+}
+
+function getBoardInstancesForRenderer() {
+  const out = [];
+  if (!bunker || !assets.board?.naturalWidth) return out;
+  const img = assets.board;
+  const iw = img.naturalWidth;
+  const ih = img.naturalHeight;
+  const halfH = BOARD_SPRITE_WORLD_SIZE * 0.5;
+  const halfW = BOARD_SPRITE_WORLD_SIZE * (iw / Math.max(1, ih)) * 0.5;
+  const placingKey = boardPlaceState?.slotKey ?? null;
+
+  for (const slot of bunkerSlots) {
+    if (slot.type !== 'window') continue;
+    const key = getSlotKey(slot);
+    const onWindow = windowBoards[key] ?? 0;
+    const onFloor = BOARDS_PER_WINDOW - onWindow;
+    const floorPoses = getBoardFloorPositions(slot);
+    const windowPoses = getBoardWindowPositions(slot);
+    const isPlacingHere = placingKey === key;
+    let floorCount = onFloor;
+    if (isPlacingHere) floorCount = Math.max(0, onFloor - 1);
+    for (let i = 0; i < floorCount && i < floorPoses.length; i++) {
+      const p = floorPoses[i];
+      out.push({ type: 'billboard', x: p.x, y: p.y + halfH, z: p.z, w: halfW * 2, h: halfH * 2, rot: p.rot });
+    }
+    for (let i = 0; i < onWindow && i < windowPoses.length; i++) {
+      const p = windowPoses[i];
+      const frac = BOARD_WINDOW_FRACTIONS[i];
+      const y = BUNKER_WALL_HEIGHT * (1 - frac);
+      const x = p.x;
+      const z = p.z;
+      const yaw = Math.atan2(slot.tangent?.z ?? 0, slot.tangent?.x ?? 1) - Math.PI / 2;
+      out.push({ type: 'wall', x, y, z, w: halfW * 2, h: halfH * 2, yaw, rot: p.rot });
+    }
+  }
+
+  for (const fb of fallingBoards) {
+    const t = Math.min(1, Math.max(0, (gameTime - fb.startTime) / (fb.endTime - fb.startTime)));
+    const x = fb.fromPos.x + (fb.toPos.x - fb.fromPos.x) * t;
+    const y = (fb.fromPos.y + (fb.toPos.y - fb.fromPos.y) * t) + halfH;
+    const z = fb.fromPos.z + (fb.toPos.z - fb.fromPos.z) * t;
+    const rot = fb.fromPos.rot + (fb.toPos.rot - fb.fromPos.rot) * t;
+    out.push({ type: 'billboard', x, y, z, w: halfW * 2, h: halfH * 2, rot });
+  }
+  return out;
+}
+
+function getWorldRendererState() {
+  return {
+    assets,
+    bunker,
+    bunkerSlots,
+    bunkerWallSegments,
+    bunkerTileWorldWidth,
+    trees,
+    zombies,
+    cameraX,
+    cameraZ,
+    CAMERA_Y,
+    BUNKER_FLOOR_Y,
+    BUNKER_WALL_HEIGHT,
+    NEAR,
+    FAR,
+    TREE_HEIGHT,
+    TREE_SPRITE_SIZE,
+    ZOMBIE_REF_HEIGHT,
+    ZOMBIE_SPRITE_W,
+    ZOMBIE_SPRITE_H,
+    MP_SPRITE_HEIGHT,
+    getFOV,
+    getBunkerWallImageAndData,
+    getCrateAABB,
+    getTreeGridCell,
+    getRemotePlayers: getRemotePlayersForRenderer,
+    getBoardInstances: getBoardInstancesForRenderer,
+    getViewForward: () => getViewVectors().forward,
+  };
+}
+
 function project(wx, wy, wz) {
   const dx = wx - cameraX;
   const dy = wy - CAMERA_Y;
@@ -1506,6 +1633,7 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
   setActiveBunkerSlot(activeSlotIndex, true);
   initWindowBoards();
   precomputeSlotVoiceVolumes();
+  worldStaticDirty = true;
 }
 
 function getBoardFloorPositions(slot) {
@@ -1515,8 +1643,9 @@ function getBoardFloorPositions(slot) {
   const rng = seeded(seed);
   const tx = slot.tangent?.x ?? 1;
   const tz = slot.tangent?.z ?? 0;
-  const wallX = slot.wallX ?? slot.x;
-  const wallZ = slot.wallZ ?? slot.z;
+  const n = slot.normal ?? { x: 0, z: 1 };
+  const wallX = (slot.wallX ?? slot.x) + n.x * BOARD_WALL_INSET;
+  const wallZ = (slot.wallZ ?? slot.z) + n.z * BOARD_WALL_INSET;
   const positions = [];
   for (let i = 0; i < BOARDS_PER_WINDOW; i++) {
     const jitter = (rng() - 0.5) * 0.08;
@@ -1533,8 +1662,9 @@ function getBoardWindowPositions(slot) {
   const key = getSlotKey(slot);
   const seed = (key.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 0)) >>> 0;
   const rng = seeded(seed);
-  const wallX = slot.wallX ?? slot.x;
-  const wallZ = slot.wallZ ?? slot.z;
+  const n = slot.normal ?? { x: 0, z: 1 };
+  const wallX = (slot.wallX ?? slot.x) + n.x * BOARD_WALL_INSET;
+  const wallZ = (slot.wallZ ?? slot.z) + n.z * BOARD_WALL_INSET;
   const positions = [
     { y: BOARD_WINDOW_Y_LOW },
     { y: BOARD_WINDOW_Y_MID },
@@ -1935,6 +2065,10 @@ function isReticuleOnBoardStack(px, py) {
   const key = getSlotKey(slot);
   const onFloor = BOARDS_PER_WINDOW - (windowBoards[key] ?? 0);
   if (onFloor <= 0) return false;
+  if (worldRenderer?.isReady()) {
+    const hit = worldRenderer.pickFirst(px, py, ['window']);
+    return !!hit && Number(hit.userData?.slotIndex) === activeSlotIndex;
+  }
   // Minimum look-down so boards at wall foot are visible; wood in frame
   if (cameraPitch < 0.06) return false;
   const floorPoses = getBoardFloorPositions(slot);
@@ -2543,6 +2677,7 @@ function updateTallyWallTextures() {
   fx.scale(-1, 1);
   fx.drawImage(canvas, 0, 0);
   assets.bunkerWallWithTallyMirrored = flipped;
+  worldStaticDirty = true;
 }
 
 function getBunkerWallImageAndData(spriteKey) {
@@ -2574,6 +2709,7 @@ function sampleBunkerWallAlpha(segment, u, y) {
 }
 
 function shotLeavesThroughWindow(px, py) {
+  if (worldRenderer?.isReady()) return worldRenderer.canShotLeaveWindow(px, py);
   if (!bunker) return true;
   const dir = getShotDirection(px, py);
   const origin = { x: cameraX, y: CAMERA_Y, z: cameraZ };
@@ -2636,6 +2772,24 @@ function isWorldPointVisibleFromCamera(wx, wy, wz, nearTargetCutoff = 0.995) {
   return true;
 }
 
+/** Visibility test for an upright actor body: sample multiple heights and require majority visible. */
+function isWorldActorVisibleFromCamera(wx, floorY, actorHeight, wz) {
+  const h = Math.max(0.2, actorHeight || 1);
+  const base = floorY + 0.04;
+  const ys = [
+    base,
+    floorY + h * 0.32,
+    floorY + h * 0.62,
+    floorY + h * 0.9,
+  ];
+  let visible = 0;
+  for (const y of ys) {
+    // Slightly stricter near-target cutoff reduces corner "peek-through" artifacts.
+    if (isWorldPointVisibleFromCamera(wx, y, wz, 0.985)) visible++;
+  }
+  return visible >= 2;
+}
+
 function getCrateAABB() {
   if (!bunker) return null;
   const crateSlot = bunkerSlots.find((slot) => slot.type === 'crate');
@@ -2656,6 +2810,7 @@ function getCrateAABB() {
 }
 
 function isReticuleOnCrate(px, py) {
+  if (worldRenderer?.isReady()) return !!worldRenderer.pickFirst(px, py, ['crate']);
   const box = getCrateAABB();
   if (!box) return false;
   const dir = getShotDirection(px, py);
@@ -2853,11 +3008,12 @@ function playBoltCloseSound() {
 const POSITIONAL_REF_DIST = 6;   // distance at which gain is 0.5 (reference for inverse-square)
 
 /** Returns { gain, pan } for a source at (worldX, worldZ). Gain follows inverse-square law. */
-function getPositionalGainPan(worldX, worldZ) {
+function getPositionalGainPan(worldX, worldZ, refDist = POSITIONAL_REF_DIST) {
   const dx = worldX - cameraX;
   const dz = worldZ - cameraZ;
   const distanceSq = dx * dx + dz * dz;
-  const refSq = POSITIONAL_REF_DIST * POSITIONAL_REF_DIST;
+  const safeRef = Math.max(0.5, Number(refDist) || POSITIONAL_REF_DIST);
+  const refSq = safeRef * safeRef;
   const gain = refSq / (refSq + Math.max(distanceSq, 0.01));
   const soundAngle = Math.atan2(dz, dx);
   const lookAngle = Math.atan2(-Math.cos(cameraYaw), Math.sin(cameraYaw));
@@ -3463,6 +3619,12 @@ function treeBlocksPoint(t, info, px, py) {
 
 /** Returns { type: 'zombie'|'tree', index } for the closest hit, or null. */
 function getHitTarget(px, py) {
+  if (worldRenderer?.isReady()) {
+    const hit = worldRenderer.pickFirst(px, py, ['zombie', 'tree']);
+    if (hit?.kind === 'zombie') return { type: 'zombie', index: Number(hit.userData?.index ?? -1) };
+    if (hit?.kind === 'tree') return { type: 'tree', index: Number(hit.userData?.index ?? -1) };
+    return null;
+  }
   const candidates = [];
   const zombieIdx = hitTestZombies(px, py);
   if (zombieIdx >= 0) {
@@ -4071,10 +4233,9 @@ function getMultiplayerDrawInfo(p, queueIndex, nowMs = Date.now()) {
     }
   }
   const bob = p.moving ? Math.sin((nowMs / 1000) * MP_BOB_SPEED + p.bobPhase) * 0.03 : 0;
-  const feetY = bob;
+  const feetY = BUNKER_FLOOR_Y + bob;
   const headY = feetY + MP_SPRITE_HEIGHT;
-  const eyeY = feetY + MP_SPRITE_HEIGHT * 0.55;
-  if (!isWorldPointVisibleFromCamera(wx, eyeY, wz, 0.9999)) return null;
+  if (!isWorldActorVisibleFromCamera(wx, feetY, MP_SPRITE_HEIGHT, wz)) return null;
   const headProj = project(wx, headY, wz);
   const feetProj = project(wx, feetY, wz);
   if (!headProj || !feetProj || headProj.depth <= NEAR) return null;
@@ -4095,7 +4256,7 @@ function getMultiplayerDrawInfo(p, queueIndex, nowMs = Date.now()) {
   if (!img) return null;
   const rawScreenH = feetProj.sy - headProj.sy;
   if (rawScreenH <= 2) return null;
-  const screenH = Math.min(rawScreenH, H * 0.55);
+  const screenH = Math.min(rawScreenH, H * 0.95);
   const spriteW = img.naturalWidth || img.width || 64;
   const spriteH = img.naturalHeight || img.height || 64;
   const screenW = Math.max(8, screenH * (spriteW / spriteH));
@@ -4121,13 +4282,17 @@ function drawMultiplayerPlayer(info) {
   ctx.restore();
 }
 
-function drawCharactersDepthSorted() {
+function drawCharactersDepthSorted(outItems = null) {
   const drawItems = [];
   for (const t of getVisibleTrees()) drawItems.push({ type: 'tree', depth: t.depth, t });
   for (const z of zombies) {
     const info = getZombieDrawInfo(z);
     if (!info) continue;
     drawItems.push({ type: 'zombie', depth: info.depth, z, info });
+  }
+  if (outItems) {
+    for (const item of drawItems) outItems.push(item);
+    return;
   }
   drawItems.sort((a, b) => b.depth - a.depth);
   for (const item of drawItems) {
@@ -4136,7 +4301,7 @@ function drawCharactersDepthSorted() {
   }
 }
 
-function drawMultiplayerPlayersDepthSorted() {
+function drawMultiplayerPlayersDepthSorted(outItems = null) {
   if (!multiplayerPlayers.size) return;
   const drawItems = [];
   const queueMap = getSlotQueueMap();
@@ -4147,11 +4312,16 @@ function drawMultiplayerPlayersDepthSorted() {
     const mp = getMultiplayerDrawInfo(p, queueIdx);
     if (mp) drawItems.push(mp);
   });
+  if (outItems) {
+    for (const mp of drawItems) outItems.push({ type: 'mp', depth: mp.depth, mp });
+    return;
+  }
   drawItems.sort((a, b) => b.depth - a.depth);
   for (const mp of drawItems) drawMultiplayerPlayer(mp);
 }
 
 const BOARD_SPRITE_WORLD_SIZE = 0.95;
+const BOARD_WALL_INSET = 0.035; // slight inward offset so boarded windows sit in front of wall
 const BOARD_WINDOW_FRACTIONS = [0.2, 0.35, 0.58];  // from top: top board, middle above rifle, bottom inside window
 
 function getWindowScreenBounds(slot) {
@@ -4201,6 +4371,17 @@ function getSlotScreenBounds(slot) {
 
 /** If the reticule is over a runnable slot and the line from player to it is inside the bunker, return that slot (closest by depth). */
 function getRunTargetAt(px, py) {
+  if (worldRenderer?.isReady()) {
+    const hit = worldRenderer.pickFirst(px, py, ['window', 'crate']);
+    const idx = Number(hit?.userData?.slotIndex);
+    if (!Number.isFinite(idx) || idx < 0 || idx >= bunkerSlots.length) return null;
+    const slot = bunkerSlots[idx];
+    const current = getCurrentBunkerSlot();
+    if (!slot || slot === current) return null;
+    if (isMovementPathBlocked(cameraX, cameraZ, slot.x, slot.z, CAMERA_Y)) return null;
+    const bounds = getSlotScreenBounds(slot);
+    return { slot, index: idx, depth: bounds?.depth ?? 0, bounds: bounds ?? { centerSx: W / 2, syTop: H / 2 } };
+  }
   if (!bunkerSlots.length || movementStartTime != null) return null;
   const current = getCurrentBunkerSlot();
   const candidates = [];
@@ -4238,8 +4419,9 @@ function getBoardQuadOnWall(slot, boardIndex, windowPoses, iw, ih) {
   if (!slot || !bunker || boardIndex >= (windowPoses?.length ?? 0)) return null;
   const frac = BOARD_WINDOW_FRACTIONS[boardIndex];
   const boardY = BUNKER_WALL_HEIGHT * (1 - frac);
-  const cx = slot.wallX ?? slot.x;
-  const cz = slot.wallZ ?? slot.z;
+  const n = slot.normal ?? { x: 0, z: 1 };
+  const cx = (slot.wallX ?? slot.x) + n.x * BOARD_WALL_INSET;
+  const cz = (slot.wallZ ?? slot.z) + n.z * BOARD_WALL_INSET;
   const { right, up } = getWallRightUp(slot);
   const halfH = BOARD_SPRITE_WORLD_SIZE / 2;
   const halfW = (BOARD_SPRITE_WORLD_SIZE * (iw / Math.max(ih, 1))) / 2;
@@ -4337,7 +4519,7 @@ function drawBoardQuadPerspective(img, iw, ih, corners, flip) {
   ctx.restore();
 }
 
-function drawBoards() {
+function drawBoards(outItems = null) {
   if (!bunker || !assets.board?.naturalWidth) return;
   const img = assets.board;
   const iw = img.naturalWidth;
@@ -4426,6 +4608,10 @@ function drawBoards() {
     if (it) items.push(it);
   }
 
+  if (outItems) {
+    for (const it of items) outItems.push({ type: 'board', depth: it.depth, board: it, img, iw, ih });
+    return;
+  }
   items.sort((a, b) => b.depth - a.depth);
   for (const it of items) {
     if (it.type === 'quad') {
@@ -4441,7 +4627,7 @@ function drawBoards() {
   }
 }
 
-function drawBunkerInterior() {
+function drawBunkerInterior(outItems = null) {
   if (!bunker) return;
   updateTallyWallTextures();
 
@@ -4597,10 +4783,47 @@ function drawBunkerInterior() {
     if (crateFacePolys[1]) polys.push(crateFacePolys[1]);
   }
 
+  if (outItems) {
+    for (const poly of backgroundPolys) outItems.push({ type: 'poly', depth: poly.avgDepth, poly });
+    for (const poly of polys) outItems.push({ type: 'poly', depth: poly.avgDepth, poly });
+    return;
+  }
   backgroundPolys.sort((a, b) => b.avgDepth - a.avgDepth);
   for (const poly of backgroundPolys) drawProjectedPolygon(poly);
   polys.sort((a, b) => b.avgDepth - a.avgDepth);
   for (const poly of polys) drawProjectedPolygon(poly);
+}
+
+function drawInterleavedWorld() {
+  const drawItems = [];
+  drawCharactersDepthSorted(drawItems);
+  drawMultiplayerPlayersDepthSorted(drawItems);
+  drawBoards(drawItems);
+  drawBunkerInterior(drawItems);
+  drawItems.sort((a, b) => b.depth - a.depth);
+  for (const item of drawItems) {
+    if (item.type === 'poly') {
+      drawProjectedPolygon(item.poly);
+    } else if (item.type === 'tree') {
+      drawTreeInfo(item.t);
+    } else if (item.type === 'zombie') {
+      drawZombieInfo(item.z, item.info);
+    } else if (item.type === 'mp') {
+      drawMultiplayerPlayer(item.mp);
+    } else if (item.type === 'board') {
+      const it = item.board;
+      if (it.type === 'quad') {
+        drawBoardQuadPerspective(item.img, item.iw, item.ih, it.corners, it.flip);
+      } else {
+        ctx.save();
+        ctx.translate(it.sx, it.sy);
+        ctx.rotate(it.rot);
+        if (it.flip) ctx.scale(-1, 1);
+        ctx.drawImage(item.img, 0, 0, item.iw, item.ih, -it.w / 2, -it.h / 2, it.w, it.h);
+        ctx.restore();
+      }
+    }
+  }
 }
 
 function drawRifle(dt) {
@@ -5101,18 +5324,31 @@ function drawVictory() {
 
 function draw() {
   if (appMode === 'menu') {
+    if (worldCanvas) worldCanvas.style.display = 'none';
+    ctx.clearRect(0, 0, W, H);
     drawMenu();
     return;
   }
-  drawSky();
-  drawHorizonForest();
-  drawGround();
-  drawFogWisps();
-  drawCharactersDepthSorted();
+  if (worldCanvas) worldCanvas.style.display = 'block';
+  ctx.clearRect(0, 0, W, H);
+  if (worldRenderer?.isReady()) {
+    worldRenderer.setAssets(assets);
+    worldRenderer.setState(getWorldRendererState());
+    if (worldStaticDirty) {
+      worldRenderer.rebuildStaticWorld();
+      worldStaticDirty = false;
+    }
+    worldRenderer.render();
+  } else {
+    ctx.fillStyle = '#111';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.floor(FONT_SIZE * 0.65)}px ${FONT_FAMILY}`;
+    ctx.textAlign = 'center';
+    ctx.fillText('WebGL renderer unavailable', W / 2, H / 2);
+    ctx.textAlign = 'left';
+  }
   drawParticles();
-  drawBunkerInterior();
-  drawMultiplayerPlayersDepthSorted();
-  drawBoards();
   if (!gameOver && !boardPlaceState) drawRifle(1 / 60);
   drawReticule();
   drawRunTargetArrow();
@@ -5441,8 +5677,16 @@ function loop(now = 0) {
 }
 
 (function main() {
+  initWorldRendererIfAvailable();
   generateBunkerLayout();
   requestAnimationFrame(loop);
-  loadAssets().catch((err) => console.error('Asset load failed:', err));
+  loadAssets()
+    .then(() => {
+      if (worldRenderer?.isReady()) {
+        worldRenderer.setAssets(assets);
+        worldStaticDirty = true;
+      }
+    })
+    .catch((err) => console.error('Asset load failed:', err));
 })();
 

@@ -24,6 +24,9 @@ const BOT_ADD_MAX_MS = 11000;
 const BOT_THINK_INTERVAL_MS = 220;
 const BOT_ACTION_DELAY_MIN_MS = 320;
 const BOT_ACTION_DELAY_MAX_MS = 1200;
+const BOT_POST_MOVE_HOLD_MS = 1000; // pause after arriving before moving again
+const BOT_MOVE_COOLDOWN_MIN_MS = 950;
+const BOT_MOVE_COOLDOWN_MAX_MS = 1450;
 const BOT_RELOAD_MS = 2100;
 const BOT_BOARD_MS = 2400;
 const BOT_EJECT_MS = 320;
@@ -153,7 +156,31 @@ function makeBotRuntimePlayer(slotIndex = 0) {
     boardUntil: 0,
     boardTargetSlot: -1,
     ejectUntil: 0,
+    moveCooldownUntil: 0,
+    holdSlotUntil: 0,
   };
+}
+
+function slotOccupancyCounts(session) {
+  const rt = ensureRuntime(session);
+  const counts = new Map();
+  for (const p of session.players.values()) {
+    const st = ensurePlayerRuntimeState(session, p);
+    const idx = Number.isFinite(st.slotIndex) ? st.slotIndex : 0;
+    counts.set(idx, (counts.get(idx) || 0) + 1);
+  }
+  return counts;
+}
+
+function chooseUnoccupiedBiasedSlot(candidates, occupancy, rng = Math.random) {
+  if (!candidates || candidates.length === 0) return BOT_WINDOW_SLOTS[0] || 0;
+  const weights = candidates.map((slot) => {
+    const occ = occupancy.get(slot) || 0;
+    // Slight but meaningful bias away from crowded windows.
+    return 1 / (1 + occ * 0.9);
+  });
+  const idx = chooseWeighted(weights, rng);
+  return candidates[Math.max(0, Math.min(candidates.length - 1, idx))];
 }
 
 function sessionSnapshot(session, req) {
@@ -394,6 +421,28 @@ function tickBotGameplay(session, nowMs) {
     }
   }
 
+  const occupancy = slotOccupancyCounts(session);
+  const canMove = (state) => nowMs >= (state.moveCooldownUntil || 0) && nowMs >= (state.holdSlotUntil || 0);
+  const applyMove = (bot, state, toSlot) => {
+    const next = Math.max(0, Math.min(BOT_SLOT_COUNT - 1, Math.floor(toSlot)));
+    if (next === state.slotIndex) return false;
+    const prev = state.slotIndex;
+    state.slotIndex = next;
+    // De-crowd accounting for subsequent bots in this tick.
+    occupancy.set(prev, Math.max(0, (occupancy.get(prev) || 1) - 1));
+    occupancy.set(next, (occupancy.get(next) || 0) + 1);
+    emitBotAction(session, bot, {
+      type: 'player_move',
+      fromSlotIndex: prev,
+      toSlotIndex: state.slotIndex,
+      at: nowMs,
+    });
+    state.moveCooldownUntil = nowMs + randInt(BOT_MOVE_COOLDOWN_MIN_MS, BOT_MOVE_COOLDOWN_MAX_MS);
+    state.holdSlotUntil = nowMs + BOT_POST_MOVE_HOLD_MS + randInt(0, 350);
+    state.actionUntil = nowMs + randInt(700, 1500);
+    return true;
+  };
+
   for (const bot of session.players.values()) {
     if (!bot?.isBot) continue;
     const state = ensurePlayerRuntimeState(session, bot);
@@ -430,6 +479,23 @@ function tickBotGameplay(session, nowMs) {
     if (state.ejectUntil && nowMs < state.ejectUntil) continue;
 
     const visibleZombies = rt.zombies.filter((z) => z.alive && !z.dead && slotDistance(state.slotIndex, z.targetSlot) <= 1);
+    const currentBoards = rt.boards.get(state.slotIndex) || 0;
+
+    // 1) If bot can't currently see zombies, prioritize boarding nearby/current window.
+    if (visibleZombies.length === 0 && state.slotIndex !== BOT_CRATE_SLOT && currentBoards < 3 && !state.boardUntil) {
+      emitBotAction(session, bot, {
+        type: 'player_board_start',
+        slotIndex: state.slotIndex,
+        slotKey: `bot-slot-${state.slotIndex}`,
+        boardsOnFloor: Math.max(0, 3 - currentBoards),
+        at: nowMs,
+      });
+      state.boardTargetSlot = state.slotIndex;
+      state.boardUntil = nowMs + BOT_BOARD_MS;
+      state.actionUntil = state.boardUntil;
+      continue;
+    }
+
     if (visibleZombies.length > 0 && state.shotsInClip > 0 && !state.reloadUntil) {
       const target = visibleZombies[Math.floor(Math.random() * visibleZombies.length)];
       const roll = Math.random();
@@ -481,15 +547,13 @@ function tickBotGameplay(session, nowMs) {
     const threatened = rt.zombies.find((z) => z.alive && !z.dead && slotDistance(state.slotIndex, z.targetSlot) <= 2 && (rt.boards.get(z.targetSlot) || 0) < 3);
     if (threatened && !state.boardUntil) {
       if (state.slotIndex !== threatened.targetSlot) {
-        const prev = state.slotIndex;
-        state.slotIndex = threatened.targetSlot;
-        emitBotAction(session, bot, {
-          type: 'player_move',
-          fromSlotIndex: prev,
-          toSlotIndex: state.slotIndex,
-          at: nowMs,
-        });
-        state.actionUntil = nowMs + randInt(700, 1500);
+        if (!canMove(state)) {
+          state.actionUntil = nowMs + randInt(220, 420);
+          continue;
+        }
+        const nearby = BOT_WINDOW_SLOTS.filter((s) => slotDistance(s, threatened.targetSlot) <= 1);
+        const targetSlot = chooseUnoccupiedBiasedSlot(nearby.length ? nearby : [threatened.targetSlot], occupancy);
+        applyMove(bot, state, targetSlot);
         continue;
       }
       emitBotAction(session, bot, {
@@ -507,15 +571,11 @@ function tickBotGameplay(session, nowMs) {
 
     if (state.shotsInClip <= 0 && state.clipsCarried <= 0) {
       if (state.slotIndex !== BOT_CRATE_SLOT) {
-        const prev = state.slotIndex;
-        state.slotIndex = BOT_CRATE_SLOT;
-        emitBotAction(session, bot, {
-          type: 'player_move',
-          fromSlotIndex: prev,
-          toSlotIndex: state.slotIndex,
-          at: nowMs,
-        });
-        state.actionUntil = nowMs + randInt(650, 1300);
+        if (!canMove(state)) {
+          state.actionUntil = nowMs + randInt(220, 420);
+          continue;
+        }
+        applyMove(bot, state, BOT_CRATE_SLOT);
       } else {
         state.clipsCarried = BOT_MAX_CLIPS;
         emitBotAction(session, bot, {
@@ -548,17 +608,14 @@ function tickBotGameplay(session, nowMs) {
     }
 
     // Idle movement to keep bots looking alive.
-    const prev = state.slotIndex;
-    state.slotIndex = BOT_WINDOW_SLOTS[Math.floor(Math.random() * BOT_WINDOW_SLOTS.length)];
-    if (state.slotIndex !== prev) {
-      emitBotAction(session, bot, {
-        type: 'player_move',
-        fromSlotIndex: prev,
-        toSlotIndex: state.slotIndex,
-        at: nowMs,
-      });
+    if (!canMove(state)) {
+      state.actionUntil = nowMs + randInt(260, 520);
+      continue;
     }
-    state.actionUntil = nowMs + randInt(700, 1900);
+    const targetSlot = chooseUnoccupiedBiasedSlot(BOT_WINDOW_SLOTS, occupancy);
+    if (!applyMove(bot, state, targetSlot)) {
+      state.actionUntil = nowMs + randInt(900, 1700);
+    }
   }
 }
 
