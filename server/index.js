@@ -28,9 +28,9 @@ const BOT_ADD_MAX_MS = 11000;
 const BOT_THINK_INTERVAL_MS = 220;
 const BOT_ACTION_DELAY_MIN_MS = 320;
 const BOT_ACTION_DELAY_MAX_MS = 1200;
-const BOT_POST_MOVE_HOLD_MS = 1000; // pause after arriving before moving again
-const BOT_MOVE_COOLDOWN_MIN_MS = 950;
-const BOT_MOVE_COOLDOWN_MAX_MS = 1450;
+const BOT_POST_MOVE_HOLD_MS = 2400; // longer pause after arriving before moving again
+const BOT_MOVE_COOLDOWN_MIN_MS = 1800;
+const BOT_MOVE_COOLDOWN_MAX_MS = 2800;
 const BOT_RELOAD_MS = 2100;
 const BOT_BOARD_MS = 2400;
 const BOT_EJECT_MS = 320;
@@ -39,6 +39,7 @@ const BOT_CLIP_SIZE = 5;
 const BOT_SLOT_COUNT = 13; // 12 windows + 1 crate slot
 const BOT_CRATE_SLOT = 12;
 const BOT_WINDOW_SLOTS = Array.from({ length: 12 }, (_, i) => i);
+const SERVER_ZOMBIE_COUNT_MULTIPLIER = 10;
 
 function overloadError() {
   return 'Server is overloaded right now. Please wait a minute and try again.';
@@ -260,7 +261,7 @@ function ensureRuntime(session) {
   let t = 0.8;
   let zombieId = 1;
   for (let wave = 0; wave < waveCount; wave++) {
-    const count = 4 + (wave % 4) + randInt(0, 2);
+    const count = (4 + (wave % 4) + randInt(0, 2)) * SERVER_ZOMBIE_COUNT_MULTIPLIER;
     for (let i = 0; i < count; i++) {
       const targetSlot = BOT_WINDOW_SLOTS[Math.floor(rng() * BOT_WINDOW_SLOTS.length)];
       const spawnAt = t + i * (0.9 + rng() * 0.8);
@@ -1118,7 +1119,15 @@ setInterval(() => {
       closeAndRemoveSession(sessionId, 'Game ended');
       continue;
     }
-    if (idleForMs > SESSION_IDLE_TIMEOUT_MS) {
+    const connected = connectedPlayersForSession(sessionId);
+    const hasConnectedHuman = connected.some((pid) => {
+      const p = session.players.get(pid);
+      return !!p && !p.isBot;
+    });
+    const timeoutMs = (session.status === 'in_progress' && hasConnectedHuman)
+      ? SESSION_IDLE_TIMEOUT_MS * 6
+      : SESSION_IDLE_TIMEOUT_MS;
+    if (idleForMs > timeoutMs) {
       closeAndRemoveSession(sessionId, 'Session timeout');
       continue;
     }

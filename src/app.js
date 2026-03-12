@@ -204,7 +204,7 @@ const ZOMBIE_DIR_CHANGE_DIST = 2.5;   // world units walked before maybe changin
 const ZOMBIE_DIR_CHANGE_CHANCE = 0.35; // probability to flip direction when threshold reached
 const GAME_OVER_FLASH_DURATION = 0.6;
 const GAME_OVER_FACE_DURATION = 2;  // seconds of zombie face + red tint before showing "game over" text
-const GAME_OVER_MENU_DELAY = 5;     // seconds before input can return to menu
+const ENDGAME_RESULTS_DELAY = 3; // seconds before stats/button appear
 const ZOMBIE_SOUND_INTERVAL = 4;      // seconds between groans; deterministic from spawnIndex/spawnTime
 const GAME_PARAM_SEED = 13371337;
 const GAME_PARAM_WAVE_COUNT = 9;
@@ -215,6 +215,7 @@ const WAVE_GAP_BASE_SECONDS = 5.6;
 const WAVE_GAP_WAVE_STEP_SECONDS = 0.7;
 const WAVE_HOT_WINDOW_WEIGHT = 0.72;
 const WAVE_HOT_SEGMENT_WEIGHT = 0.16;
+const ZOMBIE_COUNT_MULTIPLIER = 10;
 const ZOMBIE_MIN_PATH_LENGTH = 46;
 const TREE_BLOCK_RADIUS = 0.9;
 
@@ -246,6 +247,11 @@ let gameParamsHash = '';
 let tallyWallTileRef = null; // { segmentIndex, tileIndex }
 let tallyWallLastKilled = -1;
 let tallyWallLastRemaining = -1;
+const BOARD_BREAK_ALERT_DURATION = 10; // seconds
+let boardBreakAlerts = []; // [{ slotKey, expiresAt }]
+let playerMatchStats = new Map(); // playerId -> { playerId,name,isBot,kills,boards,headshots,shotsFired,shotsHit }
+let leaderboardScrollRow = 0;
+let endgameReturnButton = null; // { x,y,w,h }
 let appMode = 'menu'; // 'menu' | 'game'
 
 const MENU_BUTTON_W = 290;
@@ -493,6 +499,9 @@ function startLocalGame(opts = {}) {
   movementPathLengths = [];
   movementPathTotalLength = 0;
   pendingLossProposalId = '';
+  boardBreakAlerts = [];
+  resetMatchStats();
+  syncMatchStatsRosterFromLobby();
   if (assets.runningSound) { assets.runningSound.pause(); assets.runningSound.currentTime = 0; }
 
   const planned = generateGameParameters(seed, waveCount, playerCount);
@@ -516,6 +525,7 @@ function startLocalGame(opts = {}) {
   setActiveBunkerSlot(activeSlotIndex, true);
   const localId = multiplayerSession?.playerId || '__local__';
   const me = ensureMpPlayer(localId, 'You');
+  ensurePlayerMatchStats(localId, me.name || 'You', false);
   me.isLocal = true;
   me.slotIndex = activeSlotIndex;
   me.moveFromIndex = activeSlotIndex;
@@ -610,8 +620,10 @@ function setLobbyPlayers(players = []) {
     playerId: p.playerId,
     name: p.name || 'Player',
     isHost: !!p.isHost,
+    isBot: !!p.isBot,
     slotIndex: Number.isFinite(p.slotIndex) ? Math.floor(p.slotIndex) : 0,
   }));
+  syncMatchStatsRosterFromLobby();
 }
 
 function upsertLobbyPlayer(player) {
@@ -621,10 +633,12 @@ function upsertLobbyPlayer(player) {
     playerId: player.playerId,
     name: player.name || 'Player',
     isHost: !!player.isHost,
+    isBot: !!player.isBot,
     slotIndex: Number.isFinite(player.slotIndex) ? Math.floor(player.slotIndex) : 0,
   };
   if (idx >= 0) multiplayerLobbyPlayers[idx] = value;
   else multiplayerLobbyPlayers.push(value);
+  ensurePlayerMatchStats(value.playerId, value.name, value.isBot);
 }
 
 function removeLobbyPlayer(playerId) {
@@ -679,8 +693,10 @@ function ensureMpPlayer(playerId, name = '') {
       isLocal: playerId === multiplayerSession?.playerId,
     };
     multiplayerPlayers.set(playerId, p);
+    ensurePlayerMatchStats(playerId, p.name, false);
   } else if (name) {
     p.name = name;
+    ensurePlayerMatchStats(playerId, name, false);
   }
   return p;
 }
@@ -702,6 +718,74 @@ function removeMpPlayer(playerId) {
   multiplayerPlayers.delete(playerId);
 }
 
+function ensurePlayerMatchStats(playerId, name = '', isBot = false) {
+  if (!playerId) return null;
+  let s = playerMatchStats.get(playerId);
+  if (!s) {
+    s = {
+      playerId,
+      name: name || 'Player',
+      isBot: !!isBot,
+      kills: 0,
+      boards: 0,
+      headshots: 0,
+      shotsFired: 0,
+      shotsHit: 0,
+    };
+    playerMatchStats.set(playerId, s);
+  } else {
+    if (name) s.name = name;
+    s.isBot = !!isBot;
+  }
+  return s;
+}
+
+function resetMatchStats() {
+  playerMatchStats = new Map();
+  leaderboardScrollRow = 0;
+}
+
+function syncMatchStatsRosterFromLobby() {
+  for (const p of multiplayerLobbyPlayers) {
+    ensurePlayerMatchStats(p.playerId, p.name || 'Player', !!p.isBot);
+  }
+  const localId = multiplayerSession?.playerId || '__local__';
+  ensurePlayerMatchStats(localId, localId === '__local__' ? 'You' : getPlayerNameForMatchmaking(), false);
+}
+
+function recordShotStat(playerId, hit = null) {
+  const p = ensurePlayerMatchStats(playerId);
+  if (!p) return;
+  p.shotsFired += 1;
+  if (hit?.type === 'zombie') {
+    p.shotsHit += 1;
+    if (hit.headshot) p.headshots += 1;
+    if (hit.killed) p.kills += 1;
+  }
+}
+
+function recordBoardCompleteStat(playerId) {
+  const p = ensurePlayerMatchStats(playerId);
+  if (!p) return;
+  p.boards += 1;
+}
+
+function getSortedMatchStats() {
+  return Array.from(playerMatchStats.values()).sort((a, b) => {
+    if (b.kills !== a.kills) return b.kills - a.kills;
+    if (b.headshots !== a.headshots) return b.headshots - a.headshots;
+    const aAcc = a.shotsFired > 0 ? a.shotsHit / a.shotsFired : 0;
+    const bAcc = b.shotsFired > 0 ? b.shotsHit / b.shotsFired : 0;
+    if (bAcc !== aAcc) return bAcc - aAcc;
+    return String(a.name || '').localeCompare(String(b.name || ''));
+  });
+}
+
+function clampLeaderboardScroll(totalRows, visibleRows) {
+  const maxStart = Math.max(0, totalRows - visibleRows);
+  leaderboardScrollRow = Math.max(0, Math.min(maxStart, leaderboardScrollRow));
+}
+
 function getMpPlayerWorldPos(p, nowMs = Date.now()) {
   const toSlot = getSlotByIndex(p.moveToIndex ?? p.slotIndex);
   const fromSlot = getSlotByIndex(p.moveFromIndex ?? p.slotIndex) || toSlot;
@@ -716,6 +800,36 @@ function getMpPlayerWorldPos(p, nowMs = Date.now()) {
   const z = fromSlot.z + (toSlot.z - fromSlot.z) * s;
   const bob = p.moving ? Math.sin((nowMs / 1000) * MP_BOB_SPEED + p.bobPhase) * 0.03 : 0;
   return { x, y: bob, z, moving: p.moving, slot: toSlot };
+}
+
+function getOutwardShotDirForSlot(slotIndex) {
+  const slot = Number.isFinite(slotIndex) ? getSlotByIndex(slotIndex) : null;
+  if (!slot?.normal) return null;
+  const ox = -(slot.normal.x ?? 0);
+  const oz = -(slot.normal.z ?? 0);
+  const len = Math.hypot(ox, oz) || 0;
+  if (len <= 1e-6) return null;
+  return { x: ox / len, y: 0, z: oz / len };
+}
+
+function resolveRemoteShotDir(payloadDir, slotIndex) {
+  const hasPayloadDir = payloadDir
+    && Number.isFinite(payloadDir.x)
+    && Number.isFinite(payloadDir.y)
+    && Number.isFinite(payloadDir.z);
+  const outward = getOutwardShotDirForSlot(slotIndex);
+  if (!hasPayloadDir && outward) return outward;
+  if (!hasPayloadDir) return null;
+  const len = Math.hypot(payloadDir.x, payloadDir.y, payloadDir.z) || 1;
+  let dir = { x: payloadDir.x / len, y: payloadDir.y / len, z: payloadDir.z / len };
+  if (outward) {
+    const dotOut = dir.x * outward.x + dir.z * outward.z;
+    if (dotOut < 0.05) {
+      // Invert obviously inward vectors (seen in some bot payloads).
+      dir = { x: -dir.x, y: -dir.y, z: -dir.z };
+    }
+  }
+  return dir;
 }
 
 function getSlotQueueMap() {
@@ -746,20 +860,29 @@ function playPositionalClip(audioTemplate, worldX, worldZ, gainMul = 1, decayMs 
   const { gain, pan } = getPositionalGainPan(worldX, worldZ, refDist);
   const audio = audioTemplate.cloneNode(true);
   audio.preload = 'auto';
-  const source = ctx.createMediaElementSource(audio);
-  const gainNode = ctx.createGain();
-  const panner = ctx.createStereoPanner();
   const startGain = Math.max(0.001, gain * gainMul);
-  gainNode.gain.value = startGain;
-  panner.pan.value = pan;
-  source.connect(gainNode);
-  gainNode.connect(panner);
-  panner.connect(ctx.destination);
-  if (decayMs > 0) {
-    gainNode.gain.setValueAtTime(startGain, ctx.currentTime);
-    gainNode.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + decayMs / 1000);
+  try {
+    const source = ctx.createMediaElementSource(audio);
+    const gainNode = ctx.createGain();
+    const panner = ctx.createStereoPanner();
+    gainNode.gain.value = startGain;
+    panner.pan.value = pan;
+    source.connect(gainNode);
+    gainNode.connect(panner);
+    panner.connect(ctx.destination);
+    if (decayMs > 0) {
+      gainNode.gain.setValueAtTime(startGain, ctx.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + decayMs / 1000);
+    }
+  } catch {
+    // Fallback path: still play if WebAudio node creation fails on this element.
+    audio.volume = Math.min(1, startGain);
   }
-  audio.play().catch(() => {});
+  if (ctx.state === 'suspended') {
+    ctx.resume().finally(() => { audio.play().catch(() => {}); });
+  } else {
+    audio.play().catch(() => {});
+  }
 }
 
 function isLossConditionMet() {
@@ -937,17 +1060,19 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
         } else if (payload.type === 'player_shot') {
           if (Number.isFinite(payload.slotIndex)) setMpPlayerSlot(from, Number(payload.slotIndex), nowMs);
           const pos = getMpPlayerWorldPos(remote, nowMs);
-          if (payload?.dir && Number.isFinite(payload.dir.x) && Number.isFinite(payload.dir.y) && Number.isFinite(payload.dir.z)) {
+          recordShotStat(from, payload.hit || null);
+          const resolvedDir = resolveRemoteShotDir(payload?.dir, Number(payload.slotIndex));
+          if (resolvedDir) {
             addTracer(
               { x: pos.x, y: (pos.y ?? BUNKER_FLOOR_Y) + MP_SPRITE_HEIGHT * 0.62, z: pos.z },
-              { x: payload.dir.x, y: payload.dir.y, z: payload.dir.z },
+              resolvedDir,
             );
           }
           const shotList = assets.shotSounds || [];
           if (shotList.length > 0) {
             const sfx = shotList[Math.floor(Math.random() * shotList.length)];
             // Gunshots carry further than other SFX; keep them loud at distance.
-            playPositionalClip(sfx, pos.x, pos.z, 1.0, 420, POSITIONAL_REF_DIST * 3.2);
+            playPositionalClip(sfx, pos.x, pos.z, 1.15, 650, POSITIONAL_REF_DIST * 4.5);
           }
           if (assets.ejectCasing) playPositionalClip(assets.ejectCasing, pos.x, pos.z, 0.7, 220, POSITIONAL_REF_DIST * 1.4);
           applyRemoteZombieHit(payload, remote);
@@ -957,6 +1082,7 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
           if (assets.hammerSound) playPositionalClip(assets.hammerSound, pos.x, pos.z, 0.75, 900);
         } else if (payload.type === 'player_board_complete') {
           const pos = getMpPlayerWorldPos(remote, nowMs);
+          recordBoardCompleteStat(from);
           if (assets.hammerSound) playPositionalClip(assets.hammerSound, pos.x, pos.z, 0.7, 500);
         } else if (payload.type === 'player_ammo_pickup') {
           const pos = getMpPlayerWorldPos(remote, nowMs);
@@ -2415,7 +2541,7 @@ function generateGameParameters(seed = GAME_PARAM_SEED, waveCount = GAME_PARAM_W
   for (let wave = 0; wave < waveCount; wave++) {
     const w1 = wave + 1;
     const baseWaveSize = WAVE_TRIANGLE_CONSTANT + triangular(w1 + WAVE_TRIANGLE_OFFSET);
-    const waveSize = baseWaveSize * effectivePlayers;
+    const waveSize = baseWaveSize * effectivePlayers * ZOMBIE_COUNT_MULTIPLIER;
     const hotWindowSlot = windowSlots.length ? windowSlots[Math.floor(rng() * windowSlots.length)] : null;
     const hotSegmentSlots = hotWindowSlot
       ? windowSlots.filter((s) => s.segmentIndex === hotWindowSlot.segmentIndex)
@@ -3295,6 +3421,7 @@ function updateZombies(dt) {
         } else if (gameTime >= z.attackBoardEndTime) {
           const newCount = Math.max(0, boardsAtWindow - 1);
           windowBoards[slotKey] = newCount;
+          markBoardBreakAlert(slotKey);
           playBoardBreakSound();
           z.attackBoardEndTime = null;
           const slot = z.targetSlot;
@@ -3633,7 +3760,7 @@ function isHeadShotFromMask(z, info, hitTx, hitTy) {
 function damageZombie(idx, hitPx, hitPy) {
   const z = zombies[idx];
   const info = getZombieDrawInfo(z);
-  if (!info) return;
+  if (!info) return null;
   const spriteW = info.spriteW ?? ZOMBIE_SPRITE_W;
   const spriteH = info.spriteH ?? ZOMBIE_SPRITE_H;
   const hitTx = info.flip
@@ -3642,6 +3769,7 @@ function damageZombie(idx, hitPx, hitPy) {
   const hitTy = ((hitPy - info.sy) / info.sh) * spriteH;
   const headShot = isHeadShotFromMask(z, info, hitTx, hitTy);
   const damage = headShot ? ZOMBIE_DAMAGE_HEAD : ZOMBIE_DAMAGE_BODY;
+  const zombieId = z.spawnIndex;
   z.hp -= damage;
   hitFeedbackTime = HIT_FEEDBACK_DURATION;  // white reticule only when we actually damage an enemy
   const baseRadii = makeJaggedRadii();
@@ -3650,11 +3778,14 @@ function damageZombie(idx, hitPx, hitPy) {
     spawnHoleParticles(z, info, hitPx, hitPy, jaggedRadii);
     spawnDeathParticles(z, info);
     zombies.splice(idx, 1);
-  score += 1;
+    score += 1;
+    updateTallyWallTextures();
+    return { type: 'zombie', zombieId, headshot: headShot, killed: true };
   } else {
     if (!z.holes) z.holes = [];
     z.holes.push({ tx: hitTx, ty: hitTy, jaggedRadii });
     spawnHoleParticles(z, info, hitPx, hitPy, jaggedRadii);
+    return { type: 'zombie', zombieId, headshot: headShot, killed: false };
   }
 }
 
@@ -3694,6 +3825,7 @@ function applyRemoteZombieHit(payload, remotePlayer) {
   if (info) spawnDeathParticles(z, info);
   zombies.splice(zombieIdx, 1);
   score += 1;
+  updateTallyWallTextures();
 }
 
 // Zombie sprite: flip from walk direction. Uses per-zombie sprite dimensions for aspect.
@@ -5241,16 +5373,188 @@ function drawRunTargetArrow() {
   ctx.restore();
 }
 
+function markBoardBreakAlert(slotKey) {
+  if (!slotKey) return;
+  const expiresAt = gameTime + BOARD_BREAK_ALERT_DURATION;
+  const existing = boardBreakAlerts.find((a) => a.slotKey === slotKey);
+  if (existing) existing.expiresAt = expiresAt;
+  else boardBreakAlerts.push({ slotKey, expiresAt });
+}
+
+function drawBrokenBoardAlerts() {
+  if (!boardBreakAlerts.length) return;
+  for (const alert of boardBreakAlerts) {
+    const slot = bunkerSlots.find((s) => getSlotKey(s) === alert.slotKey);
+    if (!slot) continue;
+    const b = getSlotScreenBounds(slot);
+    if (!b) continue;
+    const life = Math.max(0, alert.expiresAt - gameTime);
+    if (life <= 0) continue;
+    const alpha = 0.3 + 0.7 * Math.min(1, life / BOARD_BREAK_ALERT_DURATION);
+    const cx = Math.round(b.centerSx);
+    const arrowY = b.syTop - 26;
+    const size = 12;
+    ctx.save();
+    ctx.strokeStyle = `rgba(255, 70, 70, ${alpha})`;
+    ctx.fillStyle = `rgba(255, 70, 70, ${alpha})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, arrowY + size);
+    ctx.lineTo(cx - size * 0.85, arrowY - size * 0.4);
+    ctx.lineTo(cx - size * 0.25, arrowY - size * 0.4);
+    ctx.lineTo(cx - size * 0.25, arrowY - size);
+    ctx.lineTo(cx + size * 0.25, arrowY - size);
+    ctx.lineTo(cx + size * 0.25, arrowY - size * 0.4);
+    ctx.lineTo(cx + size * 0.85, arrowY - size * 0.4);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawEndgameLeaderboard() {
+  const ranked = getSortedMatchStats();
+  if (!ranked.length) return;
+  const accOf = (r) => (r.shotsFired > 0 ? (r.shotsHit / r.shotsFired) : 0);
+  const topKills = ranked.reduce((m, r) => Math.max(m, r.kills || 0), 0);
+  const topBoards = ranked.reduce((m, r) => Math.max(m, r.boards || 0), 0);
+  const topHeadshots = ranked.reduce((m, r) => Math.max(m, r.headshots || 0), 0);
+  const topAcc = ranked.reduce((m, r) => Math.max(m, accOf(r)), 0);
+  const HI = '#ffd36b';
+  const panelW = Math.min(560, Math.floor(W * 0.74));
+  const panelH = Math.min(246, Math.floor(H * 0.64));
+  const x = W - panelW - 10;
+  const y = 18;
+  ctx.save();
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.62)';
+  ctx.fillRect(x, y, panelW, panelH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+  ctx.strokeRect(x + 0.5, y + 0.5, panelW - 1, panelH - 1);
+  ctx.fillStyle = '#fff';
+  ctx.font = `${Math.floor(FONT_SIZE * 0.62)}px ${FONT_FAMILY}`;
+  ctx.textAlign = 'left';
+  ctx.fillText('Match results', x + 10, y + 18);
+  ctx.font = `${Math.floor(FONT_SIZE * 0.44)}px ${FONT_FAMILY}`;
+  const headerY = y + 34;
+  const rankX = x + 10;
+  const playerX = x + 34;
+  const killsX = x + panelW - 190;
+  const boardsX = x + panelW - 146;
+  const headshotsX = x + panelW - 98;
+  const accX = x + panelW - 46;
+  ctx.fillText('#', rankX, headerY);
+  ctx.fillText('Player', playerX, headerY);
+  ctx.fillText('Kills', killsX, headerY);
+  ctx.fillText('Boards', boardsX, headerY);
+  ctx.fillText('Headshots', headshotsX, headerY);
+  ctx.fillText('Accuracy', accX, headerY);
+
+  const rowH = 14;
+  const bodyTop = headerY + 8;
+  const bodyH = panelH - (bodyTop - y) - 8;
+  const visibleRows = Math.max(1, Math.floor(bodyH / rowH));
+  clampLeaderboardScroll(ranked.length, visibleRows);
+  const start = leaderboardScrollRow;
+  const end = Math.min(ranked.length, start + visibleRows);
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x + 6, bodyTop, panelW - 12, bodyH);
+  ctx.clip();
+  for (let i = start; i < end; i++) {
+    const row = ranked[i];
+    const yy = bodyTop + (i - start + 1) * rowH;
+    const name = String(row.name || `Player-${row.playerId.slice(-4)}`).slice(0, 24);
+    const accRaw = accOf(row);
+    const acc = accRaw * 100;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(String(i + 1), rankX, yy);
+    ctx.fillText(name, playerX, yy);
+    ctx.fillStyle = row.kills === topKills ? HI : '#fff';
+    ctx.fillText(String(row.kills), killsX, yy);
+    ctx.fillStyle = row.boards === topBoards ? HI : '#fff';
+    ctx.fillText(String(row.boards), boardsX, yy);
+    ctx.fillStyle = row.headshots === topHeadshots ? HI : '#fff';
+    ctx.fillText(String(row.headshots), headshotsX, yy);
+    ctx.fillStyle = Math.abs(accRaw - topAcc) < 1e-9 ? HI : '#fff';
+    ctx.fillText(`${acc.toFixed(0)}%`, accX, yy);
+  }
+  ctx.restore();
+
+  if (ranked.length > visibleRows) {
+    const trackX = x + panelW - 6;
+    const trackY = bodyTop;
+    const trackH = bodyH;
+    const thumbH = Math.max(16, Math.floor((visibleRows / ranked.length) * trackH));
+    const maxStart = Math.max(1, ranked.length - visibleRows);
+    const thumbY = trackY + Math.floor((leaderboardScrollRow / maxStart) * (trackH - thumbH));
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.fillRect(trackX, trackY, 2, trackH);
+    ctx.fillStyle = 'rgba(255,255,255,0.65)';
+    ctx.fillRect(trackX - 1, thumbY, 4, thumbH);
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.font = `${Math.floor(FONT_SIZE * 0.33)}px ${FONT_FAMILY}`;
+    ctx.fillText('Scroll wheel', x + panelW - 86, y + panelH - 3);
+  }
+  ctx.restore();
+}
+
+function drawEndgameReturnButton() {
+  const w = 220;
+  const h = 28;
+  const x = Math.floor((W - w) / 2);
+  const y = H - h - 14;
+  endgameReturnButton = { x, y, w, h };
+  ctx.save();
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  ctx.font = `${Math.floor(FONT_SIZE * 0.58)}px ${FONT_FAMILY}`;
+  ctx.fillText('Return to Main Menu', x + w / 2, y + 18);
+  ctx.textAlign = 'left';
+  ctx.restore();
+}
+
+function handleEndgameReturnClick(e) {
+  if (appMode !== 'game') return false;
+  if (!gameOver && !gameWon) return false;
+  if (!endgameReturnButton) return false;
+  const p = getCanvasPointerPos(e);
+  const b = endgameReturnButton;
+  if (p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h) {
+    returnToMainMenu();
+    return true;
+  }
+  return false;
+}
+
+function canShowEndgameResults() {
+  if (appMode !== 'game') return false;
+  if (gameOver) return (performance.now() / 1000 - gameOverFlashStart) >= ENDGAME_RESULTS_DELAY;
+  if (gameWon) return (performance.now() / 1000 - gameWonAt) >= ENDGAME_RESULTS_DELAY;
+  return false;
+}
+
 function drawMenuBackground() {
   const img = assets.menuBackground || assets.horizonBackground;
   if (img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0) {
+    ctx.save();
+    // Menu-only smoothing so sub-pixel pan looks fluid.
+    ctx.imageSmoothingEnabled = true;
     const scale = H / img.naturalHeight;
-    const tileW = Math.max(1, Math.round(img.naturalWidth * scale));
-    let x = -((Math.floor(menuPanX) % tileW + tileW) % tileW);
+    const tileW = Math.max(1, img.naturalWidth * scale);
+    const offset = ((menuPanX % tileW) + tileW) % tileW;
+    let x = -offset - tileW; // draw one extra tile to hide edge seams
     while (x < W) {
       ctx.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight, x, 0, tileW, H);
       x += tileW;
     }
+    ctx.restore();
   } else {
     ctx.fillStyle = '#1a1f23';
     ctx.fillRect(0, 0, W, H);
@@ -5358,6 +5662,7 @@ function drawHint() {
 }
 
 function drawGameOver() {
+  endgameReturnButton = null;
   try {
     const elapsed = performance.now() / 1000 - gameOverFlashStart;
     const redAlpha = 0.5 + 0.35 * Math.max(0, 1 - elapsed / GAME_OVER_FLASH_DURATION);
@@ -5385,10 +5690,6 @@ function drawGameOver() {
       ctx.fillText('BUNKER OVERRUN', W / 2, H / 2 - 6);
       ctx.font = `${Math.floor(FONT_SIZE * 0.65)}px ${FONT_FAMILY}`;
       ctx.fillText('A zombie got through a window', W / 2, H / 2 + 18);
-      if (elapsed >= GAME_OVER_MENU_DELAY) {
-        ctx.font = `${Math.floor(FONT_SIZE * 0.55)}px ${FONT_FAMILY}`;
-        ctx.fillText('Press any key or click to return to menu', W / 2, H / 2 + 38);
-      }
       ctx.textAlign = 'left';
     }
   } catch (e) {
@@ -5398,13 +5699,11 @@ function drawGameOver() {
     ctx.fillText('BUNKER OVERRUN', W / 2, H / 2);
     ctx.textAlign = 'left';
   }
-}
-
-function canReturnToMenuFromGameOver() {
-  if (appMode !== 'game') return false;
-  if (!gameOver) return false;
-  const elapsed = performance.now() / 1000 - gameOverFlashStart;
-  return elapsed >= GAME_OVER_MENU_DELAY;
+  const elapsed = Math.max(0, performance.now() / 1000 - gameOverFlashStart);
+  if (elapsed >= ENDGAME_RESULTS_DELAY) {
+    drawEndgameLeaderboard();
+    drawEndgameReturnButton();
+  }
 }
 
 function returnToMainMenu() {
@@ -5502,6 +5801,7 @@ function handleMainMenuConfirmClick(e) {
 }
 
 function drawVictory() {
+  endgameReturnButton = null;
   const elapsed = Math.max(0, performance.now() / 1000 - gameWonAt);
   const pulse = 0.25 + 0.2 * Math.sin(elapsed * 2.8);
   ctx.fillStyle = `rgba(20, 70, 35, ${0.62 + pulse * 0.4})`;
@@ -5513,6 +5813,10 @@ function drawVictory() {
   ctx.font = `${Math.floor(FONT_SIZE * 0.7)}px ${FONT_FAMILY}`;
   ctx.fillText('All zombies defeated', W / 2, H / 2 + 18);
   ctx.textAlign = 'left';
+  if (elapsed >= ENDGAME_RESULTS_DELAY) {
+    drawEndgameLeaderboard();
+    drawEndgameReturnButton();
+  }
 }
 
 function draw() {
@@ -5521,6 +5825,10 @@ function draw() {
     ctx.clearRect(0, 0, W, H);
     drawMenu();
     return;
+  }
+  // Ensure endgame UI is clickable with a normal cursor.
+  if ((gameOver || gameWon) && pointerLocked && document.pointerLockElement === canvas) {
+    document.exitPointerLock();
   }
   if (worldCanvas) worldCanvas.style.display = 'block';
   ctx.clearRect(0, 0, W, H);
@@ -5551,6 +5859,7 @@ function draw() {
   if (!gameOver && !boardPlaceState) drawRifle(1 / 60);
   drawReticule();
   drawRunTargetArrow();
+  drawBrokenBoardAlerts();
   if (gameOver) drawGameOver();
   else if (gameWon) drawVictory();
   else if (!pointerLocked) drawHint();
@@ -5572,6 +5881,7 @@ function tick(dt) {
     const key = boardPlaceState.slotKey;
     windowBoards[key] = Math.min(BOARDS_PER_WINDOW, (windowBoards[key] ?? 0) + 1);
     console.log('[Board nailed up] slotKey=', key, 'slotIndex=', activeSlotIndex, 'boardsOnWindow=', windowBoards[key]);
+    recordBoardCompleteStat(multiplayerSession?.playerId || '__local__');
     sendMultiplayerPayload('player_board_complete', {
       slotIndex: activeSlotIndex,
       slotKey: key,
@@ -5581,6 +5891,7 @@ function tick(dt) {
     boardPlaceState = null;
   }
   fallingBoards = fallingBoards.filter((fb) => gameTime < fb.endTime);
+  boardBreakAlerts = boardBreakAlerts.filter((a) => a.expiresAt > gameTime);
   updateParticles(dt);
   updateTracers(dt);
   if (!gameOver && !gameWon) {
@@ -5665,10 +5976,7 @@ function playBoardBreakSound() {
 }
 
 canvas.addEventListener('click', (e) => {
-  if (canReturnToMenuFromGameOver()) {
-    returnToMainMenu();
-    return;
-  }
+  if (handleEndgameReturnClick(e)) return;
   if (handleMainMenuConfirmClick(e)) return;
   if (appMode === 'menu') {
     handleMenuClick(e);
@@ -5775,11 +6083,15 @@ canvas.addEventListener('click', (e) => {
     playShotSound();
     playEjectCasingSound();
     const hit = canSeeOutside ? getHitTarget(px, py) : null;
+    let hitPayload = null;
     if (hit) {
-      if (hit.type === 'zombie') damageZombie(hit.index, px, py);
+      if (hit.type === 'zombie') hitPayload = damageZombie(hit.index, px, py);
       else damageTree(hit.index, px, py);
     }
-    sendMultiplayerPayload('player_shot', makeShotEvent(hit));
+    const shotHit = hit?.type === 'zombie' ? (hitPayload || { type: 'zombie' }) : hit;
+    const localId = multiplayerSession?.playerId || '__local__';
+    recordShotStat(localId, shotHit);
+    sendMultiplayerPayload('player_shot', makeShotEvent(shotHit));
   } else if (shotsInClip === 1) {
     rifleState = 'reloading';
     rifleFrame = 0;
@@ -5792,11 +6104,15 @@ canvas.addEventListener('click', (e) => {
     playShotSound();
     playEjectCasingSound();
     const hit = canSeeOutside ? getHitTarget(px, py) : null;
+    let hitPayload = null;
     if (hit) {
-      if (hit.type === 'zombie') damageZombie(hit.index, px, py);
+      if (hit.type === 'zombie') hitPayload = damageZombie(hit.index, px, py);
       else damageTree(hit.index, px, py);
     }
-    sendMultiplayerPayload('player_shot', makeShotEvent(hit));
+    const shotHit = hit?.type === 'zombie' ? (hitPayload || { type: 'zombie' }) : hit;
+    const localId = multiplayerSession?.playerId || '__local__';
+    recordShotStat(localId, shotHit);
+    sendMultiplayerPayload('player_shot', makeShotEvent(shotHit));
   }
 });
 
@@ -5830,11 +6146,17 @@ canvas.addEventListener('mousemove', (e) => {
   desiredPitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, desiredPitch));
 });
 
+canvas.addEventListener('wheel', (e) => {
+  if (appMode !== 'game') return;
+  if (!canShowEndgameResults()) return;
+  const totalRows = playerMatchStats.size;
+  if (totalRows <= 0) return;
+  e.preventDefault();
+  leaderboardScrollRow += e.deltaY > 0 ? 1 : -1;
+  clampLeaderboardScroll(totalRows, 1);
+}, { passive: false });
+
 document.addEventListener('keydown', (e) => {
-  if (canReturnToMenuFromGameOver()) {
-    returnToMainMenu();
-    return;
-  }
   if (handleMainMenuConfirmKeydown(e)) return;
   if (appMode === 'menu') {
     handleMenuKeydown(e);
@@ -5844,7 +6166,24 @@ document.addEventListener('keydown', (e) => {
     openMainMenuConfirm();
     return;
   }
-  if (gameOver || gameWon) return;
+  if (gameOver || gameWon) {
+    if (!canShowEndgameResults()) return;
+    if (e.code === 'Enter' || e.code === 'Space') {
+      e.preventDefault();
+      returnToMainMenu();
+      return;
+    }
+    if (e.code === 'ArrowDown' || e.code === 'KeyS') {
+      e.preventDefault();
+      leaderboardScrollRow += 1;
+      clampLeaderboardScroll(playerMatchStats.size, 1);
+    } else if (e.code === 'ArrowUp' || e.code === 'KeyW') {
+      e.preventDefault();
+      leaderboardScrollRow -= 1;
+      clampLeaderboardScroll(playerMatchStats.size, 1);
+    }
+    return;
+  }
   if (boardPlaceState) return;
   if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
     ironSightsHeld = true;
