@@ -51,7 +51,8 @@
 <body>
   <canvas id="world3d"></canvas>
   <canvas id="game"></canvas>
-  <script src="node_modules/three/build/three.min.js"></script>
+  <!-- Three.js UMD; copied from node_modules (postinstall) so Electron loadFile() can resolve it -->
+  <script src="lib/three.min.js"></script>
   <script src="src/render/materials.js"></script>
   <script src="src/render/geometry/bunker.js"></script>
   <script src="src/render/entities/sprites.js"></script>

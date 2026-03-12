@@ -79,6 +79,10 @@ const BUNKER_LAYOUT = {
     { x: 1, z: 4 },
     { x: -6, z: 4 },
   ],
+  /** Interior holes (e.g. courtyard) in unit coords; floor/ceiling will not render here. */
+  interiorHoles: [
+    [{ x: 1, z: -1 }, { x: 4, z: -1 }, { x: 4, z: 4 }, { x: 1, z: 4 }],
+  ],
   segmentTiles: [
     ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
     ['wall', 'window', 'wall'],
@@ -1236,9 +1240,15 @@ function isIronSightsActive() {
 }
 
 function initWorldRendererIfAvailable() {
-  if (worldRenderer || !window.WorldRenderer3D || !worldCanvas) return;
+  if (worldRenderer && worldRenderer.isReady()) return;
+  if (!worldRenderer?.isReady()) worldRenderer = null;
+  if (!window.WorldRenderer3D || !worldCanvas) return;
   try {
     worldRenderer = new window.WorldRenderer3D(worldCanvas, W, H);
+    if (!worldRenderer.isReady()) {
+      worldRenderer = null;
+      return;
+    }
     worldStaticDirty = true;
   } catch (err) {
     console.error('WorldRenderer3D init failed:', err);
@@ -1296,28 +1306,54 @@ function getBoardInstancesForRenderer() {
     const isPlacingHere = placingKey === key;
     let floorCount = onFloor;
     if (isPlacingHere) floorCount = Math.max(0, onFloor - 1);
+    const floorY = BUNKER_FLOOR_Y + halfH;
+    const slotYaw = Math.atan2(slot.tangent?.z ?? 0, slot.tangent?.x ?? 1);
     for (let i = 0; i < floorCount && i < floorPoses.length; i++) {
       const p = floorPoses[i];
-      out.push({ type: 'billboard', x: p.x, y: p.y + halfH, z: p.z, w: halfW * 2, h: halfH * 2, rot: p.rot });
+      out.push({ type: 'floor', x: p.x, y: floorY, z: p.z, w: halfW * 2, h: halfH * 2, rot: p.rot, slotYaw });
     }
+    if (isPlacingHere && boardPlaceState && onFloor > 0 && onWindow < windowPoses.length) {
+      const startTime = boardPlaceState.startTime;
+      const endTime = boardPlaceState.endTime;
+      const t = Math.min(1, Math.max(0, (gameTime - startTime) / (endTime - startTime)));
+      const fromP = floorPoses[onFloor - 1];
+      const toP = windowPoses[onWindow];
+      const fromY = (fromP.y ?? 0) + halfH;
+      const toY = BUNKER_WALL_HEIGHT * (1 - BOARD_WINDOW_FRACTIONS[onWindow]);
+      const slotYaw = Math.atan2(slot.tangent?.z ?? 0, slot.tangent?.x ?? 1) - Math.PI / 2;
+      out.push({
+        type: 'placing',
+        t,
+        fromX: fromP.x, fromY, fromZ: fromP.z,
+        toX: toP.x, toY, toZ: toP.z,
+        fromRot: fromP.rot, toRot: toP.rot,
+        slotYaw,
+        w: halfW * 2, h: halfH * 2,
+      });
+    }
+    const tx = slot.tangent?.x ?? 1;
+    const tz = slot.tangent?.z ?? 0;
     for (let i = 0; i < onWindow && i < windowPoses.length; i++) {
       const p = windowPoses[i];
       const frac = BOARD_WINDOW_FRACTIONS[i];
-      const y = BUNKER_WALL_HEIGHT * (1 - frac);
-      const x = p.x;
-      const z = p.z;
+      const y = BUNKER_WALL_HEIGHT * (1 - frac) - BOARD_WALL_OFFSET_DOWN;
+      const x = p.x + tx * BOARD_WALL_OFFSET_RIGHT;
+      const z = p.z + tz * BOARD_WALL_OFFSET_RIGHT;
       const yaw = Math.atan2(slot.tangent?.z ?? 0, slot.tangent?.x ?? 1) - Math.PI / 2;
       out.push({ type: 'wall', x, y, z, w: halfW * 2, h: halfH * 2, yaw, rot: p.rot });
     }
   }
 
+  const floorY = BUNKER_FLOOR_Y + halfH;
   for (const fb of fallingBoards) {
     const t = Math.min(1, Math.max(0, (gameTime - fb.startTime) / (fb.endTime - fb.startTime)));
     const x = fb.fromPos.x + (fb.toPos.x - fb.fromPos.x) * t;
-    const y = (fb.fromPos.y + (fb.toPos.y - fb.fromPos.y) * t) + halfH;
+    const y = fb.fromPos.y + (floorY - fb.fromPos.y) * t;
     const z = fb.fromPos.z + (fb.toPos.z - fb.fromPos.z) * t;
     const rot = fb.fromPos.rot + (fb.toPos.rot - fb.fromPos.rot) * t;
-    out.push({ type: 'billboard', x, y, z, w: halfW * 2, h: halfH * 2, rot });
+    const slot = bunkerSlots.find((s) => getSlotKey(s) === fb.slotKey);
+    const slotYaw = slot ? Math.atan2(slot.tangent?.z ?? 0, slot.tangent?.x ?? 1) : 0;
+    out.push({ type: 'floor', x, y, z, w: halfW * 2, h: halfH * 2, rot, slotYaw });
   }
   return out;
 }
@@ -1351,6 +1387,11 @@ function getWorldRendererState() {
     getRemotePlayers: getRemotePlayersForRenderer,
     getBoardInstances: getBoardInstancesForRenderer,
     getViewForward: () => getViewVectors().forward,
+    FOG_DENSITY,
+    FOG_COLOR,
+    SKY_COLOR,
+    GROUND_COLOR,
+    horizonForestTexture,
   };
 }
 
@@ -1619,6 +1660,12 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
   const maxX = Math.max(...xs);
   const minZ = Math.min(...zs);
   const maxZ = Math.max(...zs);
+  const holes = (layout.interiorHoles || []).map((hole) =>
+    hole.map((p) => ({
+      x: WORLD_CENTER_X + p.x * bunkerTileWorldWidth,
+      z: WORLD_CENTER_Z + p.z * bunkerTileWorldWidth,
+    }))
+  );
   bunker = {
     halfW: (maxX - minX) / 2,
     halfD: (maxZ - minZ) / 2,
@@ -1627,6 +1674,7 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
     minZ,
     maxZ,
     corners,
+    holes,
   };
   bunkerSlots = slots;
   activeSlotIndex = Math.max(0, bunkerSlots.findIndex((slot) => slot.type === 'window' || slot.type === 'crate'));
@@ -2066,6 +2114,7 @@ function isReticuleOnBoardStack(px, py) {
   const onFloor = BOARDS_PER_WINDOW - (windowBoards[key] ?? 0);
   if (onFloor <= 0) return false;
   if (worldRenderer?.isReady()) {
+    if (cameraPitch < 0.06) return false;
     const hit = worldRenderer.pickFirst(px, py, ['window']);
     return !!hit && Number(hit.userData?.slotIndex) === activeSlotIndex;
   }
@@ -3617,14 +3666,8 @@ function treeBlocksPoint(t, info, px, py) {
   return alpha >= TREE_PIXEL_HIT_ALPHA_THRESHOLD;
 }
 
-/** Returns { type: 'zombie'|'tree', index } for the closest hit, or null. */
+/** Returns { type: 'zombie'|'tree', index } for the closest hit, or null. Always uses 2D screen-space hit test so hits match what the player sees (sprites on screen). */
 function getHitTarget(px, py) {
-  if (worldRenderer?.isReady()) {
-    const hit = worldRenderer.pickFirst(px, py, ['zombie', 'tree']);
-    if (hit?.kind === 'zombie') return { type: 'zombie', index: Number(hit.userData?.index ?? -1) };
-    if (hit?.kind === 'tree') return { type: 'tree', index: Number(hit.userData?.index ?? -1) };
-    return null;
-  }
   const candidates = [];
   const zombieIdx = hitTestZombies(px, py);
   if (zombieIdx >= 0) {
@@ -4322,6 +4365,8 @@ function drawMultiplayerPlayersDepthSorted(outItems = null) {
 
 const BOARD_SPRITE_WORLD_SIZE = 0.95;
 const BOARD_WALL_INSET = 0.035; // slight inward offset so boarded windows sit in front of wall
+const BOARD_WALL_OFFSET_RIGHT = 1.05; // world units along wall tangent so boards sit clearly to the side of the window
+const BOARD_WALL_OFFSET_DOWN = 0.22; // world units so boards sit below window, reducing hammer overlap
 const BOARD_WINDOW_FRACTIONS = [0.2, 0.35, 0.58];  // from top: top board, middle above rifle, bottom inside window
 
 function getWindowScreenBounds(slot) {
@@ -5331,6 +5376,7 @@ function draw() {
   }
   if (worldCanvas) worldCanvas.style.display = 'block';
   ctx.clearRect(0, 0, W, H);
+  initWorldRendererIfAvailable();
   if (worldRenderer?.isReady()) {
     worldRenderer.setAssets(assets);
     worldRenderer.setState(getWorldRendererState());
@@ -5338,7 +5384,11 @@ function draw() {
       worldRenderer.rebuildStaticWorld();
       worldStaticDirty = false;
     }
+    drawSky();
+    drawHorizonForest();
+    drawGround();
     worldRenderer.render();
+    ctx.drawImage(worldCanvas, 0, 0);
   } else {
     ctx.fillStyle = '#111';
     ctx.fillRect(0, 0, W, H);
