@@ -12,25 +12,6 @@
     return tile.spriteKey;
   }
 
-  function makeShapeFromCorners(THREE, corners, holes) {
-    const shape = new THREE.Shape();
-    if (!corners?.length) return shape;
-    shape.moveTo(corners[0].x, corners[0].z);
-    for (let i = 1; i < corners.length; i++) shape.lineTo(corners[i].x, corners[i].z);
-    shape.lineTo(corners[0].x, corners[0].z);
-    if (holes?.length) {
-      for (const hole of holes) {
-        if (!hole?.length) continue;
-        const holeShape = new THREE.Shape();
-        holeShape.moveTo(hole[0].x, hole[0].z);
-        for (let i = 1; i < hole.length; i++) holeShape.lineTo(hole[i].x, hole[i].z);
-        holeShape.lineTo(hole[0].x, hole[0].z);
-        shape.holes.push(holeShape);
-      }
-    }
-    return shape;
-  }
-
   class WorldRenderer3D {
     constructor(canvas, width, height) {
       this.canvas = canvas;
@@ -149,28 +130,36 @@
       this.slotColliderByIndex.clear();
 
       const bunker = this.state.bunker;
-      const corners = bunker.corners || [];
-      if (corners.length >= 3) {
-        const holes = bunker.holes || [];
-        let shape = makeShapeFromCorners(THREE, corners, holes);
-        let floorGeom;
-        try {
-          floorGeom = new THREE.ShapeGeometry(shape);
-          if (!floorGeom.attributes.position || floorGeom.attributes.position.count === 0) throw new Error('empty');
-        } catch (e) {
-          shape = makeShapeFromCorners(THREE, corners, []);
-          floorGeom = new THREE.ShapeGeometry(shape);
+      const isInsideBunker = this.state.isInsideBunker;
+      const floorY = this.state.BUNKER_FLOOR_Y;
+      const ceilY = this.state.BUNKER_WALL_HEIGHT;
+      const panelSize = this.state.bunkerTileWorldWidth || 1;
+      const floorboardsImg = this.assets?.floorboardsTiled;
+      if (bunker && isInsideBunker && floorboardsImg?.naturalWidth) {
+        const floorboardsTex = this._makeTexture(floorboardsImg);
+        floorboardsTex.wrapS = floorboardsTex.wrapT = THREE.RepeatWrapping;
+        floorboardsTex.repeat.set(1, 1);
+        const panelMat = new THREE.MeshBasicMaterial({
+          map: floorboardsTex,
+          side: THREE.DoubleSide,
+          depthWrite: true,
+        });
+        const panelGeom = new THREE.PlaneGeometry(panelSize, panelSize);
+        for (let x = bunker.minX; x < bunker.maxX; x += panelSize) {
+          for (let z = bunker.minZ; z < bunker.maxZ; z += panelSize) {
+            const cx = x + panelSize * 0.5;
+            const cz = z + panelSize * 0.5;
+            if (!isInsideBunker(cx, cz)) continue;
+            const floorMesh = new THREE.Mesh(panelGeom, panelMat);
+            floorMesh.rotation.x = -Math.PI / 2;
+            floorMesh.position.set(cx, floorY, cz);
+            this.staticGroup.add(floorMesh);
+            const ceilMesh = new THREE.Mesh(panelGeom, panelMat);
+            ceilMesh.rotation.x = Math.PI / 2;
+            ceilMesh.position.set(cx, ceilY, cz);
+            this.staticGroup.add(ceilMesh);
+          }
         }
-        floorGeom.rotateX(-Math.PI / 2);
-        floorGeom.translate(0, this.state.BUNKER_FLOOR_Y, 0);
-        const floorMat = new THREE.MeshBasicMaterial({ color: 0x201912, side: THREE.DoubleSide, depthWrite: true });
-        this.staticGroup.add(new THREE.Mesh(floorGeom, floorMat));
-
-        const ceilGeom = new THREE.ShapeGeometry(shape);
-        ceilGeom.rotateX(Math.PI / 2);
-        ceilGeom.translate(0, this.state.BUNKER_WALL_HEIGHT, 0);
-        const ceilMat = new THREE.MeshBasicMaterial({ color: 0x110d0a, side: THREE.DoubleSide, depthWrite: true });
-        this.staticGroup.add(new THREE.Mesh(ceilGeom, ceilMat));
       }
 
       for (const segment of this.state.bunkerWallSegments) {

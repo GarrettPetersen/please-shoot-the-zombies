@@ -1392,6 +1392,10 @@ function getWorldRendererState() {
     SKY_COLOR,
     GROUND_COLOR,
     horizonForestTexture,
+    isInsideBunker: (x, z) =>
+      bunker?.corners?.length >= 3 &&
+      isPointInsidePolygon(x, z, bunker.corners) &&
+      !(bunker.holes || []).some((h) => isPointInsidePolygon(x, z, h)),
   };
 }
 
@@ -2942,6 +2946,7 @@ async function loadAssets() {
   assets.bunkerWallWithAmmoData = imageDataFromImage(assets.bunkerWallWithAmmo);
   assets.bunkerWallWithAmmoMirroredData = imageDataFromImage(assets.bunkerWallWithAmmoMirrored);
   assets.board = await loadImage(`${base}/bunker/board.png`);
+  assets.floorboardsTiled = await loadImage(`${base}/bunker/floorboards_tiled.png`);
   assets.crateSpriteSheet = await loadImage(`${base}/bunker/crate_sprite_sheet.png`);
   assets.hammerSound = new Audio('assets/sfx/clean/hammer_nails.ogg');
   assets.hammerSound.preload = 'auto';
