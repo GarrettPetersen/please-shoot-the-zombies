@@ -181,6 +181,10 @@ let ironSightsHeld = false;
 let ironSightsRecoilKick = 0;
 const RELOAD_FREEZE_FRAME = 22;   // freeze here when out of clips until restocked
 const OUT_OF_AMMO_MESSAGE_DURATION = 1.5;
+const UPGRADE_SPITZER_AT = 100;
+const UPGRADE_MAD_MINUTE_AT = 200;
+const UPGRADE_MESSAGE_DURATION = 4;
+const ZOMBIE_RAY_RADIUS = 0.45;   // for Spitzer pass-through ray test
 
 // Zombie: 3D position, sprite size and reference at distance
 const ZOMBIE_REF_HEIGHT = 1.8;  // world units (height of zombie)
@@ -228,6 +232,12 @@ let rifleFrameTime = 0;
 let shotsInClip = RIFLE_CLIP_SIZE;
 let clipsCarried = MAX_CLIPS;
 let outOfAmmoMessageTime = 0;
+let outOfAmmoMessageText = 'Out of ammo';
+let outOfAmmoShownCrateHint = false;
+let upgradeMessageTime = 0;
+let upgradeMessageLines = [];
+let upgradeSpitzerShown = false;
+let upgradeMadMinuteShown = false;
 let zombies = [];  // { x, y, z } in world space
 let zombieSpawnPlan = [];
 let nextZombiePlanIndex = 0;
@@ -496,6 +506,12 @@ function startLocalGame(opts = {}) {
   shotsInClip = RIFLE_CLIP_SIZE;
   clipsCarried = MAX_CLIPS;
   outOfAmmoMessageTime = 0;
+  outOfAmmoMessageText = 'Out of ammo';
+  outOfAmmoShownCrateHint = false;
+  upgradeMessageTime = 0;
+  upgradeMessageLines = [];
+  upgradeSpitzerShown = false;
+  upgradeMadMinuteShown = false;
   reloadSoundPlayed = false;
   boltOpenSoundPlayed = false;
   boltCloseSoundPlayed = false;
@@ -1694,6 +1710,10 @@ const RELOAD_SOUND_ALIGN_FRAME = 51;   // 1-indexed (51st frame)
 const RELOAD_SOUND_ALIGN_TIME = 0.65; // seconds into sound file at that frame
 const RELOAD_SOUND_EARLY_OFFSET = 0.25; // start sound this many seconds earlier
 const RELOAD_SOUND_TRIGGER_FRAME = Math.max(0, Math.floor((RELOAD_SOUND_ALIGN_FRAME - 1) - RELOAD_SOUND_ALIGN_TIME * RIFLE_FPS - RELOAD_SOUND_EARLY_OFFSET * RIFLE_FPS));
+
+function getRifleFps() {
+  return score >= UPGRADE_MAD_MINUTE_AT ? RIFLE_FPS * 2 : RIFLE_FPS;
+}
 
 /** Extract ImageData from an image (for headshot mask sampling). Returns null if image not loaded. */
 function imageDataFromImage(img) {
@@ -3250,6 +3270,7 @@ async function loadAssets() {
   assets.board = await loadImage(`${base}/bunker/board.png`);
   assets.floorboardsTiled = await loadImage(`${base}/bunker/floorboards_tiled.png`);
   assets.crateSpriteSheet = await loadImage(`${base}/bunker/crate_sprite_sheet.png`);
+  assets.ammo = await loadImage(`${base}/ammo.png`);
   assets.hammerSound = new Audio('assets/sfx/clean/hammer_nails.ogg');
   assets.hammerSound.preload = 'auto';
   assets.boardBreakSound = new Audio('assets/sfx/clean/board_breaking.ogg');
@@ -3923,6 +3944,16 @@ function damageZombie(idx, hitPx, hitPy) {
     zombies.splice(idx, 1);
     score += 1;
     updateTallyWallTextures();
+    if (score === UPGRADE_SPITZER_AT && !upgradeSpitzerShown) {
+      upgradeSpitzerShown = true;
+      upgradeMessageTime = UPGRADE_MESSAGE_DURATION;
+      upgradeMessageLines = ['100 zombies destroyed', 'Upgrade unlocked: .303 Mk VII Spitzer Bullet', 'Bullets pass through enemies on kill'];
+    }
+    if (score === UPGRADE_MAD_MINUTE_AT && !upgradeMadMinuteShown) {
+      upgradeMadMinuteShown = true;
+      upgradeMessageTime = UPGRADE_MESSAGE_DURATION;
+      upgradeMessageLines = ['200 zombies destroyed', 'Upgrade unlocked: Mad Minute', 'Shooting and reloading speed doubled'];
+    }
     return { type: 'zombie', zombieId, headshot: headShot, killed: true };
   } else {
     if (!z.holes) z.holes = [];
@@ -3933,15 +3964,10 @@ function damageZombie(idx, hitPx, hitPy) {
   }
 }
 
-function applyRemoteZombieHit(payload, remotePlayer) {
-  const hit = payload?.hit;
+function applyOneRemoteZombieHit(payload, remotePlayer, hit) {
   if (!hit || hit.type !== 'zombie' || zombies.length === 0) return;
-  let zombieIdx = -1;
-  const remoteId = Number(hit.zombieId);
-  if (Number.isFinite(remoteId)) {
-    zombieIdx = zombies.findIndex((z) => z.spawnIndex === remoteId);
-    if (zombieIdx < 0) zombieIdx = zombies.findIndex((z) => z.spawnIndex === (remoteId - 1));
-  }
+  let zombieIdx = zombies.findIndex((z) => z.spawnIndex === Number(hit.zombieId));
+  if (zombieIdx < 0) zombieIdx = zombies.findIndex((z) => z.spawnIndex === (Number(hit.zombieId) - 1));
   if (zombieIdx < 0 && Number.isFinite(payload?.targetSlotIndex)) {
     const targetIdx = Number(payload.targetSlotIndex);
     zombieIdx = zombies.findIndex((z) => z.targetSlot && bunkerSlots.indexOf(z.targetSlot) === targetIdx);
@@ -3970,6 +3996,29 @@ function applyRemoteZombieHit(payload, remotePlayer) {
   zombies.splice(zombieIdx, 1);
   score += 1;
   updateTallyWallTextures();
+  if (score === UPGRADE_SPITZER_AT && !upgradeSpitzerShown) {
+    upgradeSpitzerShown = true;
+    upgradeMessageTime = UPGRADE_MESSAGE_DURATION;
+    upgradeMessageLines = ['100 zombies destroyed', 'Upgrade unlocked: .303 Mk VII Spitzer Bullet', 'Bullets pass through enemies on kill'];
+  }
+  if (score === UPGRADE_MAD_MINUTE_AT && !upgradeMadMinuteShown) {
+    upgradeMadMinuteShown = true;
+    upgradeMessageTime = UPGRADE_MESSAGE_DURATION;
+    upgradeMessageLines = ['200 zombies destroyed', 'Upgrade unlocked: Mad Minute', 'Shooting and reloading speed doubled'];
+  }
+}
+
+function applyRemoteZombieHit(payload, remotePlayer) {
+  const hits = payload?.hits;
+  if (Array.isArray(hits) && hits.length > 0) {
+    for (const hit of hits) {
+      applyOneRemoteZombieHit(payload, remotePlayer, hit);
+    }
+    return;
+  }
+  const hit = payload?.hit;
+  if (!hit || hit.type !== 'zombie' || zombies.length === 0) return;
+  applyOneRemoteZombieHit(payload, remotePlayer, hit);
 }
 
 // Zombie sprite: flip from walk direction. Uses per-zombie sprite dimensions for aspect.
@@ -4088,6 +4137,37 @@ function treeBlocksPoint(t, info, px, py) {
   if (tx < 0 || tx >= TREE_SPRITE_SIZE || ty < 0 || ty >= TREE_SPRITE_SIZE) return false;
   const alpha = idata.data[(ty * TREE_SPRITE_SIZE + tx) * 4 + 3];
   return alpha >= TREE_PIXEL_HIT_ALPHA_THRESHOLD;
+}
+
+/** Returns all zombies the ray passes through, front to back, for Spitzer pass-through. Each entry has { index, spawnIndex, t, hitPx, hitPy }. */
+function getZombieHitsAlongRay(shotDir) {
+  const ox = cameraX;
+  const oy = CAMERA_Y;
+  const oz = cameraZ;
+  const hits = [];
+  const halfH = ZOMBIE_REF_HEIGHT * 0.5;
+  for (let i = 0; i < zombies.length; i++) {
+    const z = zombies[i];
+    const cx = z.x;
+    const cy = (z.y ?? 0) + halfH;
+    const cz = z.z;
+    const dx = cx - ox;
+    const dy = cy - oy;
+    const dz = cz - oz;
+    const t = dx * shotDir.x + dy * shotDir.y + dz * shotDir.z;
+    if (t <= 0) continue;
+    const px = ox + t * shotDir.x;
+    const py = oy + t * shotDir.y;
+    const pz = oz + t * shotDir.z;
+    const dist = Math.sqrt((px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2);
+    if (dist > ZOMBIE_RAY_RADIUS) continue;
+    const info = getZombieDrawInfo(z);
+    const hitPx = info ? info.sx + info.sw / 2 : W / 2;
+    const hitPy = info ? info.sy + info.sh / 2 : H / 2;
+    hits.push({ index: i, spawnIndex: z.spawnIndex, t, hitPx, hitPy });
+  }
+  hits.sort((a, b) => a.t - b.t);
+  return hits;
 }
 
 /** Returns { type: 'zombie'|'tree', index } for the closest hit, or null. Always uses 2D screen-space hit test so hits match what the player sees (sprites on screen). */
@@ -5302,7 +5382,7 @@ function drawRifle(dt) {
   if (!fireSheet || !reloadSheet) return;
 
   rifleFrameTime += dt;
-  const frameDuration = 1 / RIFLE_FPS;
+  const frameDuration = 1 / getRifleFps();
 
   if (rifleState === 'firing') {
     if (rifleFrameTime >= frameDuration) {
@@ -5448,7 +5528,21 @@ function drawOutOfAmmoMessage() {
   ctx.fillStyle = `rgba(255, 200, 100, ${alpha})`;
   ctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
   ctx.textAlign = 'center';
-  ctx.fillText('Out of ammo', W / 2, H - 32);
+  ctx.fillText(outOfAmmoMessageText, W / 2, H - 32);
+  ctx.textAlign = 'left';
+}
+
+function drawUpgradeMessage() {
+  if (upgradeMessageTime <= 0 || !upgradeMessageLines.length) return;
+  const alpha = Math.min(1, upgradeMessageTime * 1.5);
+  ctx.fillStyle = `rgba(255, 220, 120, ${alpha})`;
+  ctx.font = `${FONT_SIZE + 2}px ${FONT_FAMILY}`;
+  ctx.textAlign = 'center';
+  const lineHeight = FONT_SIZE + 10;
+  const startY = H / 2 - (upgradeMessageLines.length * lineHeight) / 2;
+  for (let i = 0; i < upgradeMessageLines.length; i++) {
+    ctx.fillText(upgradeMessageLines[i], W / 2, startY + (i + 0.5) * lineHeight);
+  }
   ctx.textAlign = 'left';
 }
 
@@ -5471,13 +5565,19 @@ function drawReticule() {
   const pointingAtBoardStack = !boardPlaceState && slot?.type === 'window' && isReticuleOnBoardStack(cx, cy);
 
   if (pointingAtCrate) {
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
-    ctx.font = `28px ${FONT_FAMILY}`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText('\u2340', cx, cy);
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'alphabetic';
+    const img = assets.ammo;
+    if (img?.naturalWidth) {
+      const size = 32;
+      ctx.drawImage(img, cx - size / 2, cy - size / 2, size, size);
+    } else {
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+      ctx.font = `28px ${FONT_FAMILY}`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('\u2340', cx, cy);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+    }
     return;
   }
   if (pointingAtBoardStack) {
@@ -6005,6 +6105,10 @@ function draw() {
   drawReticule();
   drawRunTargetArrow();
   drawBrokenBoardAlerts();
+  drawScore();
+  drawPositionLabel();
+  drawOutOfAmmoMessage();
+  drawUpgradeMessage();
   if (gameOver) drawGameOver();
   else if (gameWon) drawVictory();
   else if (!pointerLocked) drawHint();
@@ -6021,6 +6125,7 @@ function tick(dt) {
   gameTime += dt;
   hitFeedbackTime = Math.max(0, hitFeedbackTime - dt);
   outOfAmmoMessageTime = Math.max(0, outOfAmmoMessageTime - dt);
+  upgradeMessageTime = Math.max(0, upgradeMessageTime - dt);
   ironSightsRecoilKick *= IRON_SIGHTS_RECOIL_DECAY;
   if (boardPlaceState && gameTime >= boardPlaceState.endTime) {
     const key = boardPlaceState.slotKey;
@@ -6157,6 +6262,7 @@ canvas.addEventListener('click', (e) => {
   }
 
   if (pointingAtCrate) {
+    outOfAmmoShownCrateHint = false;
     playPickUpSound();
     clipsCarried = MAX_CLIPS;
     sendMultiplayerPayload('player_ammo_pickup', {
@@ -6180,6 +6286,12 @@ canvas.addEventListener('click', (e) => {
   }
 
   if (shotsInClip === 0 && clipsCarried === 0) {
+    if (!outOfAmmoShownCrateHint) {
+      outOfAmmoMessageText = 'Out of ammo';
+      outOfAmmoShownCrateHint = true;
+    } else {
+      outOfAmmoMessageText = 'Get more ammo from the ammo crate';
+    }
     outOfAmmoMessageTime = OUT_OF_AMMO_MESSAGE_DURATION;
     rifleState = 'reloading';
     rifleFrame = 0;
@@ -6205,18 +6317,52 @@ canvas.addEventListener('click', (e) => {
   const canSeeOutside = shotLeavesThroughWindow(px, py);
   const shotDir = getShotDirection(px, py);
   addTracer({ x: cameraX, y: CAMERA_Y - 0.05, z: cameraZ }, shotDir);
-  const makeShotEvent = (hit) => ({
-    at: Date.now(),
-    px: Math.round(px),
-    py: Math.round(py),
-    dir: { x: Number(shotDir.x.toFixed(5)), y: Number(shotDir.y.toFixed(5)), z: Number(shotDir.z.toFixed(5)) },
-    canSeeOutside: !!canSeeOutside,
-    hit: hit ? {
-      type: hit.type,
-      index: hit.index,
-    } : null,
-    shotsInClip,
-  });
+  const spitzerUnlocked = score >= UPGRADE_SPITZER_AT;
+  const makeShotEvent = (hitOrHits) => {
+    const hits = Array.isArray(hitOrHits) ? hitOrHits : (hitOrHits && hitOrHits.type === 'zombie' ? [hitOrHits] : []);
+    const first = hits[0] || (hitOrHits && !Array.isArray(hitOrHits) ? hitOrHits : null);
+    const hit = first && first.type === 'zombie' ? { type: 'zombie', zombieId: first.zombieId, headshot: first.headshot, killed: first.killed } : (first || null);
+    const hitsPayload = hits.map((h) => ({ type: 'zombie', zombieId: h.zombieId, headshot: h.headshot, killed: h.killed }));
+    return {
+      at: Date.now(),
+      px: Math.round(px),
+      py: Math.round(py),
+      dir: { x: Number(shotDir.x.toFixed(5)), y: Number(shotDir.y.toFixed(5)), z: Number(shotDir.z.toFixed(5)) },
+      canSeeOutside: !!canSeeOutside,
+      hit,
+      hits: hitsPayload,
+      shotsInClip,
+    };
+  };
+
+  const resolveHitsAndSend = (isLastShot) => {
+    const firstHit = canSeeOutside ? getHitTarget(px, py) : null;
+    let hitPayloads = [];
+    if (firstHit?.type === 'tree') {
+      damageTree(firstHit.index, px, py);
+      sendMultiplayerPayload('player_shot', makeShotEvent(firstHit));
+      recordShotStat(multiplayerSession?.playerId || '__local__', firstHit);
+      return;
+    }
+    if (firstHit?.type === 'zombie' && spitzerUnlocked) {
+      const rayHits = getZombieHitsAlongRay(shotDir);
+      for (const entry of rayHits) {
+        const idx = zombies.findIndex((z) => z.spawnIndex === entry.spawnIndex);
+        if (idx < 0) continue;
+        const payload = damageZombie(idx, entry.hitPx, entry.hitPy);
+        if (payload) hitPayloads.push(payload);
+      }
+      recordShotStat(multiplayerSession?.playerId || '__local__', hitPayloads[0] || null);
+      sendMultiplayerPayload('player_shot', makeShotEvent(hitPayloads));
+      return;
+    }
+    if (firstHit?.type === 'zombie') {
+      const payload = damageZombie(firstHit.index, px, py);
+      hitPayloads = payload ? [payload] : [];
+    }
+    recordShotStat(multiplayerSession?.playerId || '__local__', hitPayloads[0] || firstHit || null);
+    sendMultiplayerPayload('player_shot', makeShotEvent(hitPayloads.length ? hitPayloads : firstHit));
+  };
 
   if (shotsInClip > 1) {
     rifleState = 'firing';
@@ -6227,16 +6373,7 @@ canvas.addEventListener('click', (e) => {
     if (ironSightsHeld) ironSightsRecoilKick = IRON_SIGHTS_RECOIL_KICK;
     playShotSound();
     playEjectCasingSound();
-    const hit = canSeeOutside ? getHitTarget(px, py) : null;
-    let hitPayload = null;
-    if (hit) {
-      if (hit.type === 'zombie') hitPayload = damageZombie(hit.index, px, py);
-      else damageTree(hit.index, px, py);
-    }
-    const shotHit = hit?.type === 'zombie' ? (hitPayload || { type: 'zombie' }) : hit;
-    const localId = multiplayerSession?.playerId || '__local__';
-    recordShotStat(localId, shotHit);
-    sendMultiplayerPayload('player_shot', makeShotEvent(shotHit));
+    resolveHitsAndSend(false);
   } else if (shotsInClip === 1) {
     rifleState = 'reloading';
     rifleFrame = 0;
@@ -6248,16 +6385,7 @@ canvas.addEventListener('click', (e) => {
     if (ironSightsHeld) ironSightsRecoilKick = IRON_SIGHTS_RECOIL_KICK;
     playShotSound();
     playEjectCasingSound();
-    const hit = canSeeOutside ? getHitTarget(px, py) : null;
-    let hitPayload = null;
-    if (hit) {
-      if (hit.type === 'zombie') hitPayload = damageZombie(hit.index, px, py);
-      else damageTree(hit.index, px, py);
-    }
-    const shotHit = hit?.type === 'zombie' ? (hitPayload || { type: 'zombie' }) : hit;
-    const localId = multiplayerSession?.playerId || '__local__';
-    recordShotStat(localId, shotHit);
-    sendMultiplayerPayload('player_shot', makeShotEvent(shotHit));
+    resolveHitsAndSend(true);
   }
 });
 
