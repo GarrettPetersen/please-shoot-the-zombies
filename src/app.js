@@ -68,30 +68,219 @@ const FOG_WISP_REF_DEPTH = 25;  // reference depth for screen size
 const FOG_WISP_BASE_ALPHA = 0.18;
 const FOG_WISP_ROT_SPEED = 0.026;  // rad/sec; each wisp gets ± this (clockwise vs counterclockwise)
 
-// Bunker: arbitrary polygon defined in wall-tile units.
-// Each edge gets one sprite key per 1-tile segment.
-const BUNKER_LAYOUT = {
-  unitCorners: [
-    { x: -6, z: -4 },
-    { x: 4, z: -4 },
-    { x: 4, z: -1 },
-    { x: 1, z: -1 },
-    { x: 1, z: 4 },
-    { x: -6, z: 4 },
-  ],
-  /** Interior holes (e.g. courtyard) in unit coords; floor/ceiling will not render here. */
-  interiorHoles: [
-    [{ x: 1, z: -1 }, { x: 4, z: -1 }, { x: 4, z: 4 }, { x: 1, z: 4 }],
-  ],
-  segmentTiles: [
-    ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
-    ['wall', 'window', 'wall'],
-    ['wall', 'door', 'wall'],
-    ['wall', 'window', 'wall', 'window', 'wall'],
-    ['wall', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
-    ['wall', 'ammo', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
-  ],
+// Bunker layouts: arbitrary polygons defined in wall-tile units.
+// Each edge gets one sprite key per 1-tile segment. Ammo only on perimeter (never on interior walls) so players can reach it clockwise/counterclockwise. Tally near ammo (can be on interior).
+const BUNKER_LAYOUTS = {
+  // Narrow L: one wall-segment-wide corridor everywhere.
+  l_redoubt: {
+    id: 'l_redoubt',
+    name: 'L Redoubt',
+    unitCorners: [
+      { x: -8, z: -5 },
+      { x: 5, z: -5 },
+      { x: 5, z: -4 },
+      { x: -7, z: -4 },
+      { x: -7, z: 5 },
+      { x: -8, z: 5 },
+    ],
+    segmentTiles: [
+      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'wall'],
+      ['wall', 'window'],
+      ['wall', 'window', 'wall', 'door', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall'],
+      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall'],
+      ['wall', 'wall', 'window', 'wall'],
+      ['wall', 'ammo', 'wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
+    ],
+  },
+  // Smallest: one door, ammo behind it, no other openings. Tally near crate.
+  shooting_gallery: {
+    id: 'shooting_gallery',
+    name: 'Shooting Gallery',
+    unitCorners: [
+      { x: -2, z: -2 },
+      { x: 2, z: -2 },
+      { x: 2, z: 2 },
+      { x: -2, z: 2 },
+    ],
+    segmentTiles: [
+      ['wall', 'door', 'ammo', 'wall'],
+      ['wall', 'wall', 'wall', 'wall'],
+      ['wall', 'wall', 'wall', 'wall'],
+      ['wall', 'wall', 'wall', 'wall'],
+    ],
+  },
+  // 1×2 units: ammo, tally, 4 openings.
+  small_1x2: {
+    id: 'small_1x2',
+    name: 'Small 1×2',
+    unitCorners: [
+      { x: 0, z: 0 },
+      { x: 1, z: 0 },
+      { x: 1, z: 2 },
+      { x: 0, z: 2 },
+    ],
+    segmentTiles: [
+      ['window'],
+      ['ammo', 'window'],
+      ['window'],
+      ['window', 'wall'],
+    ],
+  },
+  // Zigzag: L with another bend the other way (S shape).
+  zigzag: {
+    id: 'zigzag',
+    name: 'Zigzag',
+    unitCorners: [
+      { x: -8, z: -5 },
+      { x: 5, z: -5 },
+      { x: 5, z: -4 },
+      { x: -2, z: -4 },
+      { x: -2, z: 2 },
+      { x: 2, z: 2 },
+      { x: 2, z: 3 },
+      { x: -8, z: 3 },
+    ],
+    segmentTiles: [
+      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'wall', 'wall', 'wall'],
+      ['wall', 'window'],
+      ['wall', 'window', 'wall', 'door', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'window'],
+      ['wall', 'window'],
+      ['wall', 'ammo', 'wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
+    ],
+  },
+  // Pentagon with non-right angles; interior keep loop so main area is hallway-width around inner wall.
+  pentagon_rampart: {
+    id: 'pentagon_rampart',
+    name: 'Pentagon Rampart',
+    unitCorners: [
+      { x: 0, z: -5 },
+      { x: 4.76, z: -1.55 },
+      { x: 2.94, z: 4.05 },
+      { x: -2.94, z: 4.05 },
+      { x: -4.76, z: -1.55 },
+    ],
+    segmentTiles: [
+      ['wall', 'window', 'wall', 'ammo', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'window', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'window', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'window', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'window', 'wall', 'wall'],
+    ],
+    interiorWallLoops: [
+      {
+        points: [
+          { x: 0, z: -2 },
+          { x: 1.9, z: -0.62 },
+          { x: 1.18, z: 1.62 },
+          { x: -1.18, z: 1.62 },
+          { x: -1.9, z: -0.62 },
+        ],
+        segmentTiles: [
+          ['wall', 'wall', 'wall'],
+          ['wall', 'wall', 'wall'],
+          ['wall', 'wall', 'wall'],
+          ['wall', 'wall', 'wall'],
+          ['wall', 'wall', 'wall'],
+        ],
+      },
+    ],
+  },
+  // Star fort: points poking out for overlapping fields of fire; interior keep loop so you can't see across.
+  star_fort: {
+    id: 'star_fort',
+    name: 'Star Fort',
+    unitCorners: [
+      { x: 0, z: -6 },
+      { x: 2.5, z: -2 },
+      { x: 6, z: 0 },
+      { x: 2.5, z: 2 },
+      { x: 0, z: 6 },
+      { x: -2.5, z: 2 },
+      { x: -6, z: 0 },
+      { x: -2.5, z: -2 },
+    ],
+    segmentTiles: [
+      ['wall', 'window', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'wall'],
+      ['wall', 'ammo', 'wall', 'window', 'wall'],
+      ['wall', 'window', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'wall'],
+    ],
+    interiorWallLoops: [
+      {
+        points: [
+          { x: 0, z: -2 },
+          { x: 1.41, z: -1.41 },
+          { x: 2, z: 0 },
+          { x: 1.41, z: 1.41 },
+          { x: 0, z: 2 },
+          { x: -1.41, z: 1.41 },
+          { x: -2, z: 0 },
+          { x: -1.41, z: -1.41 },
+        ],
+        segmentTiles: [
+          ['wall', 'wall'],
+          ['wall', 'wall'],
+          ['wall', 'wall'],
+          ['wall', 'wall'],
+          ['wall', 'wall'],
+          ['wall', 'wall'],
+          ['wall', 'wall'],
+          ['wall', 'wall'],
+        ],
+      },
+    ],
+  },
+  rectangle_fort: {
+    id: 'rectangle_fort',
+    name: 'Rectangle Fort',
+    unitCorners: [
+      { x: -7, z: -4 },
+      { x: 5, z: -4 },
+      { x: 5, z: 4 },
+      { x: -7, z: 4 },
+    ],
+    segmentTiles: [
+      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'window', 'wall'],
+      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'ammo', 'wall'],
+      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
+    ],
+  },
+  horseshoe_keep: {
+    id: 'horseshoe_keep',
+    name: 'Horseshoe Keep',
+    unitCorners: [
+      { x: -7, z: -4 },
+      { x: 5, z: -4 },
+      { x: 5, z: 4 },
+      { x: 2, z: 4 },
+      { x: 2, z: -1 },
+      { x: -4, z: -1 },
+      { x: -4, z: 4 },
+      { x: -7, z: 4 },
+    ],
+    interiorHoles: [
+      [{ x: -4, z: -1 }, { x: 2, z: -1 }, { x: 2, z: 4 }, { x: -4, z: 4 }],
+    ],
+    segmentTiles: [
+      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'window', 'wall'],
+      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
+      ['wall', 'window', 'wall'],
+      ['wall', 'door', 'wall', 'window', 'wall'],
+      ['wall', 'window', 'wall', 'window', 'wall', 'window'],
+      ['wall', 'door', 'wall', 'window', 'wall'],
+      ['wall', 'window', 'wall'],
+      ['wall', 'window', 'wall', 'window', 'wall', 'ammo', 'wall', 'wall'],
+    ],
+  },
 };
+const DEFAULT_BUNKER_LAYOUT_ID = 'l_redoubt';
 const BUNKER_SLOT_SPACING = 4.5;
 const BUNKER_WALL_INSET = 2.8;
 const BUNKER_MOVE_LERP = 10;
@@ -284,6 +473,7 @@ const MENU_LANGUAGES = {
     language: 'Language',
     settingsTitle: 'Match Settings',
     privacy: 'Privacy',
+    bunker: 'Bunker',
     maxPlayers: 'Max Players',
     difficulty: 'Difficulty',
     createMatch: 'Create Match',
@@ -333,6 +523,7 @@ const MENU_LANGUAGES = {
     language: 'Idioma',
     settingsTitle: 'Configuracion de partida',
     privacy: 'Privacidad',
+    bunker: 'Bunker',
     maxPlayers: 'Max jugadores',
     difficulty: 'Dificultad',
     createMatch: 'Crear partida',
@@ -379,11 +570,13 @@ let menuToast = '';
 let menuToastUntil = 0;
 let confirmMainMenuOpen = false;
 const confirmMainMenuButtons = []; // updated when dialog draws
+let currentBunkerLayoutId = DEFAULT_BUNKER_LAYOUT_ID;
 const menuState = {
   matchSettings: {
     privacy: 'private',
     maxPlayers: 8,
     difficulty: 'normal',
+    bunkerLayoutId: DEFAULT_BUNKER_LAYOUT_ID,
   },
 };
 const DEFAULT_MULTIPLAYER_HTTP_BASE = 'http://100.52.203.69:3000';
@@ -395,6 +588,7 @@ let multiplayerConnected = false;
 let multiplayerAgreedHash = '';
 let multiplayerGameSeed = GAME_PARAM_SEED;
 let multiplayerWaveCount = GAME_PARAM_WAVE_COUNT;
+let multiplayerBunkerLayoutId = DEFAULT_BUNKER_LAYOUT_ID;
 let multiplayerStartAt = 0;
 let pendingLossProposalId = '';
 let multiplayerDisconnecting = false;
@@ -491,9 +685,29 @@ function setMenuPage(pageId) {
   menuHoverIndex = -1;
 }
 
+function getBunkerLayoutOptions() {
+  return Object.values(BUNKER_LAYOUTS);
+}
+
+function getBunkerLayoutById(layoutId) {
+  const id = String(layoutId || '');
+  return BUNKER_LAYOUTS[id] || BUNKER_LAYOUTS[DEFAULT_BUNKER_LAYOUT_ID];
+}
+
+function getBunkerLayoutName(layoutId) {
+  return getBunkerLayoutById(layoutId)?.name || getBunkerLayoutById(DEFAULT_BUNKER_LAYOUT_ID)?.name || 'Bunker';
+}
+
+function setCurrentBunkerLayout(layoutId) {
+  const resolved = getBunkerLayoutById(layoutId);
+  currentBunkerLayoutId = resolved.id;
+  generateBunkerLayout(resolved);
+}
+
 function startLocalGame(opts = {}) {
   const seed = Number.isFinite(opts.seed) ? opts.seed : GAME_PARAM_SEED;
   const waveCount = Number.isFinite(opts.waveCount) ? opts.waveCount : GAME_PARAM_WAVE_COUNT;
+  const bunkerLayoutId = String(opts.bunkerLayoutId || multiplayerBunkerLayoutId || currentBunkerLayoutId || DEFAULT_BUNKER_LAYOUT_ID);
   const playerCount = Math.max(1, Number.isFinite(opts.playerCount)
     ? Math.floor(opts.playerCount)
     : (multiplayerLobbyPlayers.length || 1));
@@ -539,6 +753,7 @@ function startLocalGame(opts = {}) {
   resetMatchStats();
   syncMatchStatsRosterFromLobby();
   if (assets.runningSound) { assets.runningSound.pause(); assets.runningSound.currentTime = 0; }
+  setCurrentBunkerLayout(bunkerLayoutId);
 
   const planned = generateGameParameters(seed, waveCount, playerCount);
   gameParams = planned.params;
@@ -702,6 +917,8 @@ function leaveLobby() {
   multiplayerSession = null;
   multiplayerConnected = false;
   multiplayerAgreedHash = '';
+  multiplayerBunkerLayoutId = menuState.matchSettings.bunkerLayoutId || DEFAULT_BUNKER_LAYOUT_ID;
+  setCurrentBunkerLayout(multiplayerBunkerLayoutId);
   multiplayerStartAt = 0;
   showMenuToast(t('statusLeftLobby'), 1.2);
   setMenuPage('online');
@@ -1008,6 +1225,8 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
         }
         multiplayerGameSeed = Number(msg.session.gameSeed || GAME_PARAM_SEED);
         multiplayerWaveCount = Number(msg.session.waveCount || GAME_PARAM_WAVE_COUNT);
+        multiplayerBunkerLayoutId = String(msg.session.bunkerLayoutId || DEFAULT_BUNKER_LAYOUT_ID);
+        setCurrentBunkerLayout(multiplayerBunkerLayoutId);
         if (msg.session.agreedHash) {
           multiplayerAgreedHash = msg.session.agreedHash;
           multiplayerStartAt = Number(msg.session.startedAt || 0);
@@ -1018,6 +1237,8 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
       if (msg.type === 'handshake_request') {
         multiplayerGameSeed = Number(msg.seed || GAME_PARAM_SEED);
         multiplayerWaveCount = Number(msg.waveCount || GAME_PARAM_WAVE_COUNT);
+        multiplayerBunkerLayoutId = String(msg.bunkerLayoutId || DEFAULT_BUNKER_LAYOUT_ID);
+        setCurrentBunkerLayout(multiplayerBunkerLayoutId);
         const multiplayerPlayerCount = Math.max(1, Number(msg.playerCount || multiplayerLobbyPlayers.length || 1));
         const planned = generateGameParameters(multiplayerGameSeed, multiplayerWaveCount, multiplayerPlayerCount);
         sendMultiplayerPayload('state_hash', {
@@ -1029,12 +1250,14 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
       if (msg.type === 'start_game') {
         multiplayerGameSeed = Number(msg.seed || GAME_PARAM_SEED);
         multiplayerWaveCount = Number(msg.waveCount || GAME_PARAM_WAVE_COUNT);
+        multiplayerBunkerLayoutId = String(msg.bunkerLayoutId || DEFAULT_BUNKER_LAYOUT_ID);
         const multiplayerPlayerCount = Math.max(1, Number(msg.playerCount || multiplayerLobbyPlayers.length || 1));
         multiplayerAgreedHash = String(msg.agreedHash || '');
         multiplayerStartAt = Number(msg.startAt || 0);
         if (startLocalGame({
           seed: multiplayerGameSeed,
           waveCount: multiplayerWaveCount,
+          bunkerLayoutId: multiplayerBunkerLayoutId,
           playerCount: multiplayerPlayerCount,
           agreedHash: multiplayerAgreedHash,
         })) {
@@ -1171,6 +1394,7 @@ async function hostMatchFromSettings() {
     maxPlayers: s.maxPlayers,
     botsFill: true,
     difficulty: s.difficulty,
+    bunkerLayoutId: s.bunkerLayoutId,
     playerName: name,
   });
   multiplayerSession = {
@@ -1182,6 +1406,8 @@ async function hostMatchFromSettings() {
   };
   multiplayerAgreedHash = '';
   multiplayerStartAt = 0;
+  multiplayerBunkerLayoutId = String(created.bunkerLayoutId || s.bunkerLayoutId || DEFAULT_BUNKER_LAYOUT_ID);
+  setCurrentBunkerLayout(multiplayerBunkerLayoutId);
   connectMultiplayerSocket(created.sessionId, created.playerId, created.wsUrl);
   showMenuToast(`${t('statusHosted')} (${created.joinCode})`, 2.2);
   setMenuPage('lobby');
@@ -1312,6 +1538,14 @@ function getMenuPageDefinition() {
           label: `${t('privacy')}: ${privLabel}`,
           onSelect: () => {
             settings.privacy = settings.privacy === 'public' ? 'private' : 'public';
+          },
+        },
+        {
+          label: `${t('bunker')}: ${getBunkerLayoutName(settings.bunkerLayoutId)}`,
+          onSelect: () => {
+            const opts = getBunkerLayoutOptions().map((b) => b.id);
+            settings.bunkerLayoutId = cycleValue(opts, settings.bunkerLayoutId, 1);
+            setCurrentBunkerLayout(settings.bunkerLayoutId);
           },
         },
         {
@@ -1799,13 +2033,15 @@ function generateTrees() {
   }
 }
 
-function generateBunkerLayout(layout = BUNKER_LAYOUT) {
+function generateBunkerLayout(layout = null) {
+  const activeLayout = layout || getBunkerLayoutById(currentBunkerLayoutId);
+  currentBunkerLayoutId = activeLayout?.id || DEFAULT_BUNKER_LAYOUT_ID;
   const wallAspect = assets.bunkerWall?.naturalWidth && assets.bunkerWall?.naturalHeight
     ? assets.bunkerWall.naturalWidth / assets.bunkerWall.naturalHeight
     : 1;
   bunkerTileWorldWidth = BUNKER_WALL_HEIGHT * wallAspect * BUNKER_WALL_TILE_SCALE;
-  const unitCorners = Array.isArray(layout.unitCorners) && layout.unitCorners.length >= 3
-    ? layout.unitCorners
+  const unitCorners = Array.isArray(activeLayout?.unitCorners) && activeLayout.unitCorners.length >= 3
+    ? activeLayout.unitCorners
     : [{ x: -3, z: -2 }, { x: 3, z: -2 }, { x: 3, z: 2 }, { x: -3, z: 2 }];
   const corners = unitCorners.map((p) => ({
     x: WORLD_CENTER_X + p.x * bunkerTileWorldWidth,
@@ -1830,18 +2066,19 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
     signedArea2 += a.x * b.z - b.x * a.z;
   }
   const isCCW = signedArea2 > 0;
+  const polygonCenter = corners.reduce((acc, p) => ({ x: acc.x + p.x, z: acc.z + p.z }), { x: 0, z: 0 });
+  polygonCenter.x /= Math.max(1, corners.length);
+  polygonCenter.z /= Math.max(1, corners.length);
 
-  for (let i = 0; i < corners.length; i++) {
-    const a = corners[i];
-    const b = corners[(i + 1) % corners.length];
+  function appendSegment(a, b, tileKeys = [], createSlots = true, inwardOverride = null) {
     const dx = b.x - a.x;
     const dz = b.z - a.z;
     const len = Math.hypot(dx, dz);
-    if (len <= 1e-6) continue;
+    if (len <= 1e-6) return;
     const count = Math.max(1, Math.round(len / bunkerTileWorldWidth));
     const tx = dx / len;
     const tz = dz / len;
-    const inward = isCCW ? { x: -tz, z: tx } : { x: tz, z: -tx };
+    const inward = inwardOverride || (isCCW ? { x: -tz, z: tx } : { x: tz, z: -tx });
     const segment = {
       index: bunkerWallSegments.length,
       a,
@@ -1851,7 +2088,6 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
       length: len,
       tiles: [],
     };
-    const tileKeys = Array.isArray(layout.segmentTiles?.[i]) ? layout.segmentTiles[i] : [];
     for (let j = 0; j < count; j++) {
       const t0 = j / count;
       const t1 = (j + 1) / count;
@@ -1870,7 +2106,7 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
       };
       segment.tiles.push(tile);
 
-      if (spriteKey === 'ammo') {
+      if (createSlots && spriteKey === 'ammo') {
         slots.push({
           segmentIndex: segment.index,
           tileIndex: j,
@@ -1886,7 +2122,7 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
           baseYaw: yawFromDir(-inward.x, -inward.z),
           label: 'Ammo Crate',
         });
-      } else if (spriteKey !== 'wall' && spriteKey !== 'wall_ammo') {
+      } else if (createSlots && spriteKey !== 'wall' && spriteKey !== 'wall_ammo') {
         slots.push({
           segmentIndex: segment.index,
           tileIndex: j,
@@ -1905,6 +2141,60 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
       }
     }
     bunkerWallSegments.push(segment);
+  }
+
+  for (let i = 0; i < corners.length; i++) {
+    const a = corners[i];
+    const b = corners[(i + 1) % corners.length];
+    const tileKeys = Array.isArray(activeLayout?.segmentTiles?.[i]) ? activeLayout.segmentTiles[i] : [];
+    appendSegment(a, b, tileKeys, true);
+  }
+
+  const interiorWalls = Array.isArray(activeLayout?.interiorWalls) ? activeLayout.interiorWalls : [];
+  for (const wall of interiorWalls) {
+    if (!wall?.from || !wall?.to) continue;
+    const a = {
+      x: WORLD_CENTER_X + wall.from.x * bunkerTileWorldWidth,
+      z: WORLD_CENTER_Z + wall.from.z * bunkerTileWorldWidth,
+    };
+    const b = {
+      x: WORLD_CENTER_X + wall.to.x * bunkerTileWorldWidth,
+      z: WORLD_CENTER_Z + wall.to.z * bunkerTileWorldWidth,
+    };
+    const mx = (a.x + b.x) * 0.5;
+    const mz = (a.z + b.z) * 0.5;
+    const vx = polygonCenter.x - mx;
+    const vz = polygonCenter.z - mz;
+    const vLen = Math.hypot(vx, vz) || 1;
+    const inward = { x: vx / vLen, z: vz / vLen };
+    appendSegment(a, b, wall.tiles || [], false, inward);
+  }
+
+  const interiorWallLoops = Array.isArray(activeLayout?.interiorWallLoops) ? activeLayout.interiorWallLoops : [];
+  for (const loop of interiorWallLoops) {
+    const pts = Array.isArray(loop?.points) ? loop.points : [];
+    if (pts.length < 3) continue;
+    const segmentTiles = Array.isArray(loop.segmentTiles) ? loop.segmentTiles : [];
+    for (let i = 0; i < pts.length; i++) {
+      const p0 = pts[i];
+      const p1 = pts[(i + 1) % pts.length];
+      const a = {
+        x: WORLD_CENTER_X + p0.x * bunkerTileWorldWidth,
+        z: WORLD_CENTER_Z + p0.z * bunkerTileWorldWidth,
+      };
+      const b = {
+        x: WORLD_CENTER_X + p1.x * bunkerTileWorldWidth,
+        z: WORLD_CENTER_Z + p1.z * bunkerTileWorldWidth,
+      };
+      const mx = (a.x + b.x) * 0.5;
+      const mz = (a.z + b.z) * 0.5;
+      const vx = polygonCenter.x - mx;
+      const vz = polygonCenter.z - mz;
+      const vLen = Math.hypot(vx, vz) || 1;
+      const inward = { x: vx / vLen, z: vz / vLen };
+      const tiles = segmentTiles[i] || segmentTiles[0] || ['wall', 'wall'];
+      appendSegment(a, b, tiles, false, inward);
+    }
   }
 
   // Pick a nearby blank wall tile for zombie tally (closest wall tile to ammo crate).
@@ -1935,7 +2225,7 @@ function generateBunkerLayout(layout = BUNKER_LAYOUT) {
   const maxX = Math.max(...xs);
   const minZ = Math.min(...zs);
   const maxZ = Math.max(...zs);
-  const holes = (layout.interiorHoles || []).map((hole) =>
+  const holes = ((activeLayout && activeLayout.interiorHoles) || []).map((hole) =>
     hole.map((p) => ({
       x: WORLD_CENTER_X + p.x * bunkerTileWorldWidth,
       z: WORLD_CENTER_Z + p.z * bunkerTileWorldWidth,
@@ -2608,6 +2898,7 @@ function generateGameParameters(seed = GAME_PARAM_SEED, waveCount = GAME_PARAM_W
     waveCount,
     playerCount: effectivePlayers,
     bunker: {
+      layoutId: currentBunkerLayoutId,
       corners: (bunker.corners ?? []).map((c) => ({ x: +c.x.toFixed(3), z: +c.z.toFixed(3) })),
       segments: bunkerWallSegments.map((s) => ({
         index: s.index,
@@ -3278,7 +3569,7 @@ async function loadAssets() {
   assets.runningSound = new Audio('assets/sfx/clean/boots_running.ogg');
   assets.runningSound.preload = 'auto';
   assets.runningSound.loop = true;
-  generateBunkerLayout();
+  setCurrentBunkerLayout(menuState.matchSettings.bunkerLayoutId);
   const horizonPath = `${base}/${HORIZON_BACKGROUND_PATH}`;
   assets.horizonBackground = await loadImage(horizonPath);
   if (assets.horizonBackground) {
@@ -5958,6 +6249,8 @@ function returnToMainMenu() {
   multiplayerAgreedHash = '';
   multiplayerGameSeed = GAME_PARAM_SEED;
   multiplayerWaveCount = GAME_PARAM_WAVE_COUNT;
+  multiplayerBunkerLayoutId = menuState.matchSettings.bunkerLayoutId || DEFAULT_BUNKER_LAYOUT_ID;
+  setCurrentBunkerLayout(multiplayerBunkerLayoutId);
   multiplayerStartAt = 0;
   pendingLossProposalId = '';
   gameOver = false;

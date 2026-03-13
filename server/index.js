@@ -246,6 +246,7 @@ function sessionSnapshot(session, req) {
     wsUrl: `${publicWsBase(req)}/ws`,
     gameSeed: session.game.seed,
     waveCount: session.game.waveCount,
+    bunkerLayoutId: session.game.bunkerLayoutId || 'l_redoubt',
     agreedHash: session.game.agreedHash || '',
     startedAt: session.game.startedAt || 0,
   };
@@ -970,6 +971,7 @@ function finalizeHandshake(sessionId) {
     sessionId,
     seed: session.game.seed,
     waveCount: session.game.waveCount,
+    bunkerLayoutId: session.game.bunkerLayoutId || 'l_redoubt',
     playerCount: connectedPlayersForSession(sessionId).length,
     agreedHash: session.game.agreedHash,
     startAt: session.game.startedAt,
@@ -1016,6 +1018,7 @@ function createSession(data = {}) {
   const maxPlayers = Math.max(2, Math.min(64, Number(data.maxPlayers) || 8));
   const botsFill = !!data.botsFill;
   const difficulty = ['normal', 'hard', 'nightmare'].includes(data.difficulty) ? data.difficulty : 'normal';
+  const bunkerLayoutId = String(data.bunkerLayoutId || 'l_redoubt').trim() || 'l_redoubt';
   const hostName = sanitizeName(data.playerName || data.hostName);
   const hostPlayerId = randomId('p_');
   const session = {
@@ -1033,6 +1036,7 @@ function createSession(data = {}) {
     game: {
       seed: (crypto.randomBytes(4).readUInt32BE(0) & 0x7fffffff) || 1,
       waveCount: 9,
+      bunkerLayoutId,
       agreedHash: '',
       startedAt: 0,
     },
@@ -1189,6 +1193,7 @@ wss.on('connection', (ws, req) => {
       difficulty: session.difficulty,
       gameSeed: session.game.seed,
       waveCount: session.game.waveCount,
+      bunkerLayoutId: session.game.bunkerLayoutId || 'l_redoubt',
       playerCount: connectedPlayersForSession(sessionId).length,
       agreedHash: session.game.agreedHash || '',
       startedAt: session.game.startedAt || 0,
@@ -1248,6 +1253,7 @@ wss.on('connection', (ws, req) => {
           sessionId,
           seed: session.game.seed,
           waveCount: session.game.waveCount,
+          bunkerLayoutId: session.game.bunkerLayoutId || 'l_redoubt',
           playerCount: connectedPlayersForSession(sessionId).length,
           at: Date.now(),
         });
