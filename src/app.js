@@ -84,29 +84,29 @@ const BUNKER_LAYOUTS = {
       { x: -8, z: 5 },
     ],
     segmentTiles: [
-      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'hole', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'wall'],
       ['wall', 'window'],
-      ['wall', 'window', 'wall', 'door', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'window'],
+      ['wall', 'window', 'wall', 'door', 'wall', 'hole', 'wall', 'window', 'wall', 'wall', 'window', 'window'],
       ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall'],
       ['wall', 'wall', 'window', 'wall'],
       ['wall', 'ammo', 'wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
     ],
   },
-  // Smallest: one door, ammo behind it, no other openings. Tally near crate.
+  // Smallest: 1×1 wall segment square; one door, ammo, no other openings. Tally near crate.
   shooting_gallery: {
     id: 'shooting_gallery',
     name: 'Shooting Gallery',
     unitCorners: [
-      { x: -2, z: -2 },
-      { x: 2, z: -2 },
-      { x: 2, z: 2 },
-      { x: -2, z: 2 },
+      { x: 0, z: 0 },
+      { x: 1, z: 0 },
+      { x: 1, z: 1 },
+      { x: 0, z: 1 },
     ],
     segmentTiles: [
-      ['wall', 'door', 'ammo', 'wall'],
-      ['wall', 'wall', 'wall', 'wall'],
-      ['wall', 'wall', 'wall', 'wall'],
-      ['wall', 'wall', 'wall', 'wall'],
+      ['door'],
+      ['ammo'],
+      ['wall'],
+      ['wall'],
     ],
   },
   // 1×2 units: ammo, tally, 4 openings.
@@ -121,9 +121,9 @@ const BUNKER_LAYOUTS = {
     ],
     segmentTiles: [
       ['window'],
-      ['ammo', 'window'],
+      ['ammo', 'hole'],
       ['window'],
-      ['window', 'wall'],
+      ['hole', 'wall'],
     ],
   },
   // Zigzag: L with another bend the other way (S shape).
@@ -141,11 +141,11 @@ const BUNKER_LAYOUTS = {
       { x: -8, z: 3 },
     ],
     segmentTiles: [
-      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'wall', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'hole', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'wall', 'wall', 'wall'],
       ['wall', 'window'],
-      ['wall', 'window', 'wall', 'door', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'wall', 'window'],
+      ['wall', 'window', 'wall', 'door', 'wall', 'window', 'wall', 'wall', 'hole', 'wall', 'wall', 'window'],
       ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'window'],
-      ['wall', 'window', 'wall', 'window'],
+      ['wall', 'hole', 'wall', 'window'],
       ['wall', 'window'],
       ['wall', 'ammo', 'wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
     ],
@@ -163,9 +163,9 @@ const BUNKER_LAYOUTS = {
     ],
     segmentTiles: [
       ['wall', 'window', 'wall', 'ammo', 'wall', 'wall'],
+      ['wall', 'hole', 'wall', 'window', 'wall', 'wall'],
       ['wall', 'window', 'wall', 'window', 'wall', 'wall'],
-      ['wall', 'window', 'wall', 'window', 'wall', 'wall'],
-      ['wall', 'window', 'wall', 'window', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'hole', 'wall', 'wall'],
       ['wall', 'window', 'wall', 'window', 'wall', 'wall'],
     ],
     interiorWallLoops: [
@@ -203,13 +203,13 @@ const BUNKER_LAYOUTS = {
     ],
     segmentTiles: [
       ['wall', 'window', 'wall', 'wall'],
+      ['wall', 'hole', 'wall', 'wall'],
       ['wall', 'window', 'wall', 'wall'],
       ['wall', 'window', 'wall', 'wall'],
-      ['wall', 'window', 'wall', 'wall'],
-      ['wall', 'ammo', 'wall', 'window', 'wall'],
-      ['wall', 'window', 'wall', 'wall'],
+      ['wall', 'ammo', 'wall', 'hole', 'wall'],
       ['wall', 'window', 'wall', 'wall'],
       ['wall', 'window', 'wall', 'wall'],
+      ['wall', 'hole', 'wall', 'wall'],
     ],
     interiorWallLoops: [
       {
@@ -246,10 +246,10 @@ const BUNKER_LAYOUTS = {
       { x: -7, z: 4 },
     ],
     segmentTiles: [
-      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'window', 'wall'],
-      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'hole', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'window', 'wall'],
+      ['wall', 'window', 'wall', 'window', 'wall', 'hole', 'wall', 'wall'],
       ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'ammo', 'wall'],
-      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
+      ['wall', 'hole', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
     ],
   },
   horseshoe_keep: {
@@ -269,13 +269,13 @@ const BUNKER_LAYOUTS = {
       [{ x: -4, z: -1 }, { x: 2, z: -1 }, { x: 2, z: 4 }, { x: -4, z: 4 }],
     ],
     segmentTiles: [
-      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'window', 'wall'],
+      ['wall', 'window', 'wall', 'window', 'wall', 'hole', 'wall', 'wall', 'window', 'wall', 'window', 'wall'],
       ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
       ['wall', 'window', 'wall'],
-      ['wall', 'door', 'wall', 'window', 'wall'],
+      ['wall', 'door', 'wall', 'hole', 'wall'],
       ['wall', 'window', 'wall', 'window', 'wall', 'window'],
       ['wall', 'door', 'wall', 'window', 'wall'],
-      ['wall', 'window', 'wall'],
+      ['wall', 'hole', 'wall'],
       ['wall', 'window', 'wall', 'window', 'wall', 'ammo', 'wall', 'wall'],
     ],
   },
@@ -314,6 +314,8 @@ const VOICE_MIN_VOLUME_THRESHOLD = 0.2;
 const BUNKER_CRATE_WIDTH = 1.9;
 const BUNKER_CRATE_HEIGHT = 1.15;
 const BUNKER_CRATE_DEPTH = 0.95;
+/** Max distance in wall-segment widths from player to crate to allow reload by pointing at it (e.g. from a nearby window). */
+const BUNKER_CRATE_INTERACT_MAX_SEGMENTS = 1.5;
 const BOARDS_PER_WINDOW = 3;
 const BOARD_PLACE_DURATION = 2.5;
 const BOARD_ATTACK_DURATION = 5;
@@ -2836,14 +2838,14 @@ function isZombiePathOutsideBunker(points) {
   const inside = (x, z) =>
     isPointInsidePolygon(x, z, bunker.corners) &&
     !(bunker.holes || []).some((h) => isPointInsidePolygon(x, z, h));
+  const lastSeg = points.length - 1;
   for (let i = 1; i < points.length; i++) {
+    if (i === lastSeg) continue;
     const a = points[i - 1];
     const b = points[i];
     const segLen = Math.hypot(b.x - a.x, b.z - a.z);
     const steps = Math.max(2, Math.ceil(segLen / 0.2));
     for (let s = 0; s <= steps; s++) {
-      // Ignore exact final endpoint (window center is on wall plane by design).
-      if (i === points.length - 1 && s === steps) continue;
       const t = s / steps;
       const x = a.x + (b.x - a.x) * t;
       const z = a.z + (b.z - a.z) * t;
@@ -3105,11 +3107,11 @@ function clipPolygonToNear(viewPoints) {
   return clipped;
 }
 
-function pushPolygon(polys, points, fill, stroke = null, texture = null) {
+function pushPolygon(polys, points, fill, stroke = null, texture = null, depthBias = 0) {
   const viewPoints = clipPolygonToNear(points.map((p) => worldToView(p.x, p.y, p.z)));
   if (viewPoints.length < 3) return;
   const projected = viewPoints.map(projectViewPoint);
-  const avgDepth = viewPoints.reduce((sum, p) => sum + p.depth, 0) / viewPoints.length;
+  const avgDepth = viewPoints.reduce((sum, p) => sum + p.depth, 0) / viewPoints.length + depthBias;
   polys.push({ projected, avgDepth, fill, stroke, texture });
 }
 
@@ -3505,6 +3507,15 @@ function getCrateAABB() {
     minY: BUNKER_FLOOR_Y, maxY: BUNKER_FLOOR_Y + BUNKER_CRATE_HEIGHT,
     minZ: centerZ - halfZ, maxZ: centerZ + halfZ,
   };
+}
+
+function isWithinCrateInteractRange() {
+  const box = getCrateAABB();
+  if (!box) return false;
+  const cx = (box.minX + box.maxX) * 0.5;
+  const cz = (box.minZ + box.maxZ) * 0.5;
+  const maxDist = bunkerTileWorldWidth * BUNKER_CRATE_INTERACT_MAX_SEGMENTS;
+  return Math.hypot(cameraX - cx, cameraZ - cz) <= maxDist;
 }
 
 function isReticuleOnCrate(px, py) {
@@ -5515,9 +5526,10 @@ function drawBunkerInterior(outItems = null) {
   const crateTop = '#8e6944';
 
   // Draw floor/ceiling from actual bunker polygon (not AABB), so concave layouts keep open courtyards.
+  // Bias floor depth so ceiling is always drawn on top (visible from inside when looking up).
   const floorPoly = (bunker.corners ?? []).map((p) => ({ x: p.x, y: BUNKER_FLOOR_Y, z: p.z }));
   const ceilingPoly = (bunker.corners ?? []).slice().reverse().map((p) => ({ x: p.x, y: BUNKER_WALL_HEIGHT, z: p.z }));
-  if (floorPoly.length >= 3) pushPolygon(backgroundPolys, floorPoly, floorColor);
+  if (floorPoly.length >= 3) pushPolygon(backgroundPolys, floorPoly, floorColor, null, null, 1e4);
   if (ceilingPoly.length >= 3) pushPolygon(backgroundPolys, ceilingPoly, ceilingColor);
 
   function pushWallTile(segment, tile) {
@@ -5733,7 +5745,7 @@ function drawRifle(dt) {
   const ro = getReticuleOffset();
   const reticulePx = W / 2 + ro.x;
   const reticulePy = H / 2 + ro.y;
-  const pointingAtCrate = getCurrentBunkerSlot()?.type === 'crate' && isReticuleOnCrate(reticulePx, reticulePy);
+  const pointingAtCrate = isReticuleOnCrate(reticulePx, reticulePy) && isWithinCrateInteractRange();
   const GUN_LOWERED_OFFSET_Y = 140;
   let rifleShiftX = (ro.x + RETICULE_CLAMP_X) * GUN_PX_PER_RETICULE_PX;
   let rifleShiftY = (ro.y + RETICULE_CLAMP_Y) * GUN_PX_PER_RETICULE_PX_Y;
@@ -5806,13 +5818,6 @@ function drawRifle(dt) {
 const FONT_FAMILY = 'Zpix';
 const FONT_SIZE = 24;  // multiples of 12 for pixel font
 
-function drawScore() {
-  ctx.fillStyle = '#aaa';
-  ctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
-  ctx.fillText(`Score: ${score}`, 12, FONT_SIZE + 4);
-  ctx.fillText(`Clips: ${clipsCarried}/${MAX_CLIPS}`, 12, FONT_SIZE * 2 + 4);
-}
-
 function drawOutOfAmmoMessage() {
   if (outOfAmmoMessageTime <= 0) return;
   const alpha = Math.min(1, outOfAmmoMessageTime * 2);
@@ -5837,22 +5842,13 @@ function drawUpgradeMessage() {
   ctx.textAlign = 'left';
 }
 
-function drawPositionLabel() {
-  const slot = getCurrentBunkerSlot();
-  if (!slot) return;
-  ctx.fillStyle = '#aaa';
-  ctx.font = `${Math.floor(FONT_SIZE * 0.7)}px ${FONT_FAMILY}`;
-  const label = slot.type === 'crate' ? 'Ammo Crate' : (slot.label || `Window ${slot.segmentIndex ?? '?'}-${(slot.tileIndex ?? 0) + 1}`);
-  ctx.fillText(label, 12, FONT_SIZE * 2 + 22);
-}
-
 function drawReticule() {
   if (!pointerLocked) return;
   const ro = getReticuleOffset();
   const cx = Math.round(W / 2 + ro.x);
   const cy = Math.round(H / 2 + ro.y);
   const slot = getCurrentBunkerSlot();
-  const pointingAtCrate = slot?.type === 'crate' && isReticuleOnCrate(cx, cy);
+  const pointingAtCrate = isReticuleOnCrate(cx, cy) && isWithinCrateInteractRange();
   const pointingAtBoardStack = !boardPlaceState && slot?.type === 'window' && isReticuleOnBoardStack(cx, cy);
 
   if (pointingAtCrate) {
@@ -6427,8 +6423,6 @@ function draw() {
   drawReticule();
   drawRunTargetArrow();
   drawBrokenBoardAlerts();
-  drawScore();
-  drawPositionLabel();
   drawOutOfAmmoMessage();
   drawUpgradeMessage();
   if (gameOver) drawGameOver();
@@ -6564,7 +6558,7 @@ canvas.addEventListener('click', (e) => {
   const px = W / 2 + ro.x;
   const py = H / 2 + ro.y;
   const slot = getCurrentBunkerSlot();
-  const pointingAtCrate = slot?.type === 'crate' && isReticuleOnCrate(px, py);
+  const pointingAtCrate = isReticuleOnCrate(px, py) && isWithinCrateInteractRange();
   const pointingAtBoardStack = slot?.type === 'window' && isReticuleOnBoardStack(px, py);
 
   if (pointingAtBoardStack) {
@@ -6587,9 +6581,10 @@ canvas.addEventListener('click', (e) => {
     outOfAmmoShownCrateHint = false;
     playPickUpSound();
     clipsCarried = MAX_CLIPS;
+    const crateSlot = bunkerSlots.find((s) => s.type === 'crate');
     sendMultiplayerPayload('player_ammo_pickup', {
       slotIndex: activeSlotIndex,
-      slotKey: slot ? getSlotKey(slot) : '',
+      slotKey: crateSlot ? getSlotKey(crateSlot) : '',
       clipsCarried,
       at: Date.now(),
     });

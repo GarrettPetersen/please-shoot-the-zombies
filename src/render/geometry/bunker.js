@@ -16,9 +16,20 @@
   }
 
   function makeCeilingGeometry(THREE, corners, y) {
-    const g = new THREE.ShapeGeometry(makeBunkerShape(THREE, corners));
+    const reversed = Array.isArray(corners) ? [...corners].reverse() : [];
+    const g = new THREE.ShapeGeometry(makeBunkerShape(THREE, reversed));
     g.rotateX(Math.PI / 2);
     g.translate(0, y, 0);
+    const index = g.index;
+    if (index) {
+      const arr = index.array;
+      for (let i = 0; i < arr.length; i += 3) {
+        const a = arr[i];
+        arr[i] = arr[i + 2];
+        arr[i + 2] = a;
+      }
+      index.needsUpdate = true;
+    }
     return g;
   }
 

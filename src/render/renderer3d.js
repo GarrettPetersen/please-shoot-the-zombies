@@ -207,7 +207,8 @@
         floorboardsTex.wrapS = floorboardsTex.wrapT = THREE.RepeatWrapping;
         const extentX = bunker.maxX - bunker.minX;
         const extentZ = bunker.maxZ - bunker.minZ;
-        floorboardsTex.repeat.set(Math.max(1, extentX / (this.state.bunkerTileWorldWidth || 1)), Math.max(1, extentZ / (this.state.bunkerTileWorldWidth || 1)));
+        const tileW = this.state.bunkerTileWorldWidth || 1;
+        floorboardsTex.repeat.set(Math.max(1, extentX / tileW), Math.max(1, extentZ / tileW));
         const panelMat = new THREE.MeshBasicMaterial({
           map: floorboardsTex,
           side: THREE.DoubleSide,
@@ -217,7 +218,7 @@
         const floorGeom = BunkerGeometry3D.makeFloorGeometry(THREE, cornersForShape, floorY - 0.01);
         const floorMesh = new THREE.Mesh(floorGeom, panelMat);
         this.staticGroup.add(floorMesh);
-        const ceilGeom = BunkerGeometry3D.makeCeilingGeometry(THREE, cornersForShape, ceilY + 0.01);
+        const ceilGeom = BunkerGeometry3D.makeFloorGeometry(THREE, cornersForShape, ceilY + 0.01);
         const ceilMesh = new THREE.Mesh(ceilGeom, panelMat);
         this.staticGroup.add(ceilMesh);
       }
