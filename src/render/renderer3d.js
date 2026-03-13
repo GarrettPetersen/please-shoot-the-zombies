@@ -200,33 +200,26 @@
       const isInsideBunker = this.state.isInsideBunker;
       const floorY = this.state.BUNKER_FLOOR_Y;
       const ceilY = this.state.BUNKER_WALL_HEIGHT;
-      const panelSize = this.state.bunkerTileWorldWidth || 1;
       const floorboardsImg = this.assets?.floorboardsTiled;
-      if (bunker && isInsideBunker && floorboardsImg?.naturalWidth) {
+      const BunkerGeometry3D = window.BunkerGeometry3D;
+      if (bunker && bunker.corners && bunker.corners.length >= 3 && BunkerGeometry3D && floorboardsImg?.naturalWidth) {
         const floorboardsTex = this._makeTexture(floorboardsImg);
         floorboardsTex.wrapS = floorboardsTex.wrapT = THREE.RepeatWrapping;
-        floorboardsTex.repeat.set(1, 1);
+        const extentX = bunker.maxX - bunker.minX;
+        const extentZ = bunker.maxZ - bunker.minZ;
+        floorboardsTex.repeat.set(Math.max(1, extentX / (this.state.bunkerTileWorldWidth || 1)), Math.max(1, extentZ / (this.state.bunkerTileWorldWidth || 1)));
         const panelMat = new THREE.MeshBasicMaterial({
           map: floorboardsTex,
           side: THREE.DoubleSide,
           depthWrite: true,
         });
-        const panelGeom = new THREE.PlaneGeometry(panelSize, panelSize);
-        for (let x = bunker.minX; x < bunker.maxX; x += panelSize) {
-          for (let z = bunker.minZ; z < bunker.maxZ; z += panelSize) {
-            const cx = x + panelSize * 0.5;
-            const cz = z + panelSize * 0.5;
-            if (!isInsideBunker(cx, cz)) continue;
-            const floorMesh = new THREE.Mesh(panelGeom, panelMat);
-            floorMesh.rotation.x = -Math.PI / 2;
-            floorMesh.position.set(cx, floorY - 0.01, cz);
-            this.staticGroup.add(floorMesh);
-            const ceilMesh = new THREE.Mesh(panelGeom, panelMat);
-            ceilMesh.rotation.x = Math.PI / 2;
-            ceilMesh.position.set(cx, ceilY + 0.01, cz);
-            this.staticGroup.add(ceilMesh);
-          }
-        }
+        const cornersForShape = bunker.corners.map((c) => ({ x: c.x, z: -c.z }));
+        const floorGeom = BunkerGeometry3D.makeFloorGeometry(THREE, cornersForShape, floorY - 0.01);
+        const floorMesh = new THREE.Mesh(floorGeom, panelMat);
+        this.staticGroup.add(floorMesh);
+        const ceilGeom = BunkerGeometry3D.makeCeilingGeometry(THREE, cornersForShape, ceilY + 0.01);
+        const ceilMesh = new THREE.Mesh(ceilGeom, panelMat);
+        this.staticGroup.add(ceilMesh);
       }
 
       for (const segment of this.state.bunkerWallSegments) {
@@ -280,6 +273,7 @@
       }
 
       const crate = this.state.getCrateAABB?.();
+      const crateSlot = this.state.bunkerSlots?.find((s) => s.type === 'crate');
       if (crate) {
         const cw = Math.max(0.05, crate.maxX - crate.minX);
         const ch = Math.max(0.05, crate.maxY - crate.minY);
@@ -301,10 +295,14 @@
         ];
         const cmesh = new THREE.Mesh(cgeom, mats);
         cmesh.position.set((crate.minX + crate.maxX) * 0.5, (crate.minY + crate.maxY) * 0.5, (crate.minZ + crate.maxZ) * 0.5);
+        if (crateSlot && (crateSlot.normal?.x !== 0 || crateSlot.normal?.z !== 0)) {
+          cmesh.rotation.y = Math.atan2(crateSlot.normal.x, crateSlot.normal.z);
+        }
         this.staticGroup.add(cmesh);
 
         const cc = new THREE.Mesh(cgeom.clone(), new THREE.MeshBasicMaterial({ visible: false }));
         cc.position.copy(cmesh.position);
+        cc.rotation.copy(cmesh.rotation);
         cc.userData = { kind: 'crate' };
         this.staticGroup.add(cc);
         this.raycastStatic.push(cc);

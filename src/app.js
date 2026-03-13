@@ -86,7 +86,7 @@ const BUNKER_LAYOUTS = {
     segmentTiles: [
       ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'wall'],
       ['wall', 'window'],
-      ['wall', 'window', 'wall', 'door', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall'],
+      ['wall', 'window', 'wall', 'door', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'window'],
       ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall'],
       ['wall', 'wall', 'window', 'wall'],
       ['wall', 'ammo', 'wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
@@ -143,8 +143,8 @@ const BUNKER_LAYOUTS = {
     segmentTiles: [
       ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'wall', 'wall', 'wall'],
       ['wall', 'window'],
-      ['wall', 'window', 'wall', 'door', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'wall', 'wall'],
-      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'door', 'wall', 'window', 'wall', 'wall', 'window', 'wall', 'wall', 'window'],
+      ['wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'window'],
       ['wall', 'window', 'wall', 'window'],
       ['wall', 'window'],
       ['wall', 'ammo', 'wall', 'window', 'wall', 'window', 'wall', 'window', 'wall', 'wall'],
@@ -412,6 +412,7 @@ const WAVE_HOT_SEGMENT_WEIGHT = 0.16;
 const ZOMBIE_COUNT_MULTIPLIER = 20;
 const ZOMBIE_MIN_PATH_LENGTH = 46;
 const TREE_BLOCK_RADIUS = 0.9;
+const TREE_MIN_DIST_FROM_BUNKER = 5; // world units; keep trees far enough so branches don't encroach inside
 
 let assets = {};
 let score = 0;
@@ -1582,10 +1583,20 @@ function getMenuPageDefinition() {
     subtitle: t('subtitleMain'),
     items: [
       {
+        label: `${t('bunker')}: ${getBunkerLayoutName(menuState.matchSettings.bunkerLayoutId)}`,
+        onSelect: () => {
+          const opts = getBunkerLayoutOptions().map((b) => b.id);
+          menuState.matchSettings.bunkerLayoutId = cycleValue(opts, menuState.matchSettings.bunkerLayoutId, 1);
+          setCurrentBunkerLayout(menuState.matchSettings.bunkerLayoutId);
+        },
+      },
+      {
         label: t('startLocal'),
         onSelect: () => {
+          const layoutId = menuState.matchSettings.bunkerLayoutId;
+          setCurrentBunkerLayout(layoutId);
           showMenuToast(t('statusStartingLocal'), 0.8);
-          startLocalGame();
+          startLocalGame({ bunkerLayoutId: layoutId });
           canvas.requestPointerLock();
         },
       },
@@ -2024,12 +2035,21 @@ function generateTrees() {
   }
   const rng = createSeededRng(GAME_PARAM_SEED);
   for (let i = 0; i < TREE_COUNT; i++) {
-    const dist = TREE_MIN_DIST + rng() * (TREE_MAX_DIST - TREE_MIN_DIST);
-    const angle = rng() * Math.PI * 2;
-    const x = WORLD_CENTER_X + Math.cos(angle) * dist;
-    const z = WORLD_CENTER_Z + Math.sin(angle) * dist;
-    const spriteIndex = Math.floor(rng() * 14);
-    trees.push({ id: nextTreeId++, x, z, spriteIndex, hp: TREE_HP });
+    let placed = false;
+    for (let tries = 0; tries < 80 && !placed; tries++) {
+      const dist = TREE_MIN_DIST + rng() * (TREE_MAX_DIST - TREE_MIN_DIST);
+      const angle = rng() * Math.PI * 2;
+      const x = WORLD_CENTER_X + Math.cos(angle) * dist;
+      const z = WORLD_CENTER_Z + Math.sin(angle) * dist;
+      if (bunker?.corners?.length >= 3) {
+        if (isPointInsidePolygon(x, z, bunker.corners)) continue;
+        if ((bunker.holes || []).some((h) => isPointInsidePolygon(x, z, h))) continue;
+        if (distanceFromPointToPolygon(x, z, bunker.corners) < TREE_MIN_DIST_FROM_BUNKER) continue;
+      }
+      const spriteIndex = Math.floor(rng() * 14);
+      trees.push({ id: nextTreeId++, x, z, spriteIndex, hp: TREE_HP });
+      placed = true;
+    }
   }
 }
 
@@ -2748,6 +2768,16 @@ function distancePointToSegment(px, pz, ax, az, bx, bz) {
   return Math.hypot(px - qx, pz - qz);
 }
 
+function distanceFromPointToPolygon(px, pz, corners) {
+  if (!corners?.length) return Infinity;
+  let d = Infinity;
+  for (let i = 0, j = corners.length - 1; i < corners.length; j = i++) {
+    const dseg = distancePointToSegment(px, pz, corners[i].x, corners[i].z, corners[j].x, corners[j].z);
+    d = Math.min(d, dseg);
+  }
+  return d;
+}
+
 function isPointInsidePolygon(x, z, corners) {
   let inside = false;
   for (let i = 0, j = corners.length - 1; i < corners.length; j = i++) {
@@ -2918,6 +2948,8 @@ function generateGameParameters(seed = GAME_PARAM_SEED, waveCount = GAME_PARAM_W
       const x = WORLD_CENTER_X + Math.cos(angle) * dist;
       const z = WORLD_CENTER_Z + Math.sin(angle) * dist;
       if (isPointInsidePolygon(x, z, bunker.corners)) continue;
+      if ((bunker.holes || []).some((h) => isPointInsidePolygon(x, z, h))) continue;
+      if (distanceFromPointToPolygon(x, z, bunker.corners) < TREE_MIN_DIST_FROM_BUNKER) continue;
       if (params.trees.some((t) => Math.hypot(t.x - x, t.z - z) < TREE_BLOCK_RADIUS * 2.5)) continue;
       params.trees.push({ x: +x.toFixed(3), z: +z.toFixed(3), spriteIndex: Math.floor(rng() * 14), hp: TREE_HP });
       placed = true;
@@ -5533,16 +5565,33 @@ function drawBunkerInterior(outItems = null) {
 
   const crateSlot = bunkerSlots.find((slot) => slot.type === 'crate');
   if (crateSlot) {
-    const crateBox = getCrateAABB();
-    if (!crateBox) return;
-    const crateMinX = crateBox.minX;
-    const crateMaxX = crateBox.maxX;
-    const crateMinZ = crateBox.minZ;
-    const crateMaxZ = crateBox.maxZ;
+    const n = crateSlot.normal ?? { x: 0, z: 1 };
+    const t = crateSlot.tangent ?? { x: 1, z: 0 };
+    const wallX = crateSlot.wallX ?? crateSlot.x;
+    const wallZ = crateSlot.wallZ ?? crateSlot.z;
+    const inset = 0.08;
+    const halfW = BUNKER_CRATE_WIDTH / 2;
     const crateY0 = BUNKER_FLOOR_Y;
     const crateY1 = BUNKER_FLOOR_Y + BUNKER_CRATE_HEIGHT;
+    const backCx = wallX + n.x * inset;
+    const backCz = wallZ + n.z * inset;
+    const frontCx = wallX + n.x * (inset + BUNKER_CRATE_DEPTH);
+    const frontCz = wallZ + n.z * (inset + BUNKER_CRATE_DEPTH);
+    const blX = backCx - t.x * halfW;
+    const blZ = backCz - t.z * halfW;
+    const brX = backCx + t.x * halfW;
+    const brZ = backCz + t.z * halfW;
+    const flX = frontCx - t.x * halfW;
+    const flZ = frontCz - t.z * halfW;
+    const frX = frontCx + t.x * halfW;
+    const frZ = frontCz + t.z * halfW;
+    const pt = (xx, yy, zz) => ({ x: xx, y: yy, z: zz });
+    const frontFace = { points: [pt(flX, crateY0, flZ), pt(frX, crateY0, frZ), pt(frX, crateY1, frZ), pt(flX, crateY1, flZ)], normal: n, fill: crateFront };
+    const backFace = { points: [pt(brX, crateY0, brZ), pt(blX, crateY0, blZ), pt(blX, crateY1, blZ), pt(brX, crateY1, brZ)], normal: { x: -n.x, z: -n.z }, fill: crateSide };
+    const leftFace = { points: [pt(blX, crateY0, blZ), pt(flX, crateY0, flZ), pt(flX, crateY1, flZ), pt(blX, crateY1, blZ)], normal: { x: -t.x, z: -t.z }, fill: crateSide };
+    const rightFace = { points: [pt(frX, crateY0, frZ), pt(brX, crateY0, brZ), pt(brX, crateY1, brZ), pt(frX, crateY1, frZ)], normal: t, fill: crateSide };
+    const topFace = { points: [pt(flX, crateY1, flZ), pt(frX, crateY1, frZ), pt(brX, crateY1, brZ), pt(blX, crateY1, blZ)], fill: crateTop };
     const crateSheet = assets.crateSpriteSheet;
-    // Crate sprite sheet: 4 columns x 5 rows. Row 0=front, 1=left, 2=right, 3=back, 4=top.
     let crateTexFront, crateTexLeft, crateTexRight, crateTexBack, crateTexTop;
     if (crateSheet) {
       const w = crateSheet.naturalWidth || crateSheet.width;
@@ -5556,71 +5605,22 @@ function drawBunkerInterior(outItems = null) {
       crateTexBack = tex(0, 3);
       crateTexTop = tex(0, 4);
     }
-    const crateCenterX = (crateMinX + crateMaxX) * 0.5;
-    const crateCenterZ = (crateMinZ + crateMaxZ) * 0.5;
-    const cameraOnEast = cameraX >= crateCenterX;
-    const cameraOnSouth = cameraZ >= crateCenterZ;
-    // For this axis-aligned box, draw only camera-facing vertical faces (+ top) to prevent far-face popping.
-    const visibleFaces = [];
-    visibleFaces.push(cameraOnSouth
-      ? {
-          points: [
-            { x: crateMinX, y: crateY0, z: crateMaxZ },
-            { x: crateMaxX, y: crateY0, z: crateMaxZ },
-            { x: crateMaxX, y: crateY1, z: crateMaxZ },
-            { x: crateMinX, y: crateY1, z: crateMaxZ },
-          ],
-          tex: crateTexFront,
-          fill: crateFront,
-        }
-      : {
-          points: [
-            { x: crateMinX, y: crateY0, z: crateMinZ },
-            { x: crateMaxX, y: crateY0, z: crateMinZ },
-            { x: crateMaxX, y: crateY1, z: crateMinZ },
-            { x: crateMinX, y: crateY1, z: crateMinZ },
-          ],
-          tex: crateTexBack,
-          fill: crateSide,
-        });
-    visibleFaces.push(cameraOnEast
-      ? {
-          points: [
-            { x: crateMaxX, y: crateY0, z: crateMinZ },
-            { x: crateMaxX, y: crateY0, z: crateMaxZ },
-            { x: crateMaxX, y: crateY1, z: crateMaxZ },
-            { x: crateMaxX, y: crateY1, z: crateMinZ },
-          ],
-          tex: crateTexRight,
-          fill: crateSide,
-        }
-      : {
-          points: [
-            { x: crateMinX, y: crateY0, z: crateMaxZ },
-            { x: crateMinX, y: crateY0, z: crateMinZ },
-            { x: crateMinX, y: crateY1, z: crateMinZ },
-            { x: crateMinX, y: crateY1, z: crateMaxZ },
-          ],
-          tex: crateTexLeft,
-          fill: crateSide,
-        });
-    // Draw top after the farthest visible vertical face, before nearest one.
-    const crateTopPoly = {
-      points: [
-        { x: crateMinX, y: crateY1, z: crateMinZ },
-        { x: crateMaxX, y: crateY1, z: crateMinZ },
-        { x: crateMaxX, y: crateY1, z: crateMaxZ },
-        { x: crateMinX, y: crateY1, z: crateMaxZ },
-      ],
-      tex: crateTexTop,
-      fill: crateTop,
-    };
+    frontFace.tex = crateTexFront;
+    backFace.tex = crateTexBack;
+    leftFace.tex = crateTexLeft;
+    rightFace.tex = crateTexRight;
+    topFace.tex = crateTexTop;
+    const vertFaces = [frontFace, backFace, leftFace, rightFace];
+    const toCamX = cameraX - (frontCx + backCx) * 0.5;
+    const toCamZ = cameraZ - (frontCz + backCz) * 0.5;
+    const visible = vertFaces.filter((f) => f.normal && (toCamX * f.normal.x + toCamZ * f.normal.z) > 0);
     const crateFacePolys = [];
-    pushPolygon(crateFacePolys, visibleFaces[0].points, visibleFaces[0].fill, '#3f2b1b', visibleFaces[0].tex);
-    pushPolygon(crateFacePolys, visibleFaces[1].points, visibleFaces[1].fill, '#3f2b1b', visibleFaces[1].tex);
+    for (const face of visible) {
+      pushPolygon(crateFacePolys, face.points, face.fill, '#3f2b1b', face.tex);
+    }
     crateFacePolys.sort((a, b) => b.avgDepth - a.avgDepth);
     if (crateFacePolys[0]) polys.push(crateFacePolys[0]);
-    pushPolygon(polys, crateTopPoly.points, crateTopPoly.fill, '#3f2b1b', crateTopPoly.tex);
+    pushPolygon(polys, topFace.points, topFace.fill, '#3f2b1b', topFace.tex);
     if (crateFacePolys[1]) polys.push(crateFacePolys[1]);
   }
 
@@ -6182,18 +6182,47 @@ function drawMenu() {
   }
 }
 
+function wrapTextToWidth(text, maxWidth) {
+  const words = text.split(/\s+/);
+  const lines = [];
+  let line = '';
+  for (const word of words) {
+    const candidate = line ? `${line} ${word}` : word;
+    const width = ctx.measureText(candidate).width;
+    if (width <= maxWidth) {
+      line = candidate;
+    } else {
+      if (line) lines.push(line);
+      line = word;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
 function drawHint() {
   if (pointerLocked) return;
   ctx.fillStyle = 'rgba(0,0,0,0.7)';
   ctx.fillRect(0, 0, W, H);
   ctx.fillStyle = '#fff';
-  ctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
   ctx.textAlign = 'center';
-  ctx.fillText('Click to lock mouse and play', W / 2, H / 2);
+  const maxW = W - 48;
+  const lineHeight = 22;
+  let y = H / 2 - lineHeight;
+  ctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
+  for (const line of wrapTextToWidth('Click to lock mouse and play', maxW)) {
+    ctx.fillText(line, W / 2, y);
+    y += lineHeight;
+  }
   ctx.font = `${Math.floor(FONT_SIZE * 0.65)}px ${FONT_FAMILY}`;
-  ctx.fillText('Move between windows with A/D or Left/Right', W / 2, H / 2 + 26);
-  ctx.font = `${Math.floor(FONT_SIZE * 0.65)}px ${FONT_FAMILY}`;
-  ctx.fillText('Look at a window/crate and click or press W/Up to run there', W / 2, H / 2 + 48);
+  for (const line of wrapTextToWidth('Move between windows with A/D or Left/Right', maxW)) {
+    ctx.fillText(line, W / 2, y);
+    y += lineHeight;
+  }
+  for (const line of wrapTextToWidth('Look at a window/crate and click or press W/Up to run there', maxW)) {
+    ctx.fillText(line, W / 2, y);
+    y += lineHeight;
+  }
   ctx.textAlign = 'left';
 }
 
