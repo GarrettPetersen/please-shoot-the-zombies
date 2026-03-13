@@ -28,18 +28,24 @@ const BOT_ADD_MAX_MS = 11000;
 const BOT_THINK_INTERVAL_MS = 220;
 const BOT_ACTION_DELAY_MIN_MS = 320;
 const BOT_ACTION_DELAY_MAX_MS = 1200;
-const BOT_POST_MOVE_HOLD_MS = 2400; // longer pause after arriving before moving again
-const BOT_MOVE_COOLDOWN_MIN_MS = 1800;
-const BOT_MOVE_COOLDOWN_MAX_MS = 2800;
+const BOT_POST_MOVE_HOLD_MS = 4200; // linger longer at each location
+const BOT_MOVE_COOLDOWN_MIN_MS = 2400;
+const BOT_MOVE_COOLDOWN_MAX_MS = 3600;
 const BOT_RELOAD_MS = 2100;
 const BOT_BOARD_MS = 2400;
 const BOT_EJECT_MS = 320;
+const BOT_AIM_NEW_TARGET_MIN_MS = 1700;
+const BOT_AIM_NEW_TARGET_MAX_MS = 2600;
+const BOT_AIM_SAME_TARGET_MIN_MS = 450;
+const BOT_AIM_SAME_TARGET_MAX_MS = 900;
 const BOT_MAX_CLIPS = 10;
 const BOT_CLIP_SIZE = 5;
 const BOT_SLOT_COUNT = 13; // 12 windows + 1 crate slot
 const BOT_CRATE_SLOT = 12;
 const BOT_WINDOW_SLOTS = Array.from({ length: 12 }, (_, i) => i);
 const SERVER_ZOMBIE_COUNT_MULTIPLIER = 10;
+const BOT_VIEW_CONE_SLOT_RADIUS = 2;
+const BOT_BROKEN_BOARD_PRIORITY_MS = 7000;
 
 function overloadError() {
   return 'Server is overloaded right now. Please wait a minute and try again.';
@@ -168,7 +174,24 @@ function makeBotRuntimePlayer(slotIndex = 0) {
     moveCooldownUntil: 0,
     holdSlotUntil: 0,
     recentSlots: [slotIndex],
+    aimTargetZombieId: -1,
+    aimReadyAt: 0,
+    lastShotZombieId: -1,
+    // Per-bot pregame profile so accuracy naturally varies.
+    baseAccuracy: 0.75,
+    baseHeadshotChance: 0.22,
+    baseAimSpread: 0.08,
   };
+}
+
+function hashToUnit(str) {
+  const s = String(str || '');
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) / 0xffffffff;
 }
 
 function slotOccupancyCounts(session) {
@@ -283,6 +306,10 @@ function ensureRuntime(session) {
     startedAt: 0,
     zombies,
     boards: new Map(BOT_WINDOW_SLOTS.map((s) => [s, 0])),
+    recentBrokenUntil: new Map(), // slot -> timestamp(ms) until considered "recently broken"
+    windowSlots: new Set(BOT_WINDOW_SLOTS),
+    crateSlot: BOT_CRATE_SLOT,
+    maxObservedSlot: BOT_SLOT_COUNT - 1,
     playerState: new Map(), // playerId -> runtime state
     nextBotAddAt: Date.now() + randInt(BOT_ADD_MIN_MS, BOT_ADD_MAX_MS),
     lastTickAt: Date.now(),
@@ -294,7 +321,16 @@ function ensurePlayerRuntimeState(session, player) {
   const rt = ensureRuntime(session);
   if (!rt.playerState.has(player.playerId)) {
     const slot = BOT_WINDOW_SLOTS[Math.floor(Math.random() * BOT_WINDOW_SLOTS.length)];
-    rt.playerState.set(player.playerId, makeBotRuntimePlayer(slot));
+    const st = makeBotRuntimePlayer(slot);
+    if (player?.isBot) {
+      const u1 = hashToUnit(`${player.playerId}:acc`);
+      const u2 = hashToUnit(`${player.playerId}:head`);
+      const u3 = hashToUnit(`${player.playerId}:aim`);
+      st.baseAccuracy = 0.62 + u1 * 0.26; // 62%-88%
+      st.baseHeadshotChance = 0.10 + u2 * 0.26; // 10%-36%
+      st.baseAimSpread = 0.06 + u3 * 0.14; // tighter to wider
+    }
+    rt.playerState.set(player.playerId, st);
   }
   return rt.playerState.get(player.playerId);
 }
@@ -381,6 +417,52 @@ function slotDistance(a, b) {
   return Math.abs(a - b);
 }
 
+function rememberObservedSlot(rt, slot) {
+  if (!Number.isFinite(slot)) return;
+  const s = Math.max(0, Math.floor(slot));
+  rt.maxObservedSlot = Math.max(rt.maxObservedSlot || 0, s);
+}
+
+function getBotCrateSlot(rt) {
+  return Number.isFinite(rt?.crateSlot) ? Math.floor(rt.crateSlot) : BOT_CRATE_SLOT;
+}
+
+function getBotWindowSlots(rt) {
+  if (!rt?.windowSlots || rt.windowSlots.size === 0) return BOT_WINDOW_SLOTS.slice();
+  const crate = getBotCrateSlot(rt);
+  return Array.from(rt.windowSlots)
+    .filter((s) => Number.isFinite(s))
+    .map((s) => Math.max(0, Math.floor(s)))
+    .filter((s) => s !== crate)
+    .sort((a, b) => a - b);
+}
+
+function circularWindowDistance(windowSlots, a, b) {
+  const idxA = windowSlots.indexOf(a);
+  const idxB = windowSlots.indexOf(b);
+  if (idxA < 0 || idxB < 0 || windowSlots.length < 2) return Math.abs(a - b);
+  const d = Math.abs(idxA - idxB);
+  return Math.min(d, windowSlots.length - d);
+}
+
+function zombieRangeScore(state, z, windowSlots, elapsed) {
+  const slotDist = circularWindowDistance(windowSlots, state.slotIndex, z.targetSlot);
+  const slotNorm = Math.max(0, Math.min(1, slotDist / Math.max(1, BOT_VIEW_CONE_SLOT_RADIUS)));
+  const timeToBreach = Math.max(0, (z.breachAt || 0) - elapsed);
+  const timeNorm = Math.max(0, Math.min(1, (timeToBreach - 2) / 18));
+  return Math.max(slotNorm * 0.85, timeNorm);
+}
+
+function canBotSeeZombieFromSlot(state, z, windowSlots, elapsed) {
+  const slotDist = circularWindowDistance(windowSlots, state.slotIndex, z.targetSlot);
+  if (slotDist > BOT_VIEW_CONE_SLOT_RADIUS) return false;
+  if (slotDist > 0) {
+    const timeToBreach = Math.max(0, (z.breachAt || 0) - elapsed);
+    if (timeToBreach > 20) return false;
+  }
+  return true;
+}
+
 function updateRuntimeFromHumanAction(session, playerId, msg) {
   const player = session.players.get(playerId);
   if (!player) return;
@@ -388,23 +470,58 @@ function updateRuntimeFromHumanAction(session, playerId, msg) {
   const rt = ensureRuntime(session);
   if (msg.type === 'player_move') {
     const next = Number(msg.toSlotIndex);
-    if (Number.isFinite(next)) state.slotIndex = Math.max(0, Math.min(BOT_SLOT_COUNT - 1, Math.floor(next)));
+    if (Number.isFinite(next)) {
+      state.slotIndex = Math.max(0, Math.floor(next));
+      rememberObservedSlot(rt, state.slotIndex);
+    }
     return;
   }
   if (msg.type === 'player_ammo_pickup') {
+    const slot = Number(msg.slotIndex);
+    if (Number.isFinite(slot)) {
+      rt.crateSlot = Math.max(0, Math.floor(slot));
+      rememberObservedSlot(rt, rt.crateSlot);
+      if (!rt.windowSlots) rt.windowSlots = new Set(BOT_WINDOW_SLOTS);
+      rt.windowSlots.delete(rt.crateSlot);
+    }
     state.clipsCarried = BOT_MAX_CLIPS;
     return;
   }
   if (msg.type === 'player_board_complete') {
     const slot = Number(msg.slotIndex);
     const key = Number.isFinite(slot) ? Math.floor(slot) : -1;
-    if (rt.boards.has(key)) rt.boards.set(key, Math.min(3, (rt.boards.get(key) || 0) + 1));
+    if (key >= 0) {
+      rememberObservedSlot(rt, key);
+      if (!rt.windowSlots) rt.windowSlots = new Set(BOT_WINDOW_SLOTS);
+      rt.windowSlots.add(key);
+      if (key !== rt.crateSlot && !rt.boards.has(key)) rt.boards.set(key, 0);
+    }
+    if (rt.boards.has(key)) {
+      rt.boards.set(key, Math.min(3, (rt.boards.get(key) || 0) + 1));
+      if ((rt.boards.get(key) || 0) >= 3 && rt.recentBrokenUntil) rt.recentBrokenUntil.delete(key);
+    }
+    return;
+  }
+  if (msg.type === 'player_shot') {
+    const slot = Number(msg.slotIndex);
+    if (Number.isFinite(slot)) {
+      rememberObservedSlot(rt, slot);
+      if (!rt.windowSlots) rt.windowSlots = new Set(BOT_WINDOW_SLOTS);
+      rt.windowSlots.add(Math.floor(slot));
+    }
+    const target = Number(msg.targetSlotIndex);
+    if (Number.isFinite(target)) {
+      rememberObservedSlot(rt, target);
+      if (!rt.windowSlots) rt.windowSlots = new Set(BOT_WINDOW_SLOTS);
+      rt.windowSlots.add(Math.floor(target));
+    }
   }
 }
 
 function tickBotGameplay(session, nowMs) {
   if (session.status !== 'in_progress') return;
   const rt = ensureRuntime(session);
+  if (!rt.recentBrokenUntil) rt.recentBrokenUntil = new Map();
   if (!session.game.startedAt || nowMs < session.game.startedAt) return;
   if (!rt.startedAt) rt.startedAt = session.game.startedAt;
   const elapsed = (nowMs - rt.startedAt) / 1000;
@@ -417,6 +534,9 @@ function tickBotGameplay(session, nowMs) {
   for (const z of rt.zombies) {
     if (!z.alive || z.dead) continue;
     const boards = rt.boards.get(z.targetSlot) || 0;
+    if (boards < 3) {
+      rt.recentBrokenUntil.set(z.targetSlot, Math.max(rt.recentBrokenUntil.get(z.targetSlot) || 0, nowMs + BOT_BROKEN_BOARD_PRIORITY_MS));
+    }
     if (boards <= 0 && elapsed >= z.breachAt && !session.lossVote) {
       // Trigger consensus-driven game over request.
       const proposalId = randomId('loss_');
@@ -443,9 +563,24 @@ function tickBotGameplay(session, nowMs) {
   }
 
   const occupancy = slotOccupancyCounts(session);
+  const crateSlot = getBotCrateSlot(rt);
+  const windowSlots = (() => {
+    const ws = getBotWindowSlots(rt);
+    return ws.length ? ws : BOT_WINDOW_SLOTS.slice();
+  })();
+  if (!rt.boards) rt.boards = new Map();
+  for (const s of windowSlots) {
+    if (s === crateSlot) continue;
+    if (!rt.boards.has(s)) rt.boards.set(s, 0);
+  }
   const canMove = (state) => nowMs >= (state.moveCooldownUntil || 0) && nowMs >= (state.holdSlotUntil || 0);
+  for (const [slot, until] of rt.recentBrokenUntil) {
+    if (until <= nowMs || (rt.boards.get(slot) || 0) >= 3) rt.recentBrokenUntil.delete(slot);
+  }
+  const freshBrokenSlots = windowSlots.filter((s) => (rt.recentBrokenUntil.get(s) || 0) > nowMs && (rt.boards.get(s) || 0) < 3);
   const applyMove = (bot, state, toSlot) => {
-    const next = Math.max(0, Math.min(BOT_SLOT_COUNT - 1, Math.floor(toSlot)));
+    const maxSlot = Math.max(rt.maxObservedSlot || 0, crateSlot, ...windowSlots) + 2;
+    const next = Math.max(0, Math.min(maxSlot, Math.floor(toSlot)));
     if (next === state.slotIndex) return false;
     const prev = state.slotIndex;
     state.slotIndex = next;
@@ -462,6 +597,8 @@ function tickBotGameplay(session, nowMs) {
     state.holdSlotUntil = nowMs + BOT_POST_MOVE_HOLD_MS + randInt(0, 350);
     state.actionUntil = nowMs + randInt(700, 1500);
     state.recentSlots = (state.recentSlots || []).concat([next]).slice(-8);
+    state.aimTargetZombieId = -1;
+    state.aimReadyAt = 0;
     return true;
   };
 
@@ -500,11 +637,59 @@ function tickBotGameplay(session, nowMs) {
 
     if (state.ejectUntil && nowMs < state.ejectUntil) continue;
 
-    const visibleZombies = rt.zombies.filter((z) => z.alive && !z.dead && slotDistance(state.slotIndex, z.targetSlot) <= 1);
+    const visibleZombies = rt.zombies
+      .filter((z) => z.alive && !z.dead && canBotSeeZombieFromSlot(state, z, windowSlots, elapsed))
+      .map((z) => ({ z, rangeScore: zombieRangeScore(state, z, windowSlots, elapsed) }));
     const currentBoards = rt.boards.get(state.slotIndex) || 0;
 
     // 1) If bot can't currently see zombies, prioritize boarding nearby/current window.
-    if (visibleZombies.length === 0 && state.slotIndex !== BOT_CRATE_SLOT && currentBoards < 3 && !state.boardUntil) {
+    const totalAmmo = Math.max(0, state.shotsInClip) + Math.max(0, state.clipsCarried) * BOT_CLIP_SIZE;
+
+    // Hard rule: when fully out, bot only handles ammo run + reload.
+    if (totalAmmo <= 0) {
+      state.aimTargetZombieId = -1;
+      state.aimReadyAt = 0;
+      if (state.slotIndex !== crateSlot) {
+        if (!canMove(state)) {
+          state.actionUntil = nowMs + randInt(260, 520);
+          continue;
+        }
+        applyMove(bot, state, crateSlot);
+      } else {
+        state.clipsCarried = BOT_MAX_CLIPS;
+        emitBotAction(session, bot, {
+          type: 'player_ammo_pickup',
+          slotIndex: crateSlot,
+          slotKey: 'bot-slot-crate',
+          clipsCarried: state.clipsCarried,
+          at: nowMs,
+        });
+        state.reloadUntil = nowMs + BOT_RELOAD_MS;
+        emitBotAction(session, bot, {
+          type: 'player_reload_start',
+          slotIndex: state.slotIndex,
+          at: nowMs,
+        });
+        state.actionUntil = state.reloadUntil;
+      }
+      continue;
+    }
+
+    // Low ammo behavior: occasionally top up early.
+    if (state.clipsCarried <= 2 && state.slotIndex !== crateSlot && Math.random() < 0.2) {
+      state.aimTargetZombieId = -1;
+      state.aimReadyAt = 0;
+      if (!canMove(state)) {
+        state.actionUntil = nowMs + randInt(240, 480);
+        continue;
+      }
+      applyMove(bot, state, crateSlot);
+      continue;
+    }
+
+    if (visibleZombies.length === 0 && state.slotIndex !== crateSlot && currentBoards < 3 && !state.boardUntil) {
+      state.aimTargetZombieId = -1;
+      state.aimReadyAt = 0;
       emitBotAction(session, bot, {
         type: 'player_board_start',
         slotIndex: state.slotIndex,
@@ -520,12 +705,14 @@ function tickBotGameplay(session, nowMs) {
 
     const threatened = rt.zombies.find((z) => z.alive && !z.dead && slotDistance(state.slotIndex, z.targetSlot) <= 2 && (rt.boards.get(z.targetSlot) || 0) < 3);
     if (threatened && !state.boardUntil) {
+      state.aimTargetZombieId = -1;
+      state.aimReadyAt = 0;
       if (state.slotIndex !== threatened.targetSlot) {
         if (!canMove(state)) {
           state.actionUntil = nowMs + randInt(220, 420);
           continue;
         }
-        const nearby = BOT_WINDOW_SLOTS.filter((s) => slotDistance(s, threatened.targetSlot) <= 1);
+        const nearby = windowSlots.filter((s) => slotDistance(s, threatened.targetSlot) <= 1);
         const targetSlot = chooseUnoccupiedBiasedSlot(nearby.length ? nearby : [threatened.targetSlot], occupancy, state.recentSlots);
         applyMove(bot, state, targetSlot);
         continue;
@@ -543,12 +730,52 @@ function tickBotGameplay(session, nowMs) {
       continue;
     }
 
+    // Priority patrol: if any window was recently broken, rotate bots there first.
+    if (freshBrokenSlots.length > 0 && !state.boardUntil && state.slotIndex !== crateSlot) {
+      const targetBroken = chooseUnoccupiedBiasedSlot(freshBrokenSlots, occupancy, state.recentSlots);
+      if (state.slotIndex !== targetBroken) {
+        if (!canMove(state)) {
+          state.actionUntil = nowMs + randInt(220, 420);
+          continue;
+        }
+        applyMove(bot, state, targetBroken);
+        continue;
+      }
+    }
+
     if (visibleZombies.length > 0 && state.shotsInClip > 0 && !state.reloadUntil) {
-      const target = visibleZombies[Math.floor(Math.random() * visibleZombies.length)];
+      visibleZombies.sort((a, b) => a.rangeScore - b.rangeScore);
+      // Keep lock on the current aimed target when possible.
+      let targetWrap = null;
+      if (state.aimTargetZombieId >= 0) {
+        targetWrap = visibleZombies.find((vw) => Number(vw.z.id) === Number(state.aimTargetZombieId)) || null;
+      }
+      // If lock is lost, acquire a new target and wait to aim once.
+      if (!targetWrap) {
+        targetWrap = Math.random() < 0.78
+          ? visibleZombies[0]
+          : visibleZombies[Math.floor(Math.random() * visibleZombies.length)];
+        const targetId = Number(targetWrap.z.id);
+        if (state.aimTargetZombieId !== targetId) {
+          state.aimTargetZombieId = targetId;
+          state.aimReadyAt = nowMs + randInt(BOT_AIM_NEW_TARGET_MIN_MS, BOT_AIM_NEW_TARGET_MAX_MS);
+          state.actionUntil = state.aimReadyAt;
+          continue;
+        }
+      }
+      if ((state.aimReadyAt || 0) > nowMs) {
+        state.actionUntil = state.aimReadyAt;
+        continue;
+      }
+      const target = targetWrap.z;
+      const targetId = Number(target.id);
+      const rangeScore = targetWrap.rangeScore;
+      const hitChance = Math.max(0.2, Math.min(0.95, state.baseAccuracy - 0.42 * rangeScore + randRange(-0.05, 0.05)));
+      const headshotChance = Math.max(0.02, Math.min(0.7, state.baseHeadshotChance - 0.24 * rangeScore + randRange(-0.03, 0.03)));
       const roll = Math.random();
       let hit = null;
-      if (roll < 0.78) {
-        const headshot = Math.random() < 0.28;
+      if (roll < hitChance) {
+        const headshot = Math.random() < headshotChance;
         const dmg = headshot ? 3 : 1;
         target.hp -= dmg;
         const killed = target.hp <= 0;
@@ -571,13 +798,19 @@ function tickBotGameplay(session, nowMs) {
         targetSlotIndex: target.targetSlot,
         px: randInt(160, 300),
         py: randInt(90, 190),
-        dir: { x: Number(randRange(-0.14, 0.14).toFixed(4)), y: Number(randRange(-0.1, 0.1).toFixed(4)), z: Number(randRange(0.85, 0.99).toFixed(4)) },
+        dir: {
+          x: Number(randRange(-state.baseAimSpread, state.baseAimSpread).toFixed(4)),
+          y: Number(randRange(-state.baseAimSpread * 0.75, state.baseAimSpread * 0.75).toFixed(4)),
+          z: Number(randRange(0.85, 0.99).toFixed(4)),
+        },
         canSeeOutside: true,
         hit,
         shotsInClip: state.shotsInClip,
       });
       if (state.shotsInClip <= 0) {
         state.ejectUntil = nowMs + BOT_EJECT_MS;
+        state.aimTargetZombieId = -1;
+        state.aimReadyAt = 0;
         if (state.clipsCarried > 0) {
           state.reloadUntil = nowMs + BOT_RELOAD_MS;
           emitBotAction(session, bot, {
@@ -587,22 +820,25 @@ function tickBotGameplay(session, nowMs) {
           });
         }
       }
+      state.lastShotZombieId = targetId;
+      state.aimTargetZombieId = targetId;
+      state.aimReadyAt = nowMs + randInt(BOT_AIM_SAME_TARGET_MIN_MS, BOT_AIM_SAME_TARGET_MAX_MS);
       state.actionUntil = nowMs + randInt(BOT_ACTION_DELAY_MIN_MS, BOT_ACTION_DELAY_MAX_MS);
       continue;
     }
 
     if (state.shotsInClip <= 0 && state.clipsCarried <= 0) {
-      if (state.slotIndex !== BOT_CRATE_SLOT) {
+      if (state.slotIndex !== crateSlot) {
         if (!canMove(state)) {
           state.actionUntil = nowMs + randInt(220, 420);
           continue;
         }
-        applyMove(bot, state, BOT_CRATE_SLOT);
+        applyMove(bot, state, crateSlot);
       } else {
         state.clipsCarried = BOT_MAX_CLIPS;
         emitBotAction(session, bot, {
           type: 'player_ammo_pickup',
-          slotIndex: BOT_CRATE_SLOT,
+          slotIndex: crateSlot,
           slotKey: 'bot-slot-crate',
           clipsCarried: state.clipsCarried,
           at: nowMs,
@@ -634,7 +870,7 @@ function tickBotGameplay(session, nowMs) {
       state.actionUntil = nowMs + randInt(260, 520);
       continue;
     }
-    const targetSlot = chooseUnoccupiedBiasedSlot(BOT_WINDOW_SLOTS, occupancy, state.recentSlots);
+    const targetSlot = chooseUnoccupiedBiasedSlot(windowSlots, occupancy, state.recentSlots);
     if (!applyMove(bot, state, targetSlot)) {
       state.actionUntil = nowMs + randInt(900, 1700);
     }

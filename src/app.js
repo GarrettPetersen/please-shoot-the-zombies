@@ -160,6 +160,7 @@ const TREE_HP = 100;
 const TREE_DAMAGE = 1;   // body only; no headshot, so trees rarely "fully explode"
 const TREE_HOLE_RADIUS_SCALE = 0.2;
 let trees = [];
+let nextTreeId = 1;
 
 // Rifle — 455×256 per frame (fire + reload sheets), same as canvas
 const RIFLE_FRAME_W = 455;
@@ -207,7 +208,7 @@ const GAME_OVER_FACE_DURATION = 2;  // seconds of zombie face + red tint before 
 const ENDGAME_RESULTS_DELAY = 3; // seconds before stats/button appear
 const ZOMBIE_SOUND_INTERVAL = 4;      // seconds between groans; deterministic from spawnIndex/spawnTime
 const GAME_PARAM_SEED = 13371337;
-const GAME_PARAM_WAVE_COUNT = 9;
+const GAME_PARAM_WAVE_COUNT = 11;
 const WAVE_TRIANGLE_CONSTANT = 3;
 const WAVE_TRIANGLE_OFFSET = 1; // waveSize = constant + T(waveIndex1Based + offset)
 const WAVE_SPAWN_INTERVAL = 1.3;
@@ -215,7 +216,7 @@ const WAVE_GAP_BASE_SECONDS = 5.6;
 const WAVE_GAP_WAVE_STEP_SECONDS = 0.7;
 const WAVE_HOT_WINDOW_WEIGHT = 0.72;
 const WAVE_HOT_SEGMENT_WEIGHT = 0.16;
-const ZOMBIE_COUNT_MULTIPLIER = 10;
+const ZOMBIE_COUNT_MULTIPLIER = 20;
 const ZOMBIE_MIN_PATH_LENGTH = 46;
 const TREE_BLOCK_RADIUS = 0.9;
 
@@ -439,9 +440,28 @@ try {
 function getCanvasPointerPos(evt) {
   const rect = canvas.getBoundingClientRect();
   if (!rect.width || !rect.height) return { x: W / 2, y: H / 2 };
+  // Canvas is displayed with object-fit: contain, so clicks must be remapped
+  // from the letterboxed DOM rect into the actual rendered game area.
+  const targetAspect = W / H;
+  const rectAspect = rect.width / rect.height;
+  let drawW = rect.width;
+  let drawH = rect.height;
+  let offsetX = 0;
+  let offsetY = 0;
+  if (rectAspect > targetAspect) {
+    drawH = rect.height;
+    drawW = drawH * targetAspect;
+    offsetX = (rect.width - drawW) * 0.5;
+  } else if (rectAspect < targetAspect) {
+    drawW = rect.width;
+    drawH = drawW / targetAspect;
+    offsetY = (rect.height - drawH) * 0.5;
+  }
+  const rawX = (evt.clientX - rect.left - offsetX) * (W / Math.max(1, drawW));
+  const rawY = (evt.clientY - rect.top - offsetY) * (H / Math.max(1, drawH));
   return {
-    x: (evt.clientX - rect.left) * (W / rect.width),
-    y: (evt.clientY - rect.top) * (H / rect.height),
+    x: Math.max(0, Math.min(W, rawX)),
+    y: Math.max(0, Math.min(H, rawY)),
   };
 }
 
@@ -861,10 +881,24 @@ function playPositionalClip(audioTemplate, worldX, worldZ, gainMul = 1, decayMs 
   const audio = audioTemplate.cloneNode(true);
   audio.preload = 'auto';
   const startGain = Math.max(0.001, gain * gainMul);
+  let source = null;
+  let gainNode = null;
+  let panner = null;
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    try { audio.pause(); } catch {}
+    try { source?.disconnect(); } catch {}
+    try { gainNode?.disconnect(); } catch {}
+    try { panner?.disconnect(); } catch {}
+    try { audio.removeAttribute('src'); } catch {}
+    try { audio.load(); } catch {}
+  };
   try {
-    const source = ctx.createMediaElementSource(audio);
-    const gainNode = ctx.createGain();
-    const panner = ctx.createStereoPanner();
+    source = ctx.createMediaElementSource(audio);
+    gainNode = ctx.createGain();
+    panner = ctx.createStereoPanner();
     gainNode.gain.value = startGain;
     panner.pan.value = pan;
     source.connect(gainNode);
@@ -878,10 +912,14 @@ function playPositionalClip(audioTemplate, worldX, worldZ, gainMul = 1, decayMs 
     // Fallback path: still play if WebAudio node creation fails on this element.
     audio.volume = Math.min(1, startGain);
   }
+  audio.addEventListener('ended', cleanup, { once: true });
+  audio.addEventListener('error', cleanup, { once: true });
+  const hardStopMs = Math.max(900, (decayMs || 0) + 1500);
+  setTimeout(cleanup, hardStopMs);
   if (ctx.state === 'suspended') {
-    ctx.resume().finally(() => { audio.play().catch(() => {}); });
+    ctx.resume().finally(() => { audio.play().catch(cleanup); });
   } else {
-    audio.play().catch(() => {});
+    audio.play().catch(cleanup);
   }
 }
 
@@ -1072,7 +1110,7 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
           if (shotList.length > 0) {
             const sfx = shotList[Math.floor(Math.random() * shotList.length)];
             // Gunshots carry further than other SFX; keep them loud at distance.
-            playPositionalClip(sfx, pos.x, pos.z, 1.15, 650, POSITIONAL_REF_DIST * 4.5);
+            playPositionalClip(sfx, pos.x, pos.z, 1.35, 1500, POSITIONAL_REF_DIST * 40);
           }
           if (assets.ejectCasing) playPositionalClip(assets.ejectCasing, pos.x, pos.z, 0.7, 220, POSITIONAL_REF_DIST * 1.4);
           applyRemoteZombieHit(payload, remote);
@@ -1545,6 +1583,24 @@ function getBoardInstancesForRenderer() {
   return out;
 }
 
+function getTracerInstancesForRenderer() {
+  const out = [];
+  for (const t of tracers) {
+    const a = Math.max(0, Math.min(1, t.life / Math.max(1e-6, t.maxLife || TRACER_LIFE)));
+    if (a <= 0.001) continue;
+    out.push({
+      fromX: t.fromX,
+      fromY: t.fromY,
+      fromZ: t.fromZ,
+      toX: t.toX,
+      toY: t.toY,
+      toZ: t.toZ,
+      alpha: a,
+    });
+  }
+  return out;
+}
+
 function getWorldRendererState() {
   return {
     assets,
@@ -1573,6 +1629,7 @@ function getWorldRendererState() {
     getTreeGridCell,
     getRemotePlayers: getRemotePlayersForRenderer,
     getBoardInstances: getBoardInstancesForRenderer,
+    getTracerInstances: getTracerInstancesForRenderer,
     getViewForward: () => getViewVectors().forward,
     FOG_DENSITY,
     FOG_COLOR,
@@ -1704,9 +1761,10 @@ function generateFogWisps() {
 
 function generateTrees() {
   trees = [];
+  nextTreeId = 1;
   if (gameParams?.trees?.length) {
     for (const t of gameParams.trees) {
-      trees.push({ x: t.x, z: t.z, spriteIndex: t.spriteIndex, hp: TREE_HP });
+      trees.push({ id: nextTreeId++, x: t.x, z: t.z, spriteIndex: t.spriteIndex, hp: TREE_HP });
     }
     return;
   }
@@ -1717,7 +1775,7 @@ function generateTrees() {
     const x = WORLD_CENTER_X + Math.cos(angle) * dist;
     const z = WORLD_CENTER_Z + Math.sin(angle) * dist;
     const spriteIndex = Math.floor(rng() * 14);
-    trees.push({ x, z, spriteIndex, hp: TREE_HP });
+    trees.push({ id: nextTreeId++, x, z, spriteIndex, hp: TREE_HP });
   }
 }
 
@@ -2433,6 +2491,28 @@ function pathLength(points) {
   return total;
 }
 
+function isZombiePathOutsideBunker(points) {
+  if (!points || points.length < 2 || !bunker?.corners?.length) return false;
+  const inside = (x, z) =>
+    isPointInsidePolygon(x, z, bunker.corners) &&
+    !(bunker.holes || []).some((h) => isPointInsidePolygon(x, z, h));
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1];
+    const b = points[i];
+    const segLen = Math.hypot(b.x - a.x, b.z - a.z);
+    const steps = Math.max(2, Math.ceil(segLen / 0.2));
+    for (let s = 0; s <= steps; s++) {
+      // Ignore exact final endpoint (window center is on wall plane by design).
+      if (i === points.length - 1 && s === steps) continue;
+      const t = s / steps;
+      const x = a.x + (b.x - a.x) * t;
+      const z = a.z + (b.z - a.z) * t;
+      if (inside(x, z)) return false;
+    }
+  }
+  return true;
+}
+
 function choosePathForZombie(start, target, rng, treeList) {
   const targetPt = { x: target.x, z: target.z };
   const direct = [start, targetPt];
@@ -2586,6 +2666,7 @@ function generateGameParameters(seed = GAME_PARAM_SEED, waveCount = GAME_PARAM_W
           true,
           true,
         )) continue;
+        if (!isZombiePathOutsideBunker(pathWithFinal.points)) continue;
         const plen = pathLength(pathWithFinal.points);
         if (plen < ZOMBIE_MIN_PATH_LENGTH) continue;
         start = { x: sx, z: sz };
@@ -2607,7 +2688,7 @@ function generateGameParameters(seed = GAME_PARAM_SEED, waveCount = GAME_PARAM_W
             break;
           }
         }
-        if (ok && pathLength(fallback) >= ZOMBIE_MIN_PATH_LENGTH) {
+        if (ok && isZombiePathOutsideBunker(fallback) && pathLength(fallback) >= ZOMBIE_MIN_PATH_LENGTH) {
           start = { x: sx, z: sz };
           planned = { style: 'fallback', points: fallback };
         }
@@ -3211,6 +3292,16 @@ async function loadAssets() {
   const ZOMBIE_FEMALE_SOUND_NAMES = ['female_zombie_1', 'female_zombie_2', 'female_zombie_3', 'female_zombie_4'];
   assets.zombieSoundPaths = ZOMBIE_SOUND_NAMES.map((n) => `${base}/sfx/clean/${n}.ogg`);
   assets.zombieFemaleSoundPaths = ZOMBIE_FEMALE_SOUND_NAMES.map((n) => `${base}/sfx/clean/${n}.ogg`);
+  assets.zombieSounds = assets.zombieSoundPaths.map((path) => {
+    const a = new Audio(path);
+    a.preload = 'auto';
+    return a;
+  });
+  assets.zombieFemaleSounds = assets.zombieFemaleSoundPaths.map((path) => {
+    const a = new Audio(path);
+    a.preload = 'auto';
+    return a;
+  });
   generateFogWisps();
   const planned = generateGameParameters(GAME_PARAM_SEED, GAME_PARAM_WAVE_COUNT, 1);
   gameParams = planned.params;
@@ -3311,15 +3402,36 @@ function playPositionalSound(url, worldX, worldZ) {
   if (!ctx) return;
   const { gain, pan } = getPositionalGainPan(worldX, worldZ);
   const audio = new Audio(url);
-  const source = ctx.createMediaElementSource(audio);
-  const gainNode = ctx.createGain();
-  const panner = ctx.createStereoPanner();
-  gainNode.gain.value = gain;
-  panner.pan.value = pan;
-  source.connect(gainNode);
-  gainNode.connect(panner);
-  panner.connect(ctx.destination);
-  audio.play().catch(() => {});
+  let source = null;
+  let gainNode = null;
+  let panner = null;
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    try { audio.pause(); } catch {}
+    try { source?.disconnect(); } catch {}
+    try { gainNode?.disconnect(); } catch {}
+    try { panner?.disconnect(); } catch {}
+    try { audio.removeAttribute('src'); } catch {}
+    try { audio.load(); } catch {}
+  };
+  try {
+    source = ctx.createMediaElementSource(audio);
+    gainNode = ctx.createGain();
+    panner = ctx.createStereoPanner();
+    gainNode.gain.value = gain;
+    panner.pan.value = pan;
+    source.connect(gainNode);
+    gainNode.connect(panner);
+    panner.connect(ctx.destination);
+  } catch {
+    audio.volume = Math.min(1, gain);
+  }
+  audio.addEventListener('ended', cleanup, { once: true });
+  audio.addEventListener('error', cleanup, { once: true });
+  setTimeout(cleanup, 3000);
+  audio.play().catch(cleanup);
 }
 
 /** For continuous sources (e.g. voice chat): create graph, connect your source to .gainNode, then each frame/tick set gainNode.gain.value and panner.pan.value from getPositionalGainPan(sourceX, sourceZ). */
@@ -3362,8 +3474,8 @@ function spawnZombie() {
   const spawnIndex = spawnCounter++;
   const spawnTime = gameTime;
   const useFemaleSounds = sprite === assets.zombieFemaleGhoul;
-  const paths = useFemaleSounds ? assets.zombieFemaleSoundPaths : assets.zombieSoundPaths;
-  const numPaths = paths?.length ?? 0;
+  const soundPool = useFemaleSounds ? assets.zombieFemaleSounds : assets.zombieSounds;
+  const numSounds = soundPool?.length ?? 0;
   zombies.push({
     x, y: 0, z, hp: ZOMBIE_HP_MAX,
     walkPhase: p.walkPhase ?? 0,
@@ -3383,26 +3495,27 @@ function spawnZombie() {
     pathLengths,
     pathTotal,
     pathDist: 0,
+    pathSegIndex: 1,
   });
-  if (numPaths > 0) {
-    const which = spawnIndex % numPaths;
-    playPositionalSound(paths[which], x, z);
+  if (numSounds > 0) {
+    const which = spawnIndex % numSounds;
+    playPositionalClip(soundPool[which], x, z, 0.9, 2600, POSITIONAL_REF_DIST * 1.2);
   }
 }
 
 function updateZombies(dt) {
   if (gameOver) return;
   for (const z of zombies) {
-    const paths = z.useFemaleSounds ? assets.zombieFemaleSoundPaths : assets.zombieSoundPaths;
-    const numPaths = paths?.length ?? 0;
+    const soundPool = z.useFemaleSounds ? assets.zombieFemaleSounds : assets.zombieSounds;
+    const numSounds = soundPool?.length ?? 0;
     z.walkPhase = (z.walkPhase ?? 0) + dt * ZOMBIE_BOB_SPEED;
     z.bob = Math.sin(z.walkPhase) * ZOMBIE_BOB_AMPLITUDE;
-    if (numPaths > 0) {
+    if (numSounds > 0) {
       const n = Math.floor((gameTime - z.spawnTime) / ZOMBIE_SOUND_INTERVAL);
       if (n > (z.lastSoundN ?? 0)) {
         z.lastSoundN = n;
-        const which = (z.spawnIndex + n) % numPaths;
-        playPositionalSound(paths[which], z.x, z.z);
+        const which = (z.spawnIndex + n) % numSounds;
+        playPositionalClip(soundPool[which], z.x, z.z, 0.9, 2600, POSITIONAL_REF_DIST * 1.2);
       }
     }
     const targetX = z.targetWindowX ?? WORLD_CENTER_X;
@@ -3459,13 +3572,10 @@ function updateZombies(dt) {
             gameOverZombie = z;
             gameOver = true;
             gameOverFlashStart = performance.now() / 1000;
-            const paths = z.useFemaleSounds ? assets.zombieFemaleSoundPaths : assets.zombieSoundPaths;
-            const numPaths = paths?.length ?? 0;
-            if (numPaths > 0) {
-              const url = paths[z.spawnIndex % numPaths];
-              const audio = new Audio(url);
-              audio.volume = 1;
-              audio.play().catch(() => {});
+            const soundPool = z.useFemaleSounds ? assets.zombieFemaleSounds : assets.zombieSounds;
+            const numSounds = soundPool?.length ?? 0;
+            if (numSounds > 0) {
+              playPositionalClip(soundPool[z.spawnIndex % numSounds], z.x, z.z, 1.0, 2800, POSITIONAL_REF_DIST * 1.3);
             }
           }
           return;
@@ -3478,9 +3588,11 @@ function updateZombies(dt) {
     if (z.pathPoints?.length >= 2 && z.pathTotal > 1e-6) {
       z.pathDist = Math.min(z.pathTotal, (z.pathDist ?? 0) + speed * dt);
       const distAlong = z.pathDist;
-      let segIndex = 1;
-      while (segIndex < z.pathLengths.length && distAlong > z.pathLengths[segIndex]) segIndex++;
-      segIndex = Math.min(segIndex, z.pathLengths.length - 1);
+      const maxSegIndex = z.pathLengths.length - 1;
+      let segIndex = Math.max(1, Math.min(maxSegIndex, z.pathSegIndex || 1));
+      while (segIndex < maxSegIndex && distAlong > z.pathLengths[segIndex]) segIndex++;
+      while (segIndex > 1 && distAlong <= z.pathLengths[segIndex - 1]) segIndex--;
+      z.pathSegIndex = segIndex;
       const prevLen = z.pathLengths[segIndex - 1];
       const segLen = Math.max(1e-6, z.pathLengths[segIndex] - prevLen);
       const t = (distAlong - prevLen) / segLen;
@@ -3493,6 +3605,31 @@ function updateZombies(dt) {
       const uz = dz / d;
       z.x += ux * speed * dt;
       z.z += uz * speed * dt;
+    }
+
+    // Safety clamp: zombies should never end up inside the bunker interior.
+    if (bunker?.corners?.length >= 3 && isPointInsidePolygon(z.x, z.z, bunker.corners)) {
+      let best = null;
+      for (const seg of bunkerWallSegments) {
+        const ax = seg.a.x;
+        const az = seg.a.z;
+        const bx = seg.b.x;
+        const bz = seg.b.z;
+        const abx = bx - ax;
+        const abz = bz - az;
+        const lenSq = abx * abx + abz * abz;
+        let tSeg = 0;
+        if (lenSq > 1e-8) tSeg = Math.max(0, Math.min(1, ((z.x - ax) * abx + (z.z - az) * abz) / lenSq));
+        const qx = ax + abx * tSeg;
+        const qz = az + abz * tSeg;
+        const dSeg = Math.hypot(z.x - qx, z.z - qz);
+        if (!best || dSeg < best.d) best = { d: dSeg, qx, qz, inward: seg.inward };
+      }
+      if (best) {
+        const push = 0.08;
+        z.x = best.qx - (best.inward?.x ?? 0) * push;
+        z.z = best.qz - (best.inward?.z ?? 0) * push;
+      }
     }
   }
 }
@@ -3512,6 +3649,8 @@ const PARTICLE_BOUNCE = 0.35;
 const PARTICLE_FRICTION = 0.82;
 const PARTICLE_REST_VY = 0.5;
 const PARTICLE_REST_VXZ = 0.5;
+const PARTICLE_BLAST_SPEED_MULT = 2.0;
+const PARTICLE_BLAST_UPWARD_BONUS = 2.1;
 
 let particles = [];
 let tracers = []; // short-lived bullet streaks
@@ -3585,15 +3724,15 @@ function spawnHoleParticles(z, info, hitPx, hitPy, jaggedRadii) {
       const a = idata.data[i + 3];
       if (a < 10) continue;
       const angle = Math.atan2(dy, dx) + (Math.random() - 0.5);
-      const speed = 2.5 + Math.random() * 2.5;
+      const speed = (2.5 + Math.random() * 2.5) * PARTICLE_BLAST_SPEED_MULT;
       if (particles.length >= MAX_PARTICLES) return;
       particles.push({
         wx: z.x + (Math.random() - 0.5) * 0.1,
         wy: worldY + (Math.random() - 0.5) * 0.05,
         wz: z.z + (Math.random() - 0.5) * 0.1,
-        vwx: Math.cos(angle) * speed * 0.8,
-        vwy: Math.sin(angle) * speed * 0.5 + 1.5,
-        vwz: Math.sin(angle) * speed * 0.8,
+        vwx: Math.cos(angle) * speed,
+        vwy: Math.abs(Math.sin(angle) * speed * 0.55) + PARTICLE_BLAST_UPWARD_BONUS,
+        vwz: Math.sin(angle) * speed,
         r, g, b, a,
         life: PARTICLE_LIFE,
         maxLife: PARTICLE_LIFE,
@@ -3624,9 +3763,9 @@ function spawnDeathParticles(z, info) {
         wx: z.x + (tx / w - 0.5) * 0.4,
         wy: worldY,
         wz: z.z + (Math.random() - 0.5) * 0.2,
-        vwx: (Math.random() - 0.5) * 0.8,
-        vwy: (Math.random() - 0.5) * 0.3,
-        vwz: (Math.random() - 0.5) * 0.8,
+        vwx: (Math.random() - 0.5) * 2.4 * PARTICLE_BLAST_SPEED_MULT,
+        vwy: Math.random() * 1.4 + PARTICLE_BLAST_UPWARD_BONUS * 0.5,
+        vwz: (Math.random() - 0.5) * 2.4 * PARTICLE_BLAST_SPEED_MULT,
         r: idata.data[i], g: idata.data[i + 1], b: idata.data[i + 2], a,
         life: PARTICLE_LIFE,
         maxLife: PARTICLE_LIFE,
@@ -3690,6 +3829,8 @@ function updateTracers(dt) {
 
 function drawTracers() {
   if (!tracers.length) return;
+  // In WebGL mode tracers are rendered in the world pass with depth testing.
+  if (worldRenderer?.isReady()) return;
   ctx.save();
   ctx.lineCap = 'round';
   ctx.lineWidth = TRACER_WIDTH;
@@ -3698,6 +3839,7 @@ function drawTracers() {
     const b = project(t.toX, t.toY, t.toZ);
     if (!a || !b || a.depth <= NEAR || b.depth <= NEAR) continue;
     const alpha = Math.max(0, t.life / t.maxLife);
+    if (!isWorldPointVisibleFromCamera(t.toX, t.toY, t.toZ, 0.999)) continue;
     ctx.strokeStyle = `rgba(255,244,200,${alpha})`;
     ctx.beginPath();
     ctx.moveTo(a.sx, a.sy);
@@ -3711,6 +3853,7 @@ function drawParticles() {
   for (const p of particles) {
     const proj = project(p.wx, p.wy, p.wz);
     if (!proj || proj.depth <= NEAR) continue;
+    if (!isWorldPointVisibleFromCamera(p.wx, p.wy, p.wz, 0.998)) continue;
     if (proj.sx < -4 || proj.sx > W + 4 || proj.sy < -4 || proj.sy > H + 4) continue;
     const t = p.life / p.maxLife;
     const fogF = getFogFactor(proj.depth);
@@ -3784,6 +3927,7 @@ function damageZombie(idx, hitPx, hitPy) {
   } else {
     if (!z.holes) z.holes = [];
     z.holes.push({ tx: hitTx, ty: hitTy, jaggedRadii });
+    z.holeVersion = (z.holeVersion || 0) + 1;
     spawnHoleParticles(z, info, hitPx, hitPy, jaggedRadii);
     return { type: 'zombie', zombieId, headshot: headShot, killed: false };
   }
@@ -4005,15 +4149,15 @@ function spawnTreeHoleParticles(t, info, hitPx, hitPy, jaggedRadii) {
       const a = idata.data[i + 3];
       if (a < 10) continue;
       const angle = Math.atan2(dy, dx) + (Math.random() - 0.5);
-      const speed = 2.5 + Math.random() * 2.5;
+      const speed = (2.5 + Math.random() * 2.5) * PARTICLE_BLAST_SPEED_MULT;
       if (particles.length >= MAX_PARTICLES) return;
       particles.push({
         wx: t.x + (Math.random() - 0.5) * 0.1,
         wy: worldY + (Math.random() - 0.5) * 0.05,
         wz: t.z + (Math.random() - 0.5) * 0.1,
-        vwx: Math.cos(angle) * speed * 0.8,
-        vwy: Math.sin(angle) * speed * 0.5 + 1.5,
-        vwz: Math.sin(angle) * speed * 0.8,
+        vwx: Math.cos(angle) * speed,
+        vwy: Math.abs(Math.sin(angle) * speed * 0.55) + PARTICLE_BLAST_UPWARD_BONUS,
+        vwz: Math.sin(angle) * speed,
         r, g, b, a,
         life: PARTICLE_LIFE,
         maxLife: PARTICLE_LIFE,
@@ -4039,6 +4183,7 @@ function damageTree(idx, hitPx, hitPy) {
   } else {
     if (!t.holes) t.holes = [];
     t.holes.push({ tx: hitTx, ty: hitTy, jaggedRadii });
+    t.holeVersion = (t.holeVersion || 0) + 1;
     spawnTreeHoleParticles(t, info, hitPx, hitPy, jaggedRadii);
   }
 }
