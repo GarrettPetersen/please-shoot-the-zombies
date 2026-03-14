@@ -1123,6 +1123,11 @@ function getMpPlayerWorldPos(p, nowMs = Date.now()) {
   const jitter = mpPlayerLateralJitter(p.playerId) * 0.42;
   x += tx * jitter;
   z += tz * jitter;
+  const nx = toSlot.normal?.x ?? 0;
+  const nz = toSlot.normal?.z ?? 0;
+  const forwardBias = 0.28;
+  x -= nx * forwardBias;
+  z -= nz * forwardBias;
   const bob = p.moving ? Math.sin((nowMs / 1000) * MP_BOB_SPEED + p.bobPhase) * 0.03 : 0;
   return { x, y: bob, z, moving: p.moving, slot: toSlot };
 }
@@ -5197,6 +5202,9 @@ function getMultiplayerDrawInfo(p, queueIndex, nowMs = Date.now()) {
   const toZ = toSlot.z + toInward.z * queueInward;
   let wx = fromX + (toX - fromX) * s + tx * lateralJitter;
   let wz = fromZ + (toZ - fromZ) * s + tz * lateralJitter;
+  const forwardBias = 0.28;
+  wx -= (normal.x ?? 0) * forwardBias;
+  wz -= (normal.z ?? 0) * forwardBias;
   if (bunker?.corners?.length >= 3 && !isPointInsidePolygon(wx, wz, bunker.corners)) {
     const centerX = (bunker.minX + bunker.maxX) * 0.5;
     const centerZ = (bunker.minZ + bunker.maxZ) * 0.5;
