@@ -201,15 +201,16 @@ const BUNKER_LAYOUTS = {
       { x: -6, z: 0 },
       { x: -2.5, z: -2 },
     ],
+    // Segments 0,2,4,6 are at star tips — no openings to avoid wall clipping. Segments 1,3,5,7 are diagonals — windows/holes and ammo.
     segmentTiles: [
-      ['wall', 'window', 'wall', 'wall'],
-      ['wall', 'hole', 'wall', 'wall'],
-      ['wall', 'window', 'wall', 'wall'],
-      ['wall', 'window', 'wall', 'wall'],
-      ['wall', 'ammo', 'wall', 'hole', 'wall'],
-      ['wall', 'window', 'wall', 'wall'],
-      ['wall', 'window', 'wall', 'wall'],
-      ['wall', 'hole', 'wall', 'wall'],
+      ['wall', 'wall', 'wall', 'wall'],
+      ['wall', 'ammo', 'hole', 'wall', 'window', 'wall'],
+      ['wall', 'wall', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'hole', 'wall'],
+      ['wall', 'wall', 'wall', 'wall'],
+      ['wall', 'window', 'wall', 'hole', 'wall'],
+      ['wall', 'wall', 'wall', 'wall'],
+      ['wall', 'hole', 'wall', 'window', 'wall'],
     ],
     interiorWallLoops: [
       {
@@ -442,7 +443,7 @@ const GAME_OVER_FACE_DURATION = 2;  // seconds of zombie face + red tint before 
 const ENDGAME_RESULTS_DELAY = 3; // seconds before stats/button appear
 const ZOMBIE_SOUND_INTERVAL = 4;      // seconds between groans; deterministic from spawnIndex/spawnTime
 const GAME_PARAM_SEED = 13371337;
-const GAME_PARAM_WAVE_COUNT = 11;
+const GAME_PARAM_WAVE_COUNT = 9;
 const WAVE_TRIANGLE_CONSTANT = 3;
 const WAVE_TRIANGLE_OFFSET = 1; // waveSize = constant + T(waveIndex1Based + offset)
 const WAVE_SPAWN_INTERVAL = 1.3;
@@ -636,6 +637,9 @@ let multiplayerHttpBase = DEFAULT_MULTIPLAYER_HTTP_BASE;
 let multiplayerWs = null;
 let multiplayerSession = null; // { sessionId, playerId, joinCode, privacy, maxPlayers }
 let multiplayerLobbyPlayers = []; // [{playerId,name,isHost,slotIndex}]
+let lobbyPlayerScrollOffset = 0;
+const LOBBY_PLAYER_LINE_H = 10;
+const LOBBY_VISIBLE_PLAYER_LINES = 6;
 let multiplayerConnected = false;
 let multiplayerAgreedHash = '';
 let multiplayerGameSeed = GAME_PARAM_SEED;
@@ -736,6 +740,7 @@ function setMenuPage(pageId) {
   menuSelectedIndex = 0;
   menuHoverIndex = -1;
   if (pageId === 'local_settings') setCurrentBunkerLayout(menuState.localGameSettings.bunkerLayoutId);
+  if (pageId === 'lobby') lobbyPlayerScrollOffset = 0;
 }
 
 function getBunkerLayoutOptions() {
@@ -1093,6 +1098,14 @@ function clampLeaderboardScroll(totalRows, visibleRows) {
   leaderboardScrollRow = Math.max(0, Math.min(maxStart, leaderboardScrollRow));
 }
 
+/** Stable lateral jitter in [-1, 1] from player id so multiple players at same window don't overlap. */
+function mpPlayerLateralJitter(playerId) {
+  let h = 0;
+  const str = String(playerId || '');
+  for (let i = 0; i < str.length; i++) h = ((h << 5) - h + str.charCodeAt(i)) | 0;
+  return ((h % 1000) / 500) - 1;
+}
+
 function getMpPlayerWorldPos(p, nowMs = Date.now()) {
   const toSlot = getSlotByIndex(p.moveToIndex ?? p.slotIndex);
   const fromSlot = getSlotByIndex(p.moveFromIndex ?? p.slotIndex) || toSlot;
@@ -1103,8 +1116,13 @@ function getMpPlayerWorldPos(p, nowMs = Date.now()) {
     if (t >= 1) p.moving = false;
   }
   const s = t * t * (3 - 2 * t);
-  const x = fromSlot.x + (toSlot.x - fromSlot.x) * s;
-  const z = fromSlot.z + (toSlot.z - fromSlot.z) * s;
+  let x = fromSlot.x + (toSlot.x - fromSlot.x) * s;
+  let z = fromSlot.z + (toSlot.z - fromSlot.z) * s;
+  const tx = toSlot.tangent?.x ?? 1;
+  const tz = toSlot.tangent?.z ?? 0;
+  const jitter = mpPlayerLateralJitter(p.playerId) * 0.42;
+  x += tx * jitter;
+  z += tz * jitter;
   const bob = p.moving ? Math.sin((nowMs / 1000) * MP_BOB_SPEED + p.bobPhase) * 0.03 : 0;
   return { x, y: bob, z, moving: p.moving, slot: toSlot };
 }
@@ -5172,14 +5190,13 @@ function getMultiplayerDrawInfo(p, queueIndex, nowMs = Date.now()) {
   const q = Math.max(0, queueIndex);
   const queueBack = q * MP_QUEUE_SPACING;
   const queueInward = queueBack;
-  const lane = Math.ceil(q / 2);
-  const lateral = q === 0 ? 0 : (q % 2 === 1 ? -1 : 1) * lane * 0.08;
+  const lateralJitter = mpPlayerLateralJitter(p.playerId) * 0.42;
   const fromX = fromSlot.x + fromInward.x * queueInward;
   const fromZ = fromSlot.z + fromInward.z * queueInward;
   const toX = toSlot.x + toInward.x * queueInward;
   const toZ = toSlot.z + toInward.z * queueInward;
-  let wx = fromX + (toX - fromX) * s + tx * lateral;
-  let wz = fromZ + (toZ - fromZ) * s + tz * lateral;
+  let wx = fromX + (toX - fromX) * s + tx * lateralJitter;
+  let wz = fromZ + (toZ - fromZ) * s + tz * lateralJitter;
   if (bunker?.corners?.length >= 3 && !isPointInsidePolygon(wx, wz, bunker.corners)) {
     const centerX = (bunker.minX + bunker.maxX) * 0.5;
     const centerZ = (bunker.minZ + bunker.maxZ) * 0.5;
@@ -6220,7 +6237,8 @@ function drawMenu() {
   ctx.fillText(def.subtitle || '', W / 2, 52);
 
   const panelH = items.length * MENU_BUTTON_H + Math.max(0, items.length - 1) * MENU_BUTTON_GAP + 16;
-  const lobbyExtraH = menuPage === 'lobby' ? 90 : 0;
+  const lobbyBoxH = menuPage === 'lobby' ? 44 + LOBBY_VISIBLE_PLAYER_LINES * LOBBY_PLAYER_LINE_H : 0;
+  const lobbyExtraH = lobbyBoxH;
   const panelX = Math.floor((W - (MENU_BUTTON_W + 20)) / 2);
   const panelY = Math.floor((H - (panelH + lobbyExtraH)) / 2 + 16);
   const panelW = MENU_BUTTON_W + 20;
@@ -6250,7 +6268,7 @@ function drawMenu() {
   }
 
   if (menuPage === 'lobby') {
-    const players = multiplayerLobbyPlayers.slice(0, 8);
+    const players = multiplayerLobbyPlayers;
     const startY = panelY + panelH + 8;
     ctx.fillStyle = 'rgba(0,0,0,0.5)';
     ctx.fillRect(panelX, startY, panelW, lobbyExtraH);
@@ -6260,18 +6278,27 @@ function drawMenu() {
     ctx.textAlign = 'left';
     ctx.font = `${Math.floor(FONT_SIZE * 0.48)}px ${FONT_FAMILY}`;
     const code = multiplayerSession?.joinCode || '----';
-    ctx.fillText(`${t('lobbyJoinCode')}: ${code}`, panelX + 8, startY + 14);
-    ctx.fillText(`${t('lobbyPlayers')}: ${players.length}`, panelX + 8, startY + 28);
+    ctx.fillText(`${t('lobbyJoinCode')}: ${code}`, panelX + 8, startY + 12);
+    ctx.fillText(`${t('bunker')}: ${getBunkerLayoutName(multiplayerBunkerLayoutId)}`, panelX + 8, startY + 24);
+    ctx.fillText(`${t('lobbyPlayers')}: ${players.length}`, panelX + 8, startY + 36);
+    const maxScroll = Math.max(0, players.length - LOBBY_VISIBLE_PLAYER_LINES);
+    const scrollOffset = Math.max(0, Math.min(maxScroll, lobbyPlayerScrollOffset));
+    const visible = players.slice(scrollOffset, scrollOffset + LOBBY_VISIBLE_PLAYER_LINES);
     ctx.font = `${Math.floor(FONT_SIZE * 0.42)}px ${FONT_FAMILY}`;
-    for (let i = 0; i < players.length; i++) {
-      const p = players[i];
+    for (let i = 0; i < visible.length; i++) {
+      const p = visible[i];
       const tag = p.isHost ? ' (H)' : '';
-      ctx.fillText(`${i + 1}. ${p.name}${tag}`, panelX + 8, startY + 42 + i * 10);
+      ctx.fillText(`${scrollOffset + i + 1}. ${p.name}${tag}`, panelX + 8, startY + 48 + i * LOBBY_PLAYER_LINE_H);
+    }
+    if (maxScroll > 0) {
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      ctx.font = `${Math.floor(FONT_SIZE * 0.38)}px ${FONT_FAMILY}`;
+      ctx.fillText('Scroll to see all', panelX + 8, startY + lobbyExtraH - 10);
     }
     ctx.textAlign = 'center';
     if (!isLobbyHost()) {
       ctx.fillStyle = 'rgba(255,255,255,0.8)';
-      ctx.fillText(t('lobbyHostOnly'), W / 2, startY + lobbyExtraH - 6);
+      ctx.fillText(t('lobbyHostOnly'), W / 2, startY + lobbyExtraH - 4);
     }
   }
   ctx.textBaseline = 'alphabetic';
@@ -6871,6 +6898,17 @@ canvas.addEventListener('mousemove', (e) => {
 });
 
 canvas.addEventListener('wheel', (e) => {
+  if (appMode === 'menu' && menuPage === 'lobby') {
+    const n = multiplayerLobbyPlayers.length;
+    const maxScroll = Math.max(0, n - LOBBY_VISIBLE_PLAYER_LINES);
+    if (maxScroll > 0) {
+      e.preventDefault();
+      lobbyPlayerScrollOffset += e.deltaY > 0 ? 1 : -1;
+      lobbyPlayerScrollOffset = Math.max(0, Math.min(maxScroll, lobbyPlayerScrollOffset));
+      draw();
+    }
+    return;
+  }
   if (appMode !== 'game') return;
   if (!canShowEndgameResults()) return;
   const totalRows = playerMatchStats.size;

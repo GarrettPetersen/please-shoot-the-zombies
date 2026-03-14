@@ -22,6 +22,16 @@ const BOT_NAMES = [
   'Ash', 'Mara', 'Kade', 'Vera', 'Iris', 'Niko', 'Juno', 'Soren',
   'Piper', 'Rowan', 'Quinn', 'Ilya', 'Noor', 'Silas', 'Anya', 'Milo',
   'Tessa', 'Ember', 'Finn', 'Lena', 'Aria', 'Cole', 'Mae', 'Rory',
+  'Zara', 'Dax', 'Wren', 'Ezra', 'Skye', 'Reed', 'Blair', 'Jace',
+  'Sage', 'Drew', 'Kai', 'Morgan', 'Casey', 'River', 'Hayden', 'Cameron',
+  'Alex', 'Sam', 'Jordan', 'Taylor', 'Riley', 'Avery', 'Parker', 'Quinn',
+  'Dakota', 'Reese', 'Ellis', 'Phoenix', 'Shiloh', 'Arlo', 'Nova', 'Onyx',
+  'Jade', 'Scout', 'Poe', 'Kit', 'Bex', 'Gray', 'Lake', 'Echo',
+  'Remi', 'Frankie', 'Stevie', 'Charlie', 'Bobbie', 'Jackie', 'Lou', 'Sal',
+  'Max', 'Ace', 'Jet', 'Bolt', 'Dash', 'Rusty', 'Chip', 'Bud',
+  'Vic', 'Ray', 'Joe', 'Lee', 'Cam', 'Pat', 'Terry', 'Chris',
+  'Robin', 'Dale', 'Jean', 'Lynn', 'Jody', 'Kelly', 'Drew', 'Kim',
+  'Blake', 'Devon', 'Erin', 'Shane', 'Tracy', 'Stacy', 'Jesse', 'Jamie',
 ];
 const BOT_ADD_MIN_MS = 4500;
 const BOT_ADD_MAX_MS = 11000;
@@ -379,10 +389,9 @@ function removeOneBotForHumanJoin(session) {
 function desiredOpenLobbyBots(session) {
   if (!session.botsFill) return 0;
   const humans = countHumans(session);
-  const cap = Math.max(0, session.maxPlayers - humans);
-  if (cap <= 0) return 0;
-  // Keep lobbies lively but leave room for real players.
-  return Math.min(cap, Math.max(1, Math.floor(session.maxPlayers * 0.6) - humans + 1));
+  // Almost fill the lobby but always leave at least one slot for a human to join.
+  const desired = Math.max(0, session.maxPlayers - 1 - humans);
+  return desired;
 }
 
 function maybeTrickleBots(session, nowMs) {
@@ -393,14 +402,8 @@ function maybeTrickleBots(session, nowMs) {
   const desired = desiredOpenLobbyBots(session);
   if (bots >= desired) return;
   if (nowMs < rt.nextBotAddAt) return;
-  const added = addBotToSession(session);
+  addBotToSession(session);
   rt.nextBotAddAt = nowMs + randInt(BOT_ADD_MIN_MS, BOT_ADD_MAX_MS);
-  if (added) {
-    // Optional small chance of immediate second trickle in very empty lobbies.
-    if (countHumans(session) <= 1 && countBots(session) < desired && Math.random() < 0.25) {
-      rt.nextBotAddAt = nowMs + randInt(1200, 2500);
-    }
-  }
 }
 
 function emitBotAction(session, bot, payload) {
@@ -972,7 +975,7 @@ function finalizeHandshake(sessionId) {
     seed: session.game.seed,
     waveCount: session.game.waveCount,
     bunkerLayoutId: typeof session.game.bunkerLayoutId === 'number' ? session.game.bunkerLayoutId : 0,
-    playerCount: connectedPlayersForSession(sessionId).length,
+    playerCount: session.players.size,
     agreedHash: session.game.agreedHash,
     startAt: session.game.startedAt,
   });
@@ -1255,7 +1258,7 @@ wss.on('connection', (ws, req) => {
           seed: session.game.seed,
           waveCount: session.game.waveCount,
           bunkerLayoutId: typeof session.game.bunkerLayoutId === 'number' ? session.game.bunkerLayoutId : 0,
-          playerCount: connectedPlayersForSession(sessionId).length,
+          playerCount: session.players.size,
           at: Date.now(),
         });
         return;
