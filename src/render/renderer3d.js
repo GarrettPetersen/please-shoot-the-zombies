@@ -208,7 +208,10 @@
         const extentX = bunker.maxX - bunker.minX;
         const extentZ = bunker.maxZ - bunker.minZ;
         const tileW = this.state.bunkerTileWorldWidth || 1;
-        floorboardsTex.repeat.set(Math.max(1, extentX / tileW), Math.max(1, extentZ / tileW));
+        const plankWorldSize = tileW * 10;
+        const repeatX = Math.max(1, extentX / plankWorldSize);
+        const repeatZ = Math.max(1, extentZ / plankWorldSize);
+        floorboardsTex.repeat.set(repeatX, repeatZ);
         const panelMat = new THREE.MeshBasicMaterial({
           map: floorboardsTex,
           side: THREE.DoubleSide,
@@ -224,10 +227,12 @@
       }
 
       for (const segment of this.state.bunkerWallSegments) {
+        const segLen = segment.length ?? Math.hypot(segment.b.x - segment.a.x, segment.b.z - segment.a.z);
         for (const tile of segment.tiles) {
           const key = spriteKeyForTile(tile, segment);
           const mat = this._getWallMaterial(key);
-          const width = this.state.bunkerTileWorldWidth * Math.max(0.05, (tile.maxT - tile.minT) * segment.tiles.length);
+          // Use actual tile span along segment so walls meet at corners (no gaps/overlaps on interior loops).
+          const width = Math.max(0.05, (tile.maxT - tile.minT) * segLen);
           const geom = new THREE.PlaneGeometry(width, this.state.BUNKER_WALL_HEIGHT);
           const mesh = new THREE.Mesh(geom, mat);
           const tMid = (tile.minT + tile.maxT) * 0.5;
@@ -253,7 +258,7 @@
 
           if (tile.tileIndex != null) {
             const slot = this.state.bunkerSlots.find((s) => s.segmentIndex === segment.index && s.tileIndex === tile.tileIndex);
-            if (slot && (slot.type === 'window' || slot.type === 'crate')) {
+            if (slot && (slot.type === 'window' || slot.type === 'door' || slot.type === 'hole' || slot.type === 'crate')) {
               const si = this.state.bunkerSlots.indexOf(slot);
               if (!this.slotColliderByIndex.has(si)) {
                 const slotGeom = new THREE.PlaneGeometry(this.state.bunkerTileWorldWidth * 0.85, this.state.BUNKER_WALL_HEIGHT * 0.9);

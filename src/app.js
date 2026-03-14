@@ -281,6 +281,26 @@ const BUNKER_LAYOUTS = {
   },
 };
 const DEFAULT_BUNKER_LAYOUT_ID = 'l_redoubt';
+/** Stable ordered list for backend bunker layout IDs (0, 1, 2, ...). */
+const BUNKER_LAYOUT_IDS = [
+  'l_redoubt',
+  'shooting_gallery',
+  'small_1x2',
+  'zigzag',
+  'pentagon_rampart',
+  'star_fort',
+  'rectangle_fort',
+  'horseshoe_keep',
+];
+function bunkerLayoutIdToBackendIndex(layoutId) {
+  const id = String(layoutId || '').trim();
+  const idx = BUNKER_LAYOUT_IDS.indexOf(id);
+  return idx >= 0 ? idx : 0;
+}
+function backendIndexToBunkerLayoutId(index) {
+  const i = Math.max(0, Math.floor(Number(index)));
+  return BUNKER_LAYOUT_IDS[i % BUNKER_LAYOUT_IDS.length] || DEFAULT_BUNKER_LAYOUT_ID;
+}
 const BUNKER_SLOT_SPACING = 4.5;
 const BUNKER_WALL_INSET = 2.8;
 const BUNKER_MOVE_LERP = 10;
@@ -375,7 +395,26 @@ const OUT_OF_AMMO_MESSAGE_DURATION = 1.5;
 const UPGRADE_SPITZER_AT = 100;
 const UPGRADE_MAD_MINUTE_AT = 200;
 const UPGRADE_MESSAGE_DURATION = 4;
-const ZOMBIE_RAY_RADIUS = 0.45;   // for Spitzer pass-through ray test
+/** Kill count used for upgrade unlocks: always personal (localPlayerKills in MP, score in single-player). */
+function getUpgradeKillCount() {
+  return multiplayerSession ? localPlayerKills : score;
+}
+
+function triggerUpgradeIfNeeded() {
+  const k = getUpgradeKillCount();
+  if (k === UPGRADE_SPITZER_AT && !upgradeSpitzerShown) {
+    upgradeSpitzerShown = true;
+    upgradeMessageTime = UPGRADE_MESSAGE_DURATION;
+    upgradeMessageLines = ['100 zombies destroyed', 'Upgrade unlocked: .303 Mk VII Spitzer Bullet', 'Bullets pass through enemies on kill'];
+    if (assets.upgradeSound) try { assets.upgradeSound.currentTime = 0; assets.upgradeSound.play(); } catch (_) {}
+  }
+  if (k === UPGRADE_MAD_MINUTE_AT && !upgradeMadMinuteShown) {
+    upgradeMadMinuteShown = true;
+    upgradeMessageTime = UPGRADE_MESSAGE_DURATION;
+    upgradeMessageLines = ['200 zombies destroyed', 'Upgrade unlocked: Mad Minute', 'Shooting and reloading speed doubled'];
+    if (assets.upgradeSound) try { assets.upgradeSound.currentTime = 0; assets.upgradeSound.play(); } catch (_) {}
+  }
+}
 
 // Zombie: 3D position, sprite size and reference at distance
 const ZOMBIE_REF_HEIGHT = 1.8;  // world units (height of zombie)
@@ -418,6 +457,8 @@ const TREE_MIN_DIST_FROM_BUNKER = 5; // world units; keep trees far enough so br
 
 let assets = {};
 let score = 0;
+/** In multiplayer, number of kills by the local player (for personal upgrade triggers). In single-player we use score. */
+let localPlayerKills = 0;
 let rifleFrame = 0;
 let rifleState = 'idle';
 let rifleFrameTime = 0;
@@ -456,6 +497,7 @@ let playerMatchStats = new Map(); // playerId -> { playerId,name,isBot,kills,boa
 let leaderboardScrollRow = 0;
 let endgameReturnButton = null; // { x,y,w,h }
 let appMode = 'menu'; // 'menu' | 'game'
+let assetsReady = false; // true after loadAssets() completes; menu buttons only shown when true
 
 const MENU_BUTTON_W = 290;
 const MENU_BUTTON_H = 24;
@@ -508,6 +550,7 @@ const MENU_LANGUAGES = {
     statusLeftLobby: 'Left lobby',
     statusHostFailed: 'Could not host match',
     statusJoinFailed: 'Could not join match',
+    statusServerUnreachable: 'Cannot reach server. Check URL and firewall (e.g. EC2 security group, port 3000).',
     statusNoPublic: 'No public matches available',
     statusNeedCode: 'Join code required',
     statusSocketClosed: 'Disconnected from match server',
@@ -558,6 +601,7 @@ const MENU_LANGUAGES = {
     statusLeftLobby: 'Saliste de la sala',
     statusHostFailed: 'No se pudo crear la partida',
     statusJoinFailed: 'No se pudo unir',
+    statusServerUnreachable: 'No se puede conectar al servidor. Revisa la URL y el firewall (ej. grupo de seguridad EC2, puerto 3000).',
     statusNoPublic: 'No hay partidas publicas',
     statusNeedCode: 'Se requiere codigo',
     statusSocketClosed: 'Desconectado del servidor',
@@ -580,6 +624,11 @@ const menuState = {
     maxPlayers: 8,
     difficulty: 'normal',
     bunkerLayoutId: DEFAULT_BUNKER_LAYOUT_ID,
+  },
+  /** Single-player only; separate from matchSettings so main menu selection does not override multiplayer. */
+  localGameSettings: {
+    bunkerLayoutId: DEFAULT_BUNKER_LAYOUT_ID,
+    difficulty: 'normal',
   },
 };
 const DEFAULT_MULTIPLAYER_HTTP_BASE = 'http://100.52.203.69:3000';
@@ -686,10 +735,11 @@ function setMenuPage(pageId) {
   menuPage = pageId;
   menuSelectedIndex = 0;
   menuHoverIndex = -1;
+  if (pageId === 'local_settings') setCurrentBunkerLayout(menuState.localGameSettings.bunkerLayoutId);
 }
 
 function getBunkerLayoutOptions() {
-  return Object.values(BUNKER_LAYOUTS);
+  return BUNKER_LAYOUT_IDS.map((id) => BUNKER_LAYOUTS[id]).filter(Boolean);
 }
 
 function getBunkerLayoutById(layoutId) {
@@ -717,6 +767,7 @@ function startLocalGame(opts = {}) {
   const agreedHash = typeof opts.agreedHash === 'string' ? opts.agreedHash : '';
   gameTime = 0;
   score = 0;
+  localPlayerKills = 0;
   rifleFrame = 0;
   rifleState = 'idle';
   rifleFrameTime = 0;
@@ -775,7 +826,7 @@ function startLocalGame(opts = {}) {
   tallyWallLastRemaining = -1;
   updateTallyWallTextures();
 
-  activeSlotIndex = Math.max(0, bunkerSlots.findIndex((slot) => slot.type === 'window' || slot.type === 'crate'));
+  activeSlotIndex = Math.max(0, bunkerSlots.findIndex((slot) => isOpeningSlot(slot) || slot.type === 'crate'));
   setActiveBunkerSlot(activeSlotIndex, true);
   const localId = multiplayerSession?.playerId || '__local__';
   const me = ensureMpPlayer(localId, 'You');
@@ -799,7 +850,7 @@ function logBoardOrientations() {
   console.log('[Board orientations] All wall boards should be up-and-down (vertical). rotation.y = -segmentYaw.');
   for (let i = 0; i < bunkerSlots.length; i++) {
     const slot = bunkerSlots[i];
-    if (slot.type !== 'window') continue;
+    if (!isOpeningSlot(slot)) continue;
     const tx = slot.tangent?.x ?? 0;
     const tz = slot.tangent?.z ?? 0;
     const segmentYaw = Math.atan2(tz, tx);
@@ -1228,7 +1279,8 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
         }
         multiplayerGameSeed = Number(msg.session.gameSeed || GAME_PARAM_SEED);
         multiplayerWaveCount = Number(msg.session.waveCount || GAME_PARAM_WAVE_COUNT);
-        multiplayerBunkerLayoutId = String(msg.session.bunkerLayoutId || DEFAULT_BUNKER_LAYOUT_ID);
+        const sessionBunkerIndex = Number(msg.session.bunkerLayoutId);
+        multiplayerBunkerLayoutId = Number.isFinite(sessionBunkerIndex) ? backendIndexToBunkerLayoutId(sessionBunkerIndex) : DEFAULT_BUNKER_LAYOUT_ID;
         setCurrentBunkerLayout(multiplayerBunkerLayoutId);
         if (msg.session.agreedHash) {
           multiplayerAgreedHash = msg.session.agreedHash;
@@ -1240,7 +1292,8 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
       if (msg.type === 'handshake_request') {
         multiplayerGameSeed = Number(msg.seed || GAME_PARAM_SEED);
         multiplayerWaveCount = Number(msg.waveCount || GAME_PARAM_WAVE_COUNT);
-        multiplayerBunkerLayoutId = String(msg.bunkerLayoutId || DEFAULT_BUNKER_LAYOUT_ID);
+        const handshakeBunkerIndex = Number(msg.bunkerLayoutId);
+        multiplayerBunkerLayoutId = Number.isFinite(handshakeBunkerIndex) ? backendIndexToBunkerLayoutId(handshakeBunkerIndex) : DEFAULT_BUNKER_LAYOUT_ID;
         setCurrentBunkerLayout(multiplayerBunkerLayoutId);
         const multiplayerPlayerCount = Math.max(1, Number(msg.playerCount || multiplayerLobbyPlayers.length || 1));
         const planned = generateGameParameters(multiplayerGameSeed, multiplayerWaveCount, multiplayerPlayerCount);
@@ -1253,7 +1306,8 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
       if (msg.type === 'start_game') {
         multiplayerGameSeed = Number(msg.seed || GAME_PARAM_SEED);
         multiplayerWaveCount = Number(msg.waveCount || GAME_PARAM_WAVE_COUNT);
-        multiplayerBunkerLayoutId = String(msg.bunkerLayoutId || DEFAULT_BUNKER_LAYOUT_ID);
+        const startBunkerIndex = Number(msg.bunkerLayoutId);
+        multiplayerBunkerLayoutId = Number.isFinite(startBunkerIndex) ? backendIndexToBunkerLayoutId(startBunkerIndex) : DEFAULT_BUNKER_LAYOUT_ID;
         const multiplayerPlayerCount = Math.max(1, Number(msg.playerCount || multiplayerLobbyPlayers.length || 1));
         multiplayerAgreedHash = String(msg.agreedHash || '');
         multiplayerStartAt = Number(msg.startAt || 0);
@@ -1327,6 +1381,7 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
       if (msg.type === 'relay') {
         if (appMode !== 'game' || gameOver || gameWon) return;
         const from = String(msg.fromPlayerId || '');
+        const isOwnAction = multiplayerSession && from === multiplayerSession.playerId;
         const payload = msg.payload || {};
         const remote = ensureMpPlayer(from);
         const nowMs = Date.now();
@@ -1340,7 +1395,7 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
         } else if (payload.type === 'player_shot') {
           if (Number.isFinite(payload.slotIndex)) setMpPlayerSlot(from, Number(payload.slotIndex), nowMs);
           const pos = getMpPlayerWorldPos(remote, nowMs);
-          recordShotStat(from, payload.hit || null);
+          if (!isOwnAction) recordShotStat(from, payload.hit || null);
           const resolvedDir = resolveRemoteShotDir(payload?.dir, Number(payload.slotIndex));
           if (resolvedDir) {
             addTracer(
@@ -1354,8 +1409,10 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
             // Gunshots carry further than other SFX; keep them loud at distance.
             playPositionalClip(sfx, pos.x, pos.z, 1.35, 1500, POSITIONAL_REF_DIST * 40);
           }
+          playGunshotEcho();
           if (assets.ejectCasing) playPositionalClip(assets.ejectCasing, pos.x, pos.z, 0.7, 220, POSITIONAL_REF_DIST * 1.4);
-          applyRemoteZombieHit(payload, remote);
+          // Don't apply zombie damage for our own shot — we already applied it locally; applying again would hit wrong zombies and break damage.
+          if (!isOwnAction) applyRemoteZombieHit(payload, remote);
         } else if (payload.type === 'player_board_start') {
           const pos = getMpPlayerWorldPos(remote, nowMs);
           if (Number.isFinite(payload.slotIndex)) setMpPlayerSlot(from, Number(payload.slotIndex), nowMs);
@@ -1391,13 +1448,15 @@ function connectMultiplayerSocket(sessionId, playerId, wsUrlFromServer = '') {
 async function hostMatchFromSettings() {
   showMenuToast(t('statusMatchCreating'), 2);
   const s = menuState.matchSettings;
+  const selectedLayoutId = String(s.bunkerLayoutId || DEFAULT_BUNKER_LAYOUT_ID).trim() || DEFAULT_BUNKER_LAYOUT_ID;
+  const bunkerIndex = bunkerLayoutIdToBackendIndex(selectedLayoutId);
   const name = getPlayerNameForMatchmaking();
   const created = await apiJson('/api/sessions/create', 'POST', {
     privacy: s.privacy,
     maxPlayers: s.maxPlayers,
     botsFill: true,
     difficulty: s.difficulty,
-    bunkerLayoutId: s.bunkerLayoutId,
+    bunkerLayoutId: bunkerIndex,
     playerName: name,
   });
   multiplayerSession = {
@@ -1409,7 +1468,8 @@ async function hostMatchFromSettings() {
   };
   multiplayerAgreedHash = '';
   multiplayerStartAt = 0;
-  multiplayerBunkerLayoutId = String(created.bunkerLayoutId || s.bunkerLayoutId || DEFAULT_BUNKER_LAYOUT_ID);
+  const serverIndex = Number(created.bunkerLayoutId);
+  multiplayerBunkerLayoutId = Number.isFinite(serverIndex) ? backendIndexToBunkerLayoutId(serverIndex) : selectedLayoutId;
   setCurrentBunkerLayout(multiplayerBunkerLayoutId);
   connectMultiplayerSocket(created.sessionId, created.playerId, created.wsUrl);
   showMenuToast(`${t('statusHosted')} (${created.joinCode})`, 2.2);
@@ -1580,28 +1640,47 @@ function getMenuPageDefinition() {
     };
   }
 
+  if (menuPage === 'local_settings') {
+    const local = menuState.localGameSettings;
+    const diffLabel = local.difficulty === 'hard' ? t('diffHard') : local.difficulty === 'nightmare' ? t('diffNightmare') : t('diffNormal');
+    return {
+      title: t('startLocal'),
+      subtitle: t('subtitleMain'),
+      items: [
+        {
+          label: `${t('bunker')}: ${getBunkerLayoutName(local.bunkerLayoutId)}`,
+          onSelect: () => {
+            const opts = getBunkerLayoutOptions().map((b) => b.id);
+            local.bunkerLayoutId = cycleValue(opts, local.bunkerLayoutId, 1);
+            setCurrentBunkerLayout(local.bunkerLayoutId);
+          },
+        },
+        {
+          label: `${t('difficulty')}: ${diffLabel}`,
+          onSelect: () => {
+            local.difficulty = cycleValue(['normal', 'hard', 'nightmare'], local.difficulty, 1);
+          },
+        },
+        {
+          label: t('startLocal'),
+          onSelect: () => {
+            const layoutId = local.bunkerLayoutId;
+            setCurrentBunkerLayout(layoutId);
+            showMenuToast(t('statusStartingLocal'), 0.8);
+            startLocalGame({ bunkerLayoutId: layoutId });
+            canvas.requestPointerLock();
+          },
+        },
+        { label: t('back'), onSelect: () => setMenuPage('main') },
+      ],
+    };
+  }
+
   return {
     title: t('titleMain'),
     subtitle: t('subtitleMain'),
     items: [
-      {
-        label: `${t('bunker')}: ${getBunkerLayoutName(menuState.matchSettings.bunkerLayoutId)}`,
-        onSelect: () => {
-          const opts = getBunkerLayoutOptions().map((b) => b.id);
-          menuState.matchSettings.bunkerLayoutId = cycleValue(opts, menuState.matchSettings.bunkerLayoutId, 1);
-          setCurrentBunkerLayout(menuState.matchSettings.bunkerLayoutId);
-        },
-      },
-      {
-        label: t('startLocal'),
-        onSelect: () => {
-          const layoutId = menuState.matchSettings.bunkerLayoutId;
-          setCurrentBunkerLayout(layoutId);
-          showMenuToast(t('statusStartingLocal'), 0.8);
-          startLocalGame({ bunkerLayoutId: layoutId });
-          canvas.requestPointerLock();
-        },
-      },
+      { label: t('startLocal'), onSelect: () => setMenuPage('local_settings') },
       { label: t('playOnline'), onSelect: () => setMenuPage('online') },
       { label: t('options'), onSelect: () => setMenuPage('options') },
     ],
@@ -1611,6 +1690,10 @@ function getMenuPageDefinition() {
 function selectMenuItem(index) {
   const toastFromMenuError = (err) => {
     const text = String(err?.message || '').trim();
+    if (/failed to fetch|connection refused|network error/i.test(text)) {
+      showMenuToast(t('statusServerUnreachable'), 4);
+      return;
+    }
     if (text && !/^HTTP\s+\d+/i.test(text)) {
       showMenuToast(text.slice(0, 120), 2.6);
       return;
@@ -1654,6 +1737,7 @@ function handleMenuKeydown(e) {
         return;
       }
       if (menuPage === 'match_settings') setMenuPage('online');
+      else if (menuPage === 'local_settings') setMenuPage('main');
       else setMenuPage('main');
     }
   }
@@ -1778,7 +1862,7 @@ function getBoardInstancesForRenderer() {
   const placingKey = boardPlaceState?.slotKey ?? null;
 
   for (const slot of bunkerSlots) {
-    if (slot.type !== 'window') continue;
+    if (!isOpeningSlot(slot)) continue;
     const key = getSlotKey(slot);
     const onWindow = windowBoards[key] ?? 0;
     const onFloor = BOARDS_PER_WINDOW - onWindow;
@@ -1959,7 +2043,7 @@ const RELOAD_SOUND_EARLY_OFFSET = 0.25; // start sound this many seconds earlier
 const RELOAD_SOUND_TRIGGER_FRAME = Math.max(0, Math.floor((RELOAD_SOUND_ALIGN_FRAME - 1) - RELOAD_SOUND_ALIGN_TIME * RIFLE_FPS - RELOAD_SOUND_EARLY_OFFSET * RIFLE_FPS));
 
 function getRifleFps() {
-  return score >= UPGRADE_MAD_MINUTE_AT ? RIFLE_FPS * 2 : RIFLE_FPS;
+  return getUpgradeKillCount() >= UPGRADE_MAD_MINUTE_AT ? RIFLE_FPS * 2 : RIFLE_FPS;
 }
 
 /** Extract ImageData from an image (for headshot mask sampling). Returns null if image not loaded. */
@@ -2149,7 +2233,7 @@ function generateBunkerLayout(layout = null) {
           segmentIndex: segment.index,
           tileIndex: j,
           tileSpriteKey: spriteKey,
-          type: 'window',
+          type: spriteKey,
           x: cx + inward.x * BUNKER_WALL_INSET,
           z: cz + inward.z * BUNKER_WALL_INSET,
           wallX: cx,
@@ -2264,7 +2348,7 @@ function generateBunkerLayout(layout = null) {
     holes,
   };
   bunkerSlots = slots;
-  activeSlotIndex = Math.max(0, bunkerSlots.findIndex((slot) => slot.type === 'window' || slot.type === 'crate'));
+  activeSlotIndex = Math.max(0, bunkerSlots.findIndex((slot) => isOpeningSlot(slot) || slot.type === 'crate'));
   setActiveBunkerSlot(activeSlotIndex, true);
   initWindowBoards();
   precomputeSlotVoiceVolumes();
@@ -2272,7 +2356,7 @@ function generateBunkerLayout(layout = null) {
 }
 
 function getBoardFloorPositions(slot) {
-  if (!slot || slot.type !== 'window' || !bunker) return [];
+  if (!slot || !isOpeningSlot(slot) || !bunker) return [];
   const key = getSlotKey(slot);
   const seed = (key.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 0)) >>> 0;
   const rng = seeded(seed);
@@ -2293,7 +2377,7 @@ function getBoardFloorPositions(slot) {
 }
 
 function getBoardWindowPositions(slot) {
-  if (!slot || slot.type !== 'window') return [];
+  if (!slot || !isOpeningSlot(slot)) return [];
   const key = getSlotKey(slot);
   const seed = (key.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 0)) >>> 0;
   const rng = seeded(seed);
@@ -2613,7 +2697,7 @@ function getSlotWallCenter(slot) {
 }
 
 function getPeekOffsetForSlot(slot) {
-  if (!slot || slot.type !== 'window') return { x: 0, z: 0 };
+  if (!slot || !isOpeningSlot(slot)) return { x: 0, z: 0 };
   const rawYawFromSlot = normalizeAngle(cameraYaw - slot.baseYaw);
   const absRawYaw = Math.abs(rawYawFromSlot);
   if (absRawYaw >= BUNKER_PEEK_FADE_END_YAW) return { x: 0, z: 0 };
@@ -2662,8 +2746,9 @@ function getWindowOpeningsForSide(side) {
     .sort((a, b) => a.segmentIndex - b.segmentIndex || a.min - b.min);
 }
 
+/** Slots zombies can attack (window, door, hole). All treated identically for gameplay. */
 function getWindowSlots() {
-  return bunkerSlots.filter((slot) => slot.type === 'window');
+  return bunkerSlots.filter(isOpeningSlot);
 }
 
 function getZombieWindowTarget(slot) {
@@ -2694,15 +2779,20 @@ function getSlotKey(slot) {
   return `${slot.segmentIndex ?? 0}-${slot.tileIndex ?? 0}-${slot.type ?? 'slot'}`;
 }
 
+/** True if slot is an opening (window, door, or hole). Gameplay treats all three identically; only sprite differs. */
+function isOpeningSlot(slot) {
+  return slot && (slot.type === 'window' || slot.type === 'door' || slot.type === 'hole');
+}
+
 function isReticuleOnBoardStack(px, py) {
   const slot = getCurrentBunkerSlot();
-  if (!slot || slot.type !== 'window') return false;
+  if (!slot || !isOpeningSlot(slot)) return false;
   const key = getSlotKey(slot);
   const onFloor = BOARDS_PER_WINDOW - (windowBoards[key] ?? 0);
   if (onFloor <= 0) return false;
   if (worldRenderer?.isReady()) {
     if (cameraPitch < 0.06) return false;
-    const hit = worldRenderer.pickFirst(px, py, ['window']);
+    const hit = worldRenderer.pickFirst(px, py, ['window', 'door', 'hole']);
     return !!hit && Number(hit.userData?.slotIndex) === activeSlotIndex;
   }
   // Minimum look-down so boards at wall foot are visible; wood in frame
@@ -2730,7 +2820,7 @@ function seeded(seed) {
 function initWindowBoards() {
   windowBoards = {};
   for (const slot of bunkerSlots) {
-    if (slot.type !== 'window') continue;
+    if (!isOpeningSlot(slot)) continue;
     windowBoards[getSlotKey(slot)] = 0;
   }
 }
@@ -2840,7 +2930,8 @@ function isZombiePathOutsideBunker(points) {
     !(bunker.holes || []).some((h) => isPointInsidePolygon(x, z, h));
   const lastSeg = points.length - 1;
   for (let i = 1; i < points.length; i++) {
-    if (i === lastSeg) continue;
+    // Skip last segment (window center on wall) and second-to-last (approach can be inside on small bunkers).
+    if (i >= lastSeg - 1) continue;
     const a = points[i - 1];
     const b = points[i];
     const segLen = Math.hypot(b.x - a.x, b.z - a.z);
@@ -3403,7 +3494,7 @@ function sampleBunkerWallAlpha(segment, u, y) {
 
 function shotLeavesThroughWindow(px, py) {
   const current = getCurrentBunkerSlot();
-  if (current?.type === 'window') {
+  if (isOpeningSlot(current)) {
     const b = getSlotScreenBounds(current);
     if (b) {
       const pad = 4;
@@ -3612,7 +3703,7 @@ async function loadAssets() {
   assets.runningSound = new Audio('assets/sfx/clean/boots_running.ogg');
   assets.runningSound.preload = 'auto';
   assets.runningSound.loop = true;
-  setCurrentBunkerLayout(menuState.matchSettings.bunkerLayoutId);
+  setCurrentBunkerLayout(menuState.localGameSettings.bunkerLayoutId);
   const horizonPath = `${base}/${HORIZON_BACKGROUND_PATH}`;
   assets.horizonBackground = await loadImage(horizonPath);
   if (assets.horizonBackground) {
@@ -3631,6 +3722,8 @@ async function loadAssets() {
     a.preload = 'auto';
     return a;
   });
+  assets.gunshotEcho = new Audio('assets/sfx/clean/gunshot_echo.ogg');
+  assets.gunshotEcho.preload = 'auto';
   assets.dryFire = new Audio(SFX_DRY_FIRE_PATH);
   assets.dryFire.preload = 'auto';
   assets.ejectCasing = new Audio(SFX_EJECT_CASING_PATH);
@@ -3643,6 +3736,8 @@ async function loadAssets() {
   assets.boltOpen.preload = 'auto';
   assets.boltClose = new Audio(SFX_BOLT_CLOSE_PATH);
   assets.boltClose.preload = 'auto';
+  assets.upgradeSound = new Audio('assets/sfx/clean/grandfather_clock.ogg');
+  assets.upgradeSound.preload = 'auto';
   const ZOMBIE_SOUND_NAMES = ['zombie_1', 'zombie_2', 'zombie_3', 'zombie_4', 'zombie_5'];
   const ZOMBIE_FEMALE_SOUND_NAMES = ['female_zombie_1', 'female_zombie_2', 'female_zombie_3', 'female_zombie_4'];
   assets.zombieSoundPaths = ZOMBIE_SOUND_NAMES.map((n) => `${base}/sfx/clean/${n}.ogg`);
@@ -3671,6 +3766,14 @@ async function loadAssets() {
   if (document.fonts?.load) await document.fonts.load('1em "Tally Mark"');
 }
 
+/** Plays the gunshot echo at reduced volume; each call uses a new Audio instance so echoes can overlap. */
+function playGunshotEcho() {
+  if (!assets.gunshotEcho?.src) return;
+  const a = new Audio(assets.gunshotEcho.src);
+  a.volume = 0.25;
+  a.play().catch(() => {});
+}
+
 function playShotSound() {
   if (!assets.shotSounds || assets.shotSounds.length === 0) return;
   const which = Math.floor(Math.random() * assets.shotSounds.length);
@@ -3678,6 +3781,7 @@ function playShotSound() {
   snd.currentTime = 0;
   snd.volume = 1.0;
   snd.play().catch(() => { });
+  playGunshotEcho();
 }
 
 function playEjectCasingSound() {
@@ -4278,16 +4382,6 @@ function damageZombie(idx, hitPx, hitPy) {
     zombies.splice(idx, 1);
     score += 1;
     updateTallyWallTextures();
-    if (score === UPGRADE_SPITZER_AT && !upgradeSpitzerShown) {
-      upgradeSpitzerShown = true;
-      upgradeMessageTime = UPGRADE_MESSAGE_DURATION;
-      upgradeMessageLines = ['100 zombies destroyed', 'Upgrade unlocked: .303 Mk VII Spitzer Bullet', 'Bullets pass through enemies on kill'];
-    }
-    if (score === UPGRADE_MAD_MINUTE_AT && !upgradeMadMinuteShown) {
-      upgradeMadMinuteShown = true;
-      upgradeMessageTime = UPGRADE_MESSAGE_DURATION;
-      upgradeMessageLines = ['200 zombies destroyed', 'Upgrade unlocked: Mad Minute', 'Shooting and reloading speed doubled'];
-    }
     return { type: 'zombie', zombieId, headshot: headShot, killed: true };
   } else {
     if (!z.holes) z.holes = [];
@@ -4330,16 +4424,6 @@ function applyOneRemoteZombieHit(payload, remotePlayer, hit) {
   zombies.splice(zombieIdx, 1);
   score += 1;
   updateTallyWallTextures();
-  if (score === UPGRADE_SPITZER_AT && !upgradeSpitzerShown) {
-    upgradeSpitzerShown = true;
-    upgradeMessageTime = UPGRADE_MESSAGE_DURATION;
-    upgradeMessageLines = ['100 zombies destroyed', 'Upgrade unlocked: .303 Mk VII Spitzer Bullet', 'Bullets pass through enemies on kill'];
-  }
-  if (score === UPGRADE_MAD_MINUTE_AT && !upgradeMadMinuteShown) {
-    upgradeMadMinuteShown = true;
-    upgradeMessageTime = UPGRADE_MESSAGE_DURATION;
-    upgradeMessageLines = ['200 zombies destroyed', 'Upgrade unlocked: Mad Minute', 'Shooting and reloading speed doubled'];
-  }
 }
 
 function applyRemoteZombieHit(payload, remotePlayer) {
@@ -4473,35 +4557,25 @@ function treeBlocksPoint(t, info, px, py) {
   return alpha >= TREE_PIXEL_HIT_ALPHA_THRESHOLD;
 }
 
-/** Returns all zombies the ray passes through, front to back, for Spitzer pass-through. Each entry has { index, spawnIndex, t, hitPx, hitPy }. */
-function getZombieHitsAlongRay(shotDir) {
-  const ox = cameraX;
-  const oy = CAMERA_Y;
-  const oz = cameraZ;
-  const hits = [];
-  const halfH = ZOMBIE_REF_HEIGHT * 0.5;
+/** Returns all zombies that are under the given screen point (px, py), front to back by canvas depth. Used so Spitzer penetration order matches what you see. Each entry has { index, spawnIndex, depth, hitPx, hitPy }. */
+function getZombiesUnderPointByDepth(px, py) {
+  const list = [];
   for (let i = 0; i < zombies.length; i++) {
     const z = zombies[i];
-    const cx = z.x;
-    const cy = (z.y ?? 0) + halfH;
-    const cz = z.z;
-    const dx = cx - ox;
-    const dy = cy - oy;
-    const dz = cz - oz;
-    const t = dx * shotDir.x + dy * shotDir.y + dz * shotDir.z;
-    if (t <= 0) continue;
-    const px = ox + t * shotDir.x;
-    const py = oy + t * shotDir.y;
-    const pz = oz + t * shotDir.z;
-    const dist = Math.sqrt((px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2);
-    if (dist > ZOMBIE_RAY_RADIUS) continue;
     const info = getZombieDrawInfo(z);
-    const hitPx = info ? info.sx + info.sw / 2 : W / 2;
-    const hitPy = info ? info.sy + info.sh / 2 : H / 2;
-    hits.push({ index: i, spawnIndex: z.spawnIndex, t, hitPx, hitPy });
+    if (!info) continue;
+    if (px >= info.sx && px <= info.sx + info.sw && py >= info.sy && py <= info.sy + info.sh) {
+      list.push({
+        index: i,
+        spawnIndex: z.spawnIndex,
+        depth: info.depth,
+        hitPx: px,
+        hitPy: py,
+      });
+    }
   }
-  hits.sort((a, b) => a.t - b.t);
-  return hits;
+  list.sort((a, b) => a.depth - b.depth);
+  return list;
 }
 
 /** Returns { type: 'zombie'|'tree', index } for the closest hit, or null. Always uses 2D screen-space hit test so hits match what the player sees (sprites on screen). */
@@ -5209,7 +5283,7 @@ const BOARD_STACK_ROLL = -Math.PI / 2; // fixed in-plane roll so stacked boards 
 const BOARD_WINDOW_FRACTIONS = [0.2, 0.35, 0.58];  // from top: top board, middle above rifle, bottom inside window
 
 function getWindowScreenBounds(slot) {
-  if (!slot || slot.type !== 'window' || !bunker) return null;
+  if (!slot || !isOpeningSlot(slot) || !bunker) return null;
   const wx = slot.wallX ?? slot.x;
   const wz = slot.wallZ ?? slot.z;
   const top = project(wx, BUNKER_WALL_HEIGHT, wz);
@@ -5256,7 +5330,7 @@ function getSlotScreenBounds(slot) {
 /** If the reticule is over a runnable slot and the line from player to it is inside the bunker, return that slot (closest by depth). */
 function getRunTargetAt(px, py) {
   if (worldRenderer?.isReady()) {
-    const hit = worldRenderer.pickFirst(px, py, ['window', 'crate']);
+    const hit = worldRenderer.pickFirst(px, py, ['window', 'door', 'hole', 'crate']);
     const idx = Number(hit?.userData?.slotIndex);
     if (!Number.isFinite(idx) || idx < 0 || idx >= bunkerSlots.length) return null;
     const slot = bunkerSlots[idx];
@@ -5412,7 +5486,7 @@ function drawBoards(outItems = null) {
   const placingKey = boardPlaceState?.slotKey ?? null;
 
   for (const slot of bunkerSlots) {
-    if (slot.type !== 'window') continue;
+    if (!isOpeningSlot(slot)) continue;
     const key = getSlotKey(slot);
     const onWindow = windowBoards[key] ?? 0;
     const onFloor = BOARDS_PER_WINDOW - onWindow;
@@ -5828,16 +5902,52 @@ function drawOutOfAmmoMessage() {
   ctx.textAlign = 'left';
 }
 
+function wrapTextToWidth(text, maxWidth) {
+  if (!text || maxWidth <= 0) return [];
+  const words = String(text).trim().split(/\s+/);
+  const lines = [];
+  let line = '';
+  for (const w of words) {
+    const next = line ? line + ' ' + w : w;
+    if (ctx.measureText(next).width <= maxWidth) {
+      line = next;
+    } else {
+      if (line) lines.push(line);
+      line = '';
+      // If a single word is too long, break it into chunks that fit
+      let rest = w;
+      while (rest) {
+        if (ctx.measureText(rest).width <= maxWidth) {
+          line = rest;
+          rest = '';
+          break;
+        }
+        let fit = 1;
+        for (let i = 2; i <= rest.length; i++) {
+          if (ctx.measureText(rest.slice(0, i)).width <= maxWidth) fit = i;
+        }
+        lines.push(rest.slice(0, fit));
+        rest = rest.slice(fit);
+      }
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
 function drawUpgradeMessage() {
   if (upgradeMessageTime <= 0 || !upgradeMessageLines.length) return;
   const alpha = Math.min(1, upgradeMessageTime * 1.5);
   ctx.fillStyle = `rgba(255, 220, 120, ${alpha})`;
-  ctx.font = `${FONT_SIZE + 2}px ${FONT_FAMILY}`;
+  const fontSize = Math.max(14, Math.min(FONT_SIZE + 2, Math.floor(W / 24)));
+  ctx.font = `${fontSize}px ${FONT_FAMILY}`;
   ctx.textAlign = 'center';
-  const lineHeight = FONT_SIZE + 10;
-  const startY = H / 2 - (upgradeMessageLines.length * lineHeight) / 2;
-  for (let i = 0; i < upgradeMessageLines.length; i++) {
-    ctx.fillText(upgradeMessageLines[i], W / 2, startY + (i + 0.5) * lineHeight);
+  const lineHeight = fontSize + 8;
+  const maxW = Math.max(120, Math.min(380, W * 0.75));
+  const wrapped = upgradeMessageLines.flatMap((line) => wrapTextToWidth(line, maxW));
+  const startY = H / 2 - (wrapped.length * lineHeight) / 2;
+  for (let i = 0; i < wrapped.length; i++) {
+    ctx.fillText(wrapped[i], W / 2, startY + (i + 0.5) * lineHeight);
   }
   ctx.textAlign = 'left';
 }
@@ -5849,7 +5959,7 @@ function drawReticule() {
   const cy = Math.round(H / 2 + ro.y);
   const slot = getCurrentBunkerSlot();
   const pointingAtCrate = isReticuleOnCrate(cx, cy) && isWithinCrateInteractRange();
-  const pointingAtBoardStack = !boardPlaceState && slot?.type === 'window' && isReticuleOnBoardStack(cx, cy);
+  const pointingAtBoardStack = !boardPlaceState && isOpeningSlot(slot) && isReticuleOnBoardStack(cx, cy);
 
   if (pointingAtCrate) {
     const img = assets.ammo;
@@ -6382,10 +6492,24 @@ function drawVictory() {
   }
 }
 
+function drawLoadingScreen() {
+  ctx.fillStyle = '#1a1f23';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.font = `${Math.floor(FONT_SIZE * 0.7)}px ${FONT_FAMILY}`;
+  ctx.textAlign = 'center';
+  ctx.fillText('Loading…', W / 2, H / 2);
+  ctx.textAlign = 'left';
+}
+
 function draw() {
   if (appMode === 'menu') {
     if (worldCanvas) worldCanvas.style.display = 'none';
     ctx.clearRect(0, 0, W, H);
+    if (!assetsReady) {
+      drawLoadingScreen();
+      return;
+    }
     drawMenu();
     return;
   }
@@ -6545,7 +6669,10 @@ canvas.addEventListener('click', (e) => {
   if (handleEndgameReturnClick(e)) return;
   if (handleMainMenuConfirmClick(e)) return;
   if (appMode === 'menu') {
-    handleMenuClick(e);
+    if (assetsReady) {
+      handleMenuClick(e);
+      draw();
+    }
     return;
   }
   if (gameOver || gameWon) return;
@@ -6559,7 +6686,7 @@ canvas.addEventListener('click', (e) => {
   const py = H / 2 + ro.y;
   const slot = getCurrentBunkerSlot();
   const pointingAtCrate = isReticuleOnCrate(px, py) && isWithinCrateInteractRange();
-  const pointingAtBoardStack = slot?.type === 'window' && isReticuleOnBoardStack(px, py);
+  const pointingAtBoardStack = isOpeningSlot(slot) && isReticuleOnBoardStack(px, py);
 
   if (pointingAtBoardStack) {
     const key = getSlotKey(slot);
@@ -6634,7 +6761,7 @@ canvas.addEventListener('click', (e) => {
   const canSeeOutside = shotLeavesThroughWindow(px, py);
   const shotDir = getShotDirection(px, py);
   addTracer({ x: cameraX, y: CAMERA_Y - 0.05, z: cameraZ }, shotDir);
-  const spitzerUnlocked = score >= UPGRADE_SPITZER_AT;
+  const spitzerUnlocked = getUpgradeKillCount() >= UPGRADE_SPITZER_AT;
   const makeShotEvent = (hitOrHits) => {
     const hits = Array.isArray(hitOrHits) ? hitOrHits : (hitOrHits && hitOrHits.type === 'zombie' ? [hitOrHits] : []);
     const first = hits[0] || (hitOrHits && !Array.isArray(hitOrHits) ? hitOrHits : null);
@@ -6661,21 +6788,25 @@ canvas.addEventListener('click', (e) => {
       recordShotStat(multiplayerSession?.playerId || '__local__', firstHit);
       return;
     }
-    if (firstHit?.type === 'zombie' && spitzerUnlocked) {
-      const rayHits = getZombieHitsAlongRay(shotDir);
-      for (const entry of rayHits) {
-        const idx = zombies.findIndex((z) => z.spawnIndex === entry.spawnIndex);
-        if (idx < 0) continue;
-        const payload = damageZombie(idx, entry.hitPx, entry.hitPy);
-        if (payload) hitPayloads.push(payload);
-      }
-      recordShotStat(multiplayerSession?.playerId || '__local__', hitPayloads[0] || null);
-      sendMultiplayerPayload('player_shot', makeShotEvent(hitPayloads));
-      return;
-    }
     if (firstHit?.type === 'zombie') {
-      const payload = damageZombie(firstHit.index, px, py);
-      hitPayloads = payload ? [payload] : [];
+      const firstPayload = damageZombie(firstHit.index, px, py);
+      if (firstPayload) hitPayloads.push(firstPayload);
+      if (firstPayload?.killed && spitzerUnlocked) {
+        const byDepth = getZombiesUnderPointByDepth(px, py);
+        const firstIdx = byDepth.findIndex((e) => e.index === firstHit.index);
+        const behind = firstIdx < 0 ? [] : byDepth.slice(firstIdx + 1);
+        for (const entry of behind) {
+          const idx = zombies.findIndex((z) => z.spawnIndex === entry.spawnIndex);
+          if (idx < 0) continue;
+          const p = damageZombie(idx, entry.hitPx, entry.hitPy);
+          if (p) hitPayloads.push(p);
+        }
+      }
+      for (const p of hitPayloads) if (p?.killed) localPlayerKills++;
+      triggerUpgradeIfNeeded();
+      recordShotStat(multiplayerSession?.playerId || '__local__', hitPayloads[0] || null);
+      sendMultiplayerPayload('player_shot', makeShotEvent(hitPayloads.length ? hitPayloads : firstPayload));
+      return;
     }
     recordShotStat(multiplayerSession?.playerId || '__local__', hitPayloads[0] || firstHit || null);
     sendMultiplayerPayload('player_shot', makeShotEvent(hitPayloads.length ? hitPayloads : firstHit));
@@ -6725,8 +6856,11 @@ document.addEventListener('pointerlockchange', () => {
 
 canvas.addEventListener('mousemove', (e) => {
   if (appMode === 'menu') {
-    const p = getCanvasPointerPos(e);
-    updateMenuHover(p.x, p.y);
+    if (assetsReady) {
+      const p = getCanvasPointerPos(e);
+      updateMenuHover(p.x, p.y);
+      draw();
+    }
     return;
   }
   if (!pointerLocked) return;
@@ -6749,7 +6883,7 @@ canvas.addEventListener('wheel', (e) => {
 document.addEventListener('keydown', (e) => {
   if (handleMainMenuConfirmKeydown(e)) return;
   if (appMode === 'menu') {
-    handleMenuKeydown(e);
+    if (assetsReady) handleMenuKeydown(e);
     return;
   }
   if (e.code === 'Escape' && !pointerLocked) {
@@ -6813,11 +6947,15 @@ function loop(now = 0) {
   requestAnimationFrame(loop);
   loadAssets()
     .then(() => {
+      assetsReady = true;
       if (worldRenderer?.isReady()) {
         worldRenderer.setAssets(assets);
         worldStaticDirty = true;
       }
     })
-    .catch((err) => console.error('Asset load failed:', err));
+    .catch((err) => {
+      console.error('Asset load failed:', err);
+      assetsReady = true;
+    });
 })();
 

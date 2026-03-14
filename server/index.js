@@ -246,7 +246,7 @@ function sessionSnapshot(session, req) {
     wsUrl: `${publicWsBase(req)}/ws`,
     gameSeed: session.game.seed,
     waveCount: session.game.waveCount,
-    bunkerLayoutId: session.game.bunkerLayoutId || 'l_redoubt',
+    bunkerLayoutId: typeof session.game.bunkerLayoutId === 'number' ? session.game.bunkerLayoutId : 0,
     agreedHash: session.game.agreedHash || '',
     startedAt: session.game.startedAt || 0,
   };
@@ -971,7 +971,7 @@ function finalizeHandshake(sessionId) {
     sessionId,
     seed: session.game.seed,
     waveCount: session.game.waveCount,
-    bunkerLayoutId: session.game.bunkerLayoutId || 'l_redoubt',
+    bunkerLayoutId: typeof session.game.bunkerLayoutId === 'number' ? session.game.bunkerLayoutId : 0,
     playerCount: connectedPlayersForSession(sessionId).length,
     agreedHash: session.game.agreedHash,
     startAt: session.game.startedAt,
@@ -1018,7 +1018,8 @@ function createSession(data = {}) {
   const maxPlayers = Math.max(2, Math.min(64, Number(data.maxPlayers) || 8));
   const botsFill = !!data.botsFill;
   const difficulty = ['normal', 'hard', 'nightmare'].includes(data.difficulty) ? data.difficulty : 'normal';
-  const bunkerLayoutId = String(data.bunkerLayoutId || 'l_redoubt').trim() || 'l_redoubt';
+  const raw = data.bunkerLayoutId;
+  const bunkerLayoutId = Number.isFinite(Number(raw)) ? Math.max(0, Math.floor(Number(raw))) : 0;
   const hostName = sanitizeName(data.playerName || data.hostName);
   const hostPlayerId = randomId('p_');
   const session = {
@@ -1193,7 +1194,7 @@ wss.on('connection', (ws, req) => {
       difficulty: session.difficulty,
       gameSeed: session.game.seed,
       waveCount: session.game.waveCount,
-      bunkerLayoutId: session.game.bunkerLayoutId || 'l_redoubt',
+      bunkerLayoutId: typeof session.game.bunkerLayoutId === 'number' ? session.game.bunkerLayoutId : 0,
       playerCount: connectedPlayersForSession(sessionId).length,
       agreedHash: session.game.agreedHash || '',
       startedAt: session.game.startedAt || 0,
@@ -1253,7 +1254,7 @@ wss.on('connection', (ws, req) => {
           sessionId,
           seed: session.game.seed,
           waveCount: session.game.waveCount,
-          bunkerLayoutId: session.game.bunkerLayoutId || 'l_redoubt',
+          bunkerLayoutId: typeof session.game.bunkerLayoutId === 'number' ? session.game.bunkerLayoutId : 0,
           playerCount: connectedPlayersForSession(sessionId).length,
           at: Date.now(),
         });

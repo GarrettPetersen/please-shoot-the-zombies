@@ -9,3 +9,4 @@ Zombies by Retro Diffusion
 
 Gun sounds by beerbelly38, kyles, and freesound_community
 Zombie sounds by Dragon Studio
+Clock sound by Nesrality
